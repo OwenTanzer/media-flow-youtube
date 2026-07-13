@@ -138,11 +138,35 @@ failed index update can't erase a successful archive). GitHub Actions
 4. Once deployed, Railway gives you a public URL — that's your endpoint,
    e.g. `https://your-app.up.railway.app/transcripts`.
 
-**Note on IP blocks:** `youtube-transcript-api` fetches captions directly
-from YouTube, which rate-limits/blocks known cloud provider IP ranges
-(including Railway's) more aggressively than residential IPs. If you see
-`"status": "blocked"` responses, see the
-[project's guidance on residential proxies](https://github.com/jdepoix/youtube-transcript-api?tab=readme-ov-file#working-around-ip-bans-requestblocked-or-ipblocked-exception).
+### 5. Working around IP blocks (optional, but likely needed)
+
+`youtube-transcript-api` fetches captions directly from YouTube, which
+blocks known cloud-provider IP ranges (Railway's included) far more
+aggressively than residential IPs. If you see `"status": "blocked"` in
+responses, route requests through a proxy via `YOUTUBE_PROXY_TYPE` (see
+[`.env.example`](.env.example) for every variable) - no code or API
+changes needed, just configuration:
+
+| `YOUTUBE_PROXY_TYPE` | Use when | Required variables |
+|---|---|---|
+| unset (default) | Requests direct, no proxy | — |
+| `webshare` | Using [Webshare](https://www.webshare.io/), which the library has built-in retry/rotation support for. It has a permanent free tier (10 datacenter IPs, 1GB/month) worth trying first - though datacenter IPs may still get blocked the same way Railway's do. Their paid "Residential" tier is the reliable fix. | `WEBSHARE_PROXY_USERNAME`, `WEBSHARE_PROXY_PASSWORD` (from the [Webshare dashboard](https://dashboard.webshare.io/proxy/settings)) |
+| `generic` | Any other HTTP/HTTPS proxy, including a self-hosted tunnel back to your own residential IP (e.g. via Cloudflare Tunnel or Tailscale) | `YOUTUBE_PROXY_HTTP_URL` and/or `YOUTUBE_PROXY_HTTPS_URL`, e.g. `http://user:pass@host:port` |
+
+The app validates this configuration at startup — an invalid or
+incomplete proxy setup fails the deployment immediately rather than
+surfacing later as per-video `blocked`/`error` results. A working but
+rejected proxy still produces the existing safe behavior: affected
+videos come back as `blocked` and stay queued for retry, exactly as
+without a proxy.
+
+**Rotating/updating credentials:** proxy credentials are read fresh from
+environment variables on every YouTube request rather than cached, so
+rotating them is just updating the Railway variables and letting the
+service restart (Railway does this automatically on a variable change).
+No redeploy of code is required. As with all secrets in this project,
+set proxy credentials only in Railway's environment variables (or a
+local, gitignored `.env`) - never commit them.
 
 ## Usage
 

@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 
+from . import youtube
 from .batch import run_batch
 from .config import ConfigError, settings
 from .models import BatchRequest, BatchResponse, TranscriptRequest, TranscriptResponse, VideoResult
@@ -19,6 +20,11 @@ async def lifespan(_: FastAPI):
             "API_KEY is not set. Refusing to start with an unauthenticated public endpoint. "
             "Set API_KEY, or set DRY_RUN=true for local testing without auth."
         )
+    try:
+        youtube.build_proxy_config()
+    except ConfigError as exc:
+        raise RuntimeError(f"Invalid YouTube proxy configuration: {exc}") from exc
+
     if settings.dry_run:
         logger.warning("DRY_RUN is enabled - no files will actually be written to Google Drive.")
     else:
