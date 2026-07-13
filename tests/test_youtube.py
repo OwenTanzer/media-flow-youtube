@@ -64,14 +64,31 @@ def test_fetch_video_metadata_falls_back_on_malformed_json(monkeypatch):
     assert meta.author is None
 
 
-def test_fetch_video_metadata_falls_back_on_request_exception(monkeypatch):
+def test_fetch_video_metadata_falls_back_on_request_exception(monkeypatch, caplog):
     def _raise(*a, **k):
         raise youtube.requests.RequestException("boom")
 
     monkeypatch.setattr(youtube.requests, "get", _raise)
-    meta = youtube.fetch_video_metadata("abc123XYZde")
+    with caplog.at_level("WARNING", logger="media_flow.youtube"):
+        meta = youtube.fetch_video_metadata("abc123XYZde")
     assert meta.title == "abc123XYZde"
     assert meta.author is None
+    assert "abc123XYZde" in caplog.text
+
+
+def test_fetch_video_metadata_retries_once_before_succeeding(monkeypatch):
+    calls = []
+
+    def _get(*a, **k):
+        calls.append(None)
+        if len(calls) == 1:
+            raise youtube.requests.RequestException("transient proxy failure")
+        return _FakeResponse({"title": "A Title", "author_name": "A Channel"})
+
+    monkeypatch.setattr(youtube.requests, "get", _get)
+    meta = youtube.fetch_video_metadata("abc123XYZde")
+    assert meta.title == "A Title"
+    assert len(calls) == 2
 
 
 class _FakeApi:
