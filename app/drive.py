@@ -94,14 +94,14 @@ def upload_text_file(
         return created["id"]
 
 
-def read_index(folder_id: str) -> dict:
-    if settings.dry_run:
-        return {}
+def download_text(folder_id: str, filename: str) -> str | None:
+    """Downloads a file's raw text content from the folder, or None if no
+    file by that name exists there yet."""
 
     service = get_drive_service()
-    existing = _find_file(service, folder_id, INDEX_FILENAME)
+    existing = _find_file(service, folder_id, filename)
     if not existing:
-        return {}
+        return None
 
     buffer = io.BytesIO()
     request = service.files().get_media(fileId=existing["id"])
@@ -109,8 +109,27 @@ def read_index(folder_id: str) -> dict:
     done = False
     while not done:
         _, done = downloader.next_chunk()
+    return buffer.getvalue().decode("utf-8")
+
+
+def delete_file(folder_id: str, filename: str) -> None:
+    """No-op if no file by that name exists in the folder."""
+
+    service = get_drive_service()
+    existing = _find_file(service, folder_id, filename)
+    if existing:
+        service.files().delete(fileId=existing["id"]).execute()
+
+
+def read_index(folder_id: str) -> dict:
+    if settings.dry_run:
+        return {}
+
+    text = download_text(folder_id, INDEX_FILENAME)
+    if text is None:
+        return {}
     try:
-        return json.loads(buffer.getvalue().decode("utf-8"))
+        return json.loads(text)
     except json.JSONDecodeError:
         logger.warning("Index file in folder %s was not valid JSON; starting fresh.", folder_id)
         return {}

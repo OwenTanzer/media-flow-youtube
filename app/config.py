@@ -39,6 +39,8 @@ class Settings:
         self.enable_scheduler: bool = _env_bool("ENABLE_SCHEDULER", False)
         self.schedule_cron: str | None = _env("SCHEDULE_CRON")
 
+        self.discovery_lock_ttl_seconds: int = int(_env("DISCOVERY_LOCK_TTL_SECONDS", "1800"))
+
         self.oauth_client_id: str | None = _env("GOOGLE_OAUTH_CLIENT_ID")
         self.oauth_client_secret: str | None = _env("GOOGLE_OAUTH_CLIENT_SECRET")
         self.oauth_refresh_token: str | None = _env("GOOGLE_OAUTH_REFRESH_TOKEN")
