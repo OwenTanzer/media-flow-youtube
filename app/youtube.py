@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
@@ -23,7 +24,10 @@ from youtube_transcript_api.proxies import GenericProxyConfig, ProxyConfig, Webs
 
 from .config import ConfigError, settings
 
+logger = logging.getLogger("media_flow.youtube")
+
 OEMBED_URL = "https://www.youtube.com/oembed"
+OEMBED_ATTEMPTS = 2
 
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -110,23 +114,32 @@ class VideoMetadata:
 
 def fetch_video_metadata(video_id: str, timeout: float = 10.0) -> VideoMetadata:
     """Best-effort title/author lookup via YouTube's public oEmbed endpoint.
-    Requires no API key. Falls back to the video ID if the lookup fails
-    (e.g. the video is private or deleted)."""
+    Requires no API key. Falls back to the video ID if the lookup fails on
+    every attempt (e.g. the video is private/deleted, or a rotating proxy
+    keeps landing on a blocked exit IP)."""
 
-    try:
-        proxy_config = build_proxy_config()
-        response = requests.get(
-            OEMBED_URL,
-            params={"url": canonical_url(video_id), "format": "json"},
-            timeout=timeout,
-            proxies=proxy_config.to_requests_dict() if proxy_config else None,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return VideoMetadata(title=data.get("title") or video_id, author=data.get("author_name"))
-    except (requests.RequestException, ValueError):
-        # ValueError covers response.json() failing on a malformed/non-JSON body.
-        return VideoMetadata(title=video_id, author=None)
+    proxy_config = build_proxy_config()
+    proxies = proxy_config.to_requests_dict() if proxy_config else None
+
+    last_exc: Exception | None = None
+    for attempt in range(1, OEMBED_ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                OEMBED_URL,
+                params={"url": canonical_url(video_id), "format": "json"},
+                timeout=timeout,
+                proxies=proxies,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return VideoMetadata(title=data.get("title") or video_id, author=data.get("author_name"))
+        except (requests.RequestException, ValueError) as exc:
+            # ValueError covers response.json() failing on a malformed/non-JSON body.
+            last_exc = exc
+            logger.warning("oEmbed lookup failed for %s (attempt %d/%d): %s", video_id, attempt, OEMBED_ATTEMPTS, exc)
+
+    logger.warning("Falling back to video ID as title for %s after %d failed oEmbed attempts: %s", video_id, OEMBED_ATTEMPTS, last_exc)
+    return VideoMetadata(title=video_id, author=None)
 
 
 @dataclass
