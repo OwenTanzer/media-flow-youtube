@@ -21,6 +21,10 @@ single small service on Railway.
 - Every fetch (success or failure) is recorded in `_index.json` in the
   folder, keyed by video ID, so you always know what's been tried and
   where to find it.
+- `discover_and_process.py` — optionally, poll a set of YouTube channels
+  (configured in `channels.json`, also in Drive) for new uploads via
+  their public RSS feeds, queue the ones not seen before, and process the
+  queue, all in one scheduled run. See "Scheduled channel discovery" below.
 - Missing/disabled captions, unavailable videos, and IP blocks are all
   caught and reported as a `status` field — the service never crashes on
   a single bad video.
@@ -219,6 +223,85 @@ with start command `python batch_runner.py`, pointed at the same
 environment variables. Railway runs it on your schedule and shuts it down
 between runs — no idle web process needed.
 
+## Scheduled channel discovery (optional)
+
+Instead of (or as well as) manually editing `queue.json`, you can point
+the app at a set of YouTube channels and have it discover new uploads on
+its own via each channel's public RSS feed.
+
+### 1. Create `channels.json` in the Drive folder
+
+```json
+{
+  "version": 1,
+  "channels": [
+    {
+      "channel_id": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+      "name": "Google for Developers",
+      "enabled": true
+    },
+    {
+      "channel_id": "UCsomeSpanishChannelId",
+      "name": "Some Spanish-language channel",
+      "enabled": true,
+      "languages": ["es", "en"]
+    }
+  ]
+}
+```
+
+- `channel_id` is the stable `UC…` channel ID (not the `@handle`) — find
+  it in a channel's page source, or via any "channel ID lookup" tool.
+- `enabled: false` skips a channel without deleting its entry.
+- `languages` is optional; when set, it overrides `TRANSCRIPT_LANGUAGES`
+  for videos discovered from that channel only.
+
+No deployment is needed to add, remove, enable, or disable a channel —
+just edit `channels.json` in Drive, same as `queue.json`.
+
+### 2. Deploy `discover_and_process.py` as a Railway Cron Job
+
+One job does both steps every run: discover new uploads from enabled
+channels, queue the ones not already in `_index.json` or `queue.json`,
+then process the queue exactly like `batch_runner.py` does. Deploy it as
+its own [Cron Job](https://docs.railway.com/guides/cron-jobs) service
+with start command `python discover_and_process.py`, pointed at the same
+environment variables (plus `channels.json` in the same Drive folder).
+
+**Concurrency invariant:** `queue.json` and `_index.json` use unlocked
+read-modify-write Drive operations that only tolerate one writer at a
+time. Discovery and queue processing must therefore run as one
+serialized job, never as independent, potentially-overlapping ones — do
+not *also* enable `ENABLE_SCHEDULER` or deploy `batch_runner.py` on a
+schedule alongside `discover_and_process.py`; pick one queue-processing
+path. `discover_and_process.py` additionally takes out an advisory
+Drive-based lock (`_discovery_lock.json` in the same folder) for its own
+duration, so a second overlapping invocation of *itself* (e.g. a manual
+run while a scheduled one is still going) exits immediately instead of
+racing it. `DISCOVERY_LOCK_TTL_SECONDS` (default `1800`) controls how old
+that lock must be before a new run assumes the previous one crashed and
+proceeds anyway.
+
+This lock is deliberately advisory, not a true distributed
+compare-and-swap (that redesign - Drive revision/ETag preconditions plus
+retry, or a transactional shared store - is explicitly out of scope for
+this feature). Its acquire is a check-then-write that isn't atomic across
+processes, and Drive additionally permits duplicate filenames in one
+folder, so two near-simultaneous invocations could otherwise both believe
+they hold the lock. Two things narrow that window: every lock carries a
+random ownership token, so a run can only ever delete or take over a
+lease it actually recognizes (a slow/crashed run can't steal or clear a
+*different* run's active lock); and immediately after writing its lock,
+a run re-checks that exactly one lock file exists and it's the one that
+run just wrote, backing off if a concurrent writer is detected. Real
+overlap (e.g. Railway Cron drift plus a manual run) is caught; a
+sub-second true race at the Drive API level is not fully eliminated.
+
+**Recovery:** if a run crashed and you're certain nothing is actually in
+flight, you don't have to wait out the TTL — just delete
+`_discovery_lock.json` from the Drive folder and the next run will
+acquire the lock immediately.
+
 ## Project layout
 
 ```
@@ -227,11 +310,15 @@ app/
   pipeline.py       process_video(): the shared fetch-and-archive path
   batch.py          run_batch(): queue-driven or explicit-list batch runs
   youtube.py        URL parsing, transcript fetch, oEmbed title lookup, Markdown rendering
-  drive.py          Drive upload/read + _index.json maintenance
-  queue_store.py    queue.json read/write helpers
+  drive.py          Drive upload/read + generic Drive file helpers
+  queue_store.py    queue.json read/write helpers (plain URLs or {"url","languages"} entries)
+  channel_store.py  channels.json read helper (the discovery source registry)
+  discovery.py      RSS feed fetch/parse + discover_and_enqueue(): queues unseen uploads
+  job_lock.py       Drive-based advisory lock preventing overlapping discovery runs
   scheduler.py       optional in-process APScheduler wiring
   config.py         environment variable loading/validation
   models.py         request/response schemas
 batch_runner.py     standalone entrypoint for a separate Railway Cron Job service
+discover_and_process.py  standalone entrypoint: discover channel uploads, then process the queue
 get_refresh_token.py  one-time local script to mint the Drive OAuth refresh token
 ```

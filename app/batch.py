@@ -21,19 +21,24 @@ def run_batch(urls: list[str] | None = None, languages: list[str] | None = None)
     use_queue = urls is None
 
     if use_queue:
-        urls = queue_store.read_queue(folder_id)
-        if not urls:
+        entries: list[str | dict] = queue_store.read_queue(folder_id)
+        if not entries:
             logger.info("Queue is empty, nothing to process.")
             return []
+    else:
+        entries = urls
 
     results: list[VideoResult] = []
-    remaining: list[str] = []
-    for url in urls:
-        result = safe_process_video(url, languages)
+    remaining: list[str | dict] = []
+    for entry in entries:
+        video_url = queue_store.entry_url(entry) if use_queue else entry
+        video_languages = queue_store.entry_languages(entry, languages) if use_queue else languages
+        result = safe_process_video(video_url, video_languages)
         results.append(result)
         if use_queue and result.status not in _TERMINAL_STATUSES:
-            # Transient failure (e.g. rate limiting) - keep it in the queue for next run.
-            remaining.append(url)
+            # Transient failure (e.g. rate limiting) - keep it in the queue for next
+            # run, preserving the original str/dict shape so a language override survives.
+            remaining.append(entry)
 
     if use_queue:
         queue_store.write_queue(folder_id, remaining)

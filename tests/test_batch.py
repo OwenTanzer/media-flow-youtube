@@ -40,6 +40,39 @@ def test_run_batch_from_queue_keeps_only_transient_failures(monkeypatch):
     assert written["urls"] == ["c", "d"]
 
 
+def test_run_batch_passes_dict_entry_languages_to_safe_process_video(monkeypatch):
+    monkeypatch.setattr(
+        batch.queue_store, "read_queue", lambda folder_id: [{"url": "https://youtu.be/x", "languages": ["es"]}]
+    )
+    monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: None)
+
+    seen = {}
+
+    def _fake(url, languages=None):
+        seen["url"] = url
+        seen["languages"] = languages
+        return _result("x", "ok", url)
+
+    monkeypatch.setattr(batch, "safe_process_video", _fake)
+
+    batch.run_batch()
+
+    assert seen["url"] == "https://youtu.be/x"
+    assert seen["languages"] == ["es"]
+
+
+def test_run_batch_requeues_transient_failure_as_the_same_dict_entry(monkeypatch):
+    entry = {"url": "https://youtu.be/x", "languages": ["es"]}
+    monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: [entry])
+    written = {}
+    monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: written.setdefault("urls", urls))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result("x", "blocked", url))
+
+    batch.run_batch()
+
+    assert written["urls"] == [entry]
+
+
 def test_run_batch_empty_queue_is_a_noop(monkeypatch):
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: [])
     write_calls = []
