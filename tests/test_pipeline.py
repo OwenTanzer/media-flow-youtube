@@ -1,0 +1,104 @@
+from app import pipeline, youtube
+from app.models import VideoResult
+
+
+def _stub_transcript_and_metadata(monkeypatch, *, status="ok"):
+    if status == "ok":
+        result = youtube.TranscriptResult(
+            "abc123XYZde", "ok", language="English", language_code="en", is_generated=False,
+            lines=[(0.0, "hi")],
+        )
+    else:
+        result = youtube.TranscriptResult("abc123XYZde", status, message="nope")
+    monkeypatch.setattr(pipeline.youtube, "fetch_transcript", lambda video_id, languages: result)
+    monkeypatch.setattr(
+        pipeline.youtube, "fetch_video_metadata", lambda video_id: youtube.VideoMetadata("Title", "Author")
+    )
+
+
+def test_process_video_invalid_url_short_circuits():
+    result = pipeline.process_video("https://example.com/nope")
+    assert result.status == "invalid_url"
+    assert result.video_id == ""
+
+
+def test_process_video_ok_uploads_and_indexes(monkeypatch):
+    _stub_transcript_and_metadata(monkeypatch, status="ok")
+    uploaded = {}
+    monkeypatch.setattr(
+        pipeline.drive,
+        "upload_text_file",
+        lambda folder_id, filename, content, **k: uploaded.setdefault("file_id", "drive-id-123") or "drive-id-123",
+    )
+    indexed = {}
+    monkeypatch.setattr(
+        pipeline.drive,
+        "update_index_entry",
+        lambda folder_id, video_id, entry: indexed.update(entry),
+    )
+
+    result = pipeline.process_video("https://www.youtube.com/watch?v=abc123XYZde")
+
+    assert result.status == "ok"
+    assert result.drive_file_id == "drive-id-123"
+    assert result.message is None
+    assert indexed["status"] == "ok"
+    assert indexed["video_id"] == "abc123XYZde"
+
+
+def test_process_video_no_captions_skips_upload(monkeypatch):
+    _stub_transcript_and_metadata(monkeypatch, status="no_captions")
+    upload_called = []
+    monkeypatch.setattr(pipeline.drive, "upload_text_file", lambda *a, **k: upload_called.append(1))
+    monkeypatch.setattr(pipeline.drive, "update_index_entry", lambda *a, **k: None)
+
+    result = pipeline.process_video("https://www.youtube.com/watch?v=abc123XYZde")
+
+    assert result.status == "no_captions"
+    assert result.filename is None
+    assert not upload_called
+
+
+def test_index_failure_does_not_erase_a_successful_archive(monkeypatch):
+    """Regression test for the review finding: a failed _index.json write
+    must not turn an already-uploaded transcript into a reported failure."""
+    _stub_transcript_and_metadata(monkeypatch, status="ok")
+    monkeypatch.setattr(pipeline.drive, "upload_text_file", lambda *a, **k: "drive-id-123")
+
+    def _boom(*a, **k):
+        raise RuntimeError("Drive index write failed")
+
+    monkeypatch.setattr(pipeline.drive, "update_index_entry", _boom)
+
+    result = pipeline.process_video("https://www.youtube.com/watch?v=abc123XYZde")
+
+    assert result.status == "ok"
+    assert result.drive_file_id == "drive-id-123"
+    assert "index update failed" in result.message
+
+
+def test_safe_process_video_isolates_unexpected_exceptions(monkeypatch):
+    """Regression test for the review finding: an unhandled exception from
+    anywhere in the pipeline must become an 'error' result, not propagate."""
+
+    def _boom(url_or_id, languages=None):
+        raise RuntimeError("service account credentials are invalid")
+
+    monkeypatch.setattr(pipeline, "process_video", _boom)
+
+    result = pipeline.safe_process_video("https://www.youtube.com/watch?v=abc123XYZde")
+
+    assert isinstance(result, VideoResult)
+    assert result.status == "error"
+    assert "credentials are invalid" in result.message
+
+
+def test_safe_process_video_passes_through_normal_results(monkeypatch):
+    _stub_transcript_and_metadata(monkeypatch, status="ok")
+    monkeypatch.setattr(pipeline.drive, "upload_text_file", lambda *a, **k: "drive-id-123")
+    monkeypatch.setattr(pipeline.drive, "update_index_entry", lambda *a, **k: None)
+
+    result = pipeline.safe_process_video("https://www.youtube.com/watch?v=abc123XYZde")
+
+    assert result.status == "ok"
+    assert result.drive_file_id == "drive-id-123"
