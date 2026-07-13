@@ -61,26 +61,49 @@ def process_video(url_or_id: str, languages: list[str] | None = None) -> VideoRe
         filename=filename,
         drive_file_id=file_id,
     )
-    _record_index_entry(video_id, result, fetched_at)
-    return result
+    return _record_index_entry(video_id, result, fetched_at)
 
 
-def _record_index_entry(video_id: str, result: VideoResult, fetched_at: str) -> None:
+def safe_process_video(url_or_id: str, languages: list[str] | None = None) -> VideoResult:
+    """Same as process_video(), but never raises: Drive/library failures that
+    aren't already modeled as a status become an "error" result instead of
+    aborting whichever batch of videos is being processed."""
+
+    try:
+        return process_video(url_or_id, languages)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected error processing %s", url_or_id)
+        return VideoResult(video_id="", url=url_or_id, status="error", message=str(exc))
+
+
+def _record_index_entry(video_id: str, result: VideoResult, fetched_at: str) -> VideoResult:
     try:
         folder_id = settings.require_drive_folder_id()
     except Exception:  # noqa: BLE001
-        return
-    drive.update_index_entry(
-        folder_id,
-        video_id,
-        {
-            "video_id": video_id,
-            "url": result.url,
-            "title": result.title,
-            "status": result.status,
-            "filename": result.filename,
-            "drive_file_id": result.drive_file_id,
-            "message": result.message,
-            "fetched_at": fetched_at,
-        },
-    )
+        return result
+
+    try:
+        drive.update_index_entry(
+            folder_id,
+            video_id,
+            {
+                "video_id": video_id,
+                "url": result.url,
+                "title": result.title,
+                "status": result.status,
+                "filename": result.filename,
+                "drive_file_id": result.drive_file_id,
+                "message": result.message,
+                "fetched_at": fetched_at,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The transcript itself (if any) is already archived at this point -
+        # the index is a lookup convenience, not the primary record. Don't
+        # turn an already-successful archive into a reported failure.
+        logger.exception("Failed to update _index.json for %s", video_id)
+        if result.status == "ok":
+            return result.model_copy(
+                update={"message": f"Transcript archived, but the index update failed: {exc}"}
+            )
+    return result

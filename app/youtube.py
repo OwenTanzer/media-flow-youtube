@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
@@ -82,7 +83,8 @@ def fetch_video_metadata(video_id: str, timeout: float = 10.0) -> VideoMetadata:
         response.raise_for_status()
         data = response.json()
         return VideoMetadata(title=data.get("title") or video_id, author=data.get("author_name"))
-    except requests.RequestException:
+    except (requests.RequestException, ValueError):
+        # ValueError covers response.json() failing on a malformed/non-JSON body.
         return VideoMetadata(title=video_id, author=None)
 
 
@@ -152,14 +154,19 @@ def render_transcript_markdown(
     is_generated: bool | None,
     lines: list[tuple[float, str]],
 ) -> str:
+    # JSON string escaping is a valid subset of YAML double-quoted scalar
+    # escaping, so json.dumps() gives us a safe quoted YAML value for any
+    # free-form text (titles/channel names with quotes, colons, newlines, etc.)
+    # without pulling in a YAML library.
+    language_display = f"{language or 'unknown'} ({language_code or '?'})"
     frontmatter = [
         "---",
         f"video_id: {video_id}",
-        f'title: "{title.replace(chr(34), chr(39))}"',
+        f"title: {json.dumps(title)}",
         f"url: {url}",
-        f"channel: {author or 'unknown'}",
+        f"channel: {json.dumps(author or 'unknown')}",
         f"fetched_at: {fetched_at}",
-        f"language: {language or 'unknown'} ({language_code or '?'})",
+        f"language: {json.dumps(language_display)}",
         f"auto_generated: {bool(is_generated)}",
         "---",
         "",

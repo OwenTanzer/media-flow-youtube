@@ -68,7 +68,7 @@ See [`.env.example`](.env.example) for the full list. At minimum:
 |---|---|
 | `DRIVE_FOLDER_ID` | The Drive folder ID from step 1. |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | The service account key JSON — raw or base64-encoded (`base64 -w0 key.json`). Base64 is recommended since some hosting UIs mangle multi-line env vars. |
-| `API_KEY` | Shared secret required in the `X-API-Key` header. Required in practice since the deployed URL is public. |
+| `API_KEY` | Shared secret required in the `X-API-Key` header. The app refuses to start without it unless `DRY_RUN=true`, since the deployed URL is otherwise public and unauthenticated. |
 
 ### 3. Run locally
 

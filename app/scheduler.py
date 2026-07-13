@@ -33,8 +33,23 @@ def start_scheduler() -> None:
     if _scheduler is not None:
         return
 
+    try:
+        trigger = CronTrigger.from_crontab(settings.schedule_cron)
+    except ValueError:
+        logger.error(
+            "SCHEDULE_CRON=%r is not a valid crontab expression; scheduler not started.",
+            settings.schedule_cron,
+        )
+        return
+
     _scheduler = BackgroundScheduler(timezone="UTC")
-    trigger = CronTrigger.from_crontab(settings.schedule_cron)
     _scheduler.add_job(_run_scheduled_batch, trigger=trigger, id="drive-queue-batch", replace_existing=True)
     _scheduler.start()
     logger.info("Scheduler started with cron schedule: %s", settings.schedule_cron)
+
+
+def stop_scheduler() -> None:
+    global _scheduler
+    if _scheduler is not None:
+        _scheduler.shutdown(wait=False)
+        _scheduler = None

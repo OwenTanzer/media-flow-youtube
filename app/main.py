@@ -6,7 +6,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from .batch import run_batch
 from .config import ConfigError, settings
 from .models import BatchRequest, BatchResponse, TranscriptRequest, TranscriptResponse, VideoResult
-from .pipeline import process_video
+from .pipeline import safe_process_video
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("media_flow.main")
@@ -14,8 +14,11 @@ logger = logging.getLogger("media_flow.main")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    if not settings.api_key:
-        logger.warning("API_KEY is not set - the /transcripts and /batch endpoints are unauthenticated.")
+    if not settings.api_key and not settings.dry_run:
+        raise RuntimeError(
+            "API_KEY is not set. Refusing to start with an unauthenticated public endpoint. "
+            "Set API_KEY, or set DRY_RUN=true for local testing without auth."
+        )
     if settings.dry_run:
         logger.warning("DRY_RUN is enabled - no files will actually be written to Google Drive.")
     if settings.enable_scheduler:
@@ -23,6 +26,10 @@ async def lifespan(_: FastAPI):
 
         start_scheduler()
     yield
+    if settings.enable_scheduler:
+        from .scheduler import stop_scheduler
+
+        stop_scheduler()
 
 
 app = FastAPI(title="media-flow-youtube", version="1.0.0", lifespan=lifespan)
@@ -53,7 +60,7 @@ def create_transcripts(request: TranscriptRequest) -> TranscriptResponse:
     except ConfigError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    results: list[VideoResult] = [process_video(url, request.languages) for url in request.urls]
+    results: list[VideoResult] = [safe_process_video(url, request.languages) for url in request.urls]
     return TranscriptResponse(results=results)
 
 
