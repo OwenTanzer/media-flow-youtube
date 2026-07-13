@@ -43,6 +43,15 @@ class Settings:
         self.oauth_client_secret: str | None = _env("GOOGLE_OAUTH_CLIENT_SECRET")
         self.oauth_refresh_token: str | None = _env("GOOGLE_OAUTH_REFRESH_TOKEN")
 
+        self.youtube_proxy_type: str | None = _env("YOUTUBE_PROXY_TYPE")
+        self.webshare_proxy_username: str | None = _env("WEBSHARE_PROXY_USERNAME")
+        self.webshare_proxy_password: str | None = _env("WEBSHARE_PROXY_PASSWORD")
+        self.webshare_proxy_locations: list[str] = [
+            code.strip().upper() for code in _env("WEBSHARE_PROXY_LOCATIONS", "").split(",") if code.strip()
+        ]
+        self.youtube_proxy_http_url: str | None = _env("YOUTUBE_PROXY_HTTP_URL")
+        self.youtube_proxy_https_url: str | None = _env("YOUTUBE_PROXY_HTTPS_URL")
+
     def require_oauth_credentials(self) -> OAuthCredentials:
         missing = [
             name

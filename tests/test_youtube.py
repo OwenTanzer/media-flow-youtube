@@ -103,7 +103,7 @@ class _FakeTranscript:
 
 def test_fetch_transcript_ok(monkeypatch):
     fake = _FakeTranscript([_FakeSnippet(0.0, "hi"), _FakeSnippet(1.5, "there")])
-    monkeypatch.setattr(youtube, "YouTubeTranscriptApi", lambda: _FakeApi(fake))
+    monkeypatch.setattr(youtube, "YouTubeTranscriptApi", lambda **kwargs: _FakeApi(fake))
     result = youtube.fetch_transcript("abc123XYZde", ["en"])
     assert result.status == "ok"
     assert result.lines == [(0.0, "hi"), (1.5, "there")]
@@ -120,7 +120,7 @@ def test_fetch_transcript_ok(monkeypatch):
     ],
 )
 def test_fetch_transcript_maps_known_exceptions_to_status(monkeypatch, exc, expected_status):
-    monkeypatch.setattr(youtube, "YouTubeTranscriptApi", lambda: _FakeApi(exc))
+    monkeypatch.setattr(youtube, "YouTubeTranscriptApi", lambda **kwargs: _FakeApi(exc))
     result = youtube.fetch_transcript("abc123XYZde", ["en"])
     assert result.status == expected_status
     assert result.lines is None
@@ -154,3 +154,95 @@ def test_render_transcript_markdown_title_round_trips_through_json_too():
     title = 'a "quoted" \\ backslash and emoji 🎬'
     dumped = json.dumps(title)
     assert json.loads(dumped) == title
+
+
+def _clear_proxy_settings(monkeypatch):
+    for attr, value in (
+        ("youtube_proxy_type", None),
+        ("webshare_proxy_username", None),
+        ("webshare_proxy_password", None),
+        ("webshare_proxy_locations", []),
+        ("youtube_proxy_http_url", None),
+        ("youtube_proxy_https_url", None),
+    ):
+        monkeypatch.setattr(youtube.settings, attr, value)
+
+
+def test_build_proxy_config_defaults_to_none(monkeypatch):
+    _clear_proxy_settings(monkeypatch)
+    assert youtube.build_proxy_config() is None
+
+
+def test_build_proxy_config_none_is_explicit_no_op(monkeypatch):
+    _clear_proxy_settings(monkeypatch)
+    monkeypatch.setattr(youtube.settings, "youtube_proxy_type", "none")
+    assert youtube.build_proxy_config() is None
+
+
+def test_build_proxy_config_webshare(monkeypatch):
+    _clear_proxy_settings(monkeypatch)
+    monkeypatch.setattr(youtube.settings, "youtube_proxy_type", "webshare")
+    monkeypatch.setattr(youtube.settings, "webshare_proxy_username", "wsuser")
+    monkeypatch.setattr(youtube.settings, "webshare_proxy_password", "wspass")
+
+    config = youtube.build_proxy_config()
+
+    assert isinstance(config, youtube.WebshareProxyConfig)
+    assert config.proxy_username == "wsuser"
+    assert config.proxy_password == "wspass"
+
+
+def test_build_proxy_config_webshare_missing_credentials_raises(monkeypatch):
+    _clear_proxy_settings(monkeypatch)
+    monkeypatch.setattr(youtube.settings, "youtube_proxy_type", "webshare")
+
+    with pytest.raises(youtube.ConfigError, match="WEBSHARE_PROXY_USERNAME"):
+        youtube.build_proxy_config()
+
+
+def test_build_proxy_config_generic(monkeypatch):
+    _clear_proxy_settings(monkeypatch)
+    monkeypatch.setattr(youtube.settings, "youtube_proxy_type", "generic")
+    monkeypatch.setattr(youtube.settings, "youtube_proxy_http_url", "http://user:pass@proxy.example:8080")
+
+    config = youtube.build_proxy_config()
+
+    assert isinstance(config, youtube.GenericProxyConfig)
+    assert config.to_requests_dict() == {
+        "http": "http://user:pass@proxy.example:8080",
+        "https": "http://user:pass@proxy.example:8080",
+    }
+
+
+def test_build_proxy_config_generic_missing_urls_raises(monkeypatch):
+    _clear_proxy_settings(monkeypatch)
+    monkeypatch.setattr(youtube.settings, "youtube_proxy_type", "generic")
+
+    with pytest.raises(youtube.ConfigError, match="YOUTUBE_PROXY_HTTP_URL"):
+        youtube.build_proxy_config()
+
+
+def test_build_proxy_config_unknown_type_raises(monkeypatch):
+    _clear_proxy_settings(monkeypatch)
+    monkeypatch.setattr(youtube.settings, "youtube_proxy_type", "socks5-magic")
+
+    with pytest.raises(youtube.ConfigError, match="socks5-magic"):
+        youtube.build_proxy_config()
+
+
+def test_fetch_transcript_passes_proxy_config_through(monkeypatch):
+    _clear_proxy_settings(monkeypatch)
+    monkeypatch.setattr(youtube.settings, "youtube_proxy_type", "generic")
+    monkeypatch.setattr(youtube.settings, "youtube_proxy_http_url", "http://proxy.example:8080")
+
+    fake = _FakeTranscript([_FakeSnippet(0.0, "hi")])
+    seen_kwargs = {}
+
+    def fake_api(**kwargs):
+        seen_kwargs.update(kwargs)
+        return _FakeApi(fake)
+
+    monkeypatch.setattr(youtube, "YouTubeTranscriptApi", fake_api)
+    youtube.fetch_transcript("abc123XYZde", ["en"])
+
+    assert isinstance(seen_kwargs["proxy_config"], youtube.GenericProxyConfig)

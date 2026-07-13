@@ -19,6 +19,9 @@ from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     VideoUnavailable,
 )
+from youtube_transcript_api.proxies import GenericProxyConfig, ProxyConfig, WebshareProxyConfig
+
+from .config import ConfigError, settings
 
 OEMBED_URL = "https://www.youtube.com/oembed"
 
@@ -63,6 +66,42 @@ def canonical_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+def build_proxy_config() -> ProxyConfig | None:
+    """Builds the egress proxy for outbound YouTube requests, if configured.
+    Both a rotating residential provider (Webshare, which the library has
+    first-class support for) and any generic HTTP/HTTPS proxy - including a
+    self-hosted tunnel - are supported via YOUTUBE_PROXY_TYPE."""
+
+    proxy_type = (settings.youtube_proxy_type or "").strip().lower()
+    if not proxy_type or proxy_type == "none":
+        return None
+
+    if proxy_type == "webshare":
+        if not settings.webshare_proxy_username or not settings.webshare_proxy_password:
+            raise ConfigError(
+                "YOUTUBE_PROXY_TYPE=webshare requires WEBSHARE_PROXY_USERNAME and "
+                "WEBSHARE_PROXY_PASSWORD to be set."
+            )
+        return WebshareProxyConfig(
+            proxy_username=settings.webshare_proxy_username,
+            proxy_password=settings.webshare_proxy_password,
+            filter_ip_locations=settings.webshare_proxy_locations or None,
+        )
+
+    if proxy_type == "generic":
+        if not settings.youtube_proxy_http_url and not settings.youtube_proxy_https_url:
+            raise ConfigError(
+                "YOUTUBE_PROXY_TYPE=generic requires YOUTUBE_PROXY_HTTP_URL and/or "
+                "YOUTUBE_PROXY_HTTPS_URL to be set."
+            )
+        return GenericProxyConfig(
+            http_url=settings.youtube_proxy_http_url,
+            https_url=settings.youtube_proxy_https_url,
+        )
+
+    raise ConfigError(f"Unknown YOUTUBE_PROXY_TYPE: {settings.youtube_proxy_type!r}")
+
+
 @dataclass
 class VideoMetadata:
     title: str
@@ -75,10 +114,12 @@ def fetch_video_metadata(video_id: str, timeout: float = 10.0) -> VideoMetadata:
     (e.g. the video is private or deleted)."""
 
     try:
+        proxy_config = build_proxy_config()
         response = requests.get(
             OEMBED_URL,
             params={"url": canonical_url(video_id), "format": "json"},
             timeout=timeout,
+            proxies=proxy_config.to_requests_dict() if proxy_config else None,
         )
         response.raise_for_status()
         data = response.json()
@@ -104,7 +145,7 @@ def fetch_transcript(video_id: str, languages: list[str]) -> TranscriptResult:
     the caller can act on without needing to know about this library."""
 
     try:
-        transcript = YouTubeTranscriptApi().fetch(video_id, languages=languages)
+        transcript = YouTubeTranscriptApi(proxy_config=build_proxy_config()).fetch(video_id, languages=languages)
     except TranscriptsDisabled:
         return TranscriptResult(video_id, "no_captions", message="Captions are disabled for this video.")
     except NoTranscriptFound:

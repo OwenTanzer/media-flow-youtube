@@ -13,4 +13,10 @@ def _base_settings(monkeypatch):
     monkeypatch.setattr(settings, "languages", ["en"])
     monkeypatch.setattr(settings, "enable_scheduler", False)
     monkeypatch.setattr(settings, "schedule_cron", None)
+    monkeypatch.setattr(settings, "youtube_proxy_type", None)
+    monkeypatch.setattr(settings, "webshare_proxy_username", None)
+    monkeypatch.setattr(settings, "webshare_proxy_password", None)
+    monkeypatch.setattr(settings, "webshare_proxy_locations", [])
+    monkeypatch.setattr(settings, "youtube_proxy_http_url", None)
+    monkeypatch.setattr(settings, "youtube_proxy_https_url", None)
     yield settings

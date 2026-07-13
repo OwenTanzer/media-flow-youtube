@@ -102,3 +102,15 @@ def test_startup_fails_when_drive_folder_id_missing_and_not_dry_run(monkeypatch)
     with pytest.raises(ConfigError):
         with TestClient(app):
             pass
+
+
+def test_startup_fails_when_proxy_config_is_invalid(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "youtube_proxy_type", "generic")
+    monkeypatch.setattr(settings, "youtube_proxy_http_url", None)
+    monkeypatch.setattr(settings, "youtube_proxy_https_url", None)
+
+    with pytest.raises(RuntimeError, match="Invalid YouTube proxy configuration"):
+        with TestClient(app):
+            pass
