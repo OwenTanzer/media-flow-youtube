@@ -18,12 +18,14 @@ GOOGLE_OAUTH_CLIENT_SECRET) wherever the app runs. This script never
 sends your credentials anywhere but Google's own OAuth servers.
 """
 
+import sys
+
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
-def main() -> None:
+def main() -> int:
     client_id = input("OAuth client ID: ").strip()
     client_secret = input("OAuth client secret: ").strip()
 
@@ -37,13 +39,25 @@ def main() -> None:
         }
     }
     flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-    creds = flow.run_local_server(port=0)
+    # access_type=offline requests a refresh token at all; prompt=consent
+    # forces Google to re-issue one even if you've authorized this app
+    # before (by default a repeat authorization returns none).
+    creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+
+    if not creds.refresh_token:
+        print(
+            "\nNo refresh token was returned. Revoke this app's access at "
+            "https://myaccount.google.com/permissions and run this script again.",
+            file=sys.stderr,
+        )
+        return 1
 
     print("\nSuccess. Set these environment variables wherever the app runs:\n")
     print(f"GOOGLE_OAUTH_CLIENT_ID={client_id}")
     print(f"GOOGLE_OAUTH_CLIENT_SECRET={client_secret}")
     print(f"GOOGLE_OAUTH_REFRESH_TOKEN={creds.refresh_token}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

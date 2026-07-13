@@ -21,6 +21,16 @@ async def lifespan(_: FastAPI):
         )
     if settings.dry_run:
         logger.warning("DRY_RUN is enabled - no files will actually be written to Google Drive.")
+    else:
+        from . import drive
+
+        settings.require_drive_folder_id()
+        try:
+            drive.get_drive_service()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"Failed to validate Google Drive OAuth credentials at startup: {exc}"
+            ) from exc
     if settings.enable_scheduler:
         from .scheduler import start_scheduler
 

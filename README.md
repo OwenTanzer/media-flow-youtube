@@ -80,6 +80,16 @@ Treat the client secret and refresh token like passwords: set them only
 in Railway's environment variables (or a local, gitignored `.env`) —
 never commit them, and never paste them into a public place.
 
+**Before deploying long-term**, check your OAuth consent screen's
+publishing status under **APIs & Services → OAuth consent screen**. Left
+in **Testing**, Google expires refresh tokens after 7 days — fine for a
+local smoke test, but it'll silently break the deployed service a week
+in. Move it to **Production** (no Google verification review is required
+for personal, single-user use like this) so the refresh token doesn't
+expire. If a token does expire, just rerun `get_refresh_token.py` and
+update the env var. See
+[Google's docs on refresh token expiration](https://developers.google.com/identity/protocols/oauth2#expiration).
+
 ### 2. Configure environment variables
 
 See [`.env.example`](.env.example) for the full list. At minimum:
