@@ -1,5 +1,7 @@
 # media-flow-youtube
 
+![CI](https://github.com/OwenTanzer/media-flow-youtube/actions/workflows/ci.yml/badge.svg)
+
 A lightweight backend that fetches YouTube transcripts on demand or on a
 schedule, and archives them to a Google Drive folder as clean Markdown
 files (with metadata frontmatter) plus a JSON index. Built to run as a
@@ -82,6 +84,20 @@ uvicorn app.main:app --reload
 
 Set `DRY_RUN=true` to test the API and transcript pipeline without a real
 Drive folder or credentials — Drive writes are logged instead of sent.
+
+### Testing
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+ruff check .
+```
+
+The test suite mocks YouTube/Drive/oEmbed calls throughout, so it runs
+offline with no real credentials. It also covers the failure-isolation
+behavior called out below (a bad video can't 500 a whole request, and a
+failed index update can't erase a successful archive). GitHub Actions
+(`.github/workflows/ci.yml`) runs both on every push and pull request.
 
 ### 4. Deploy to Railway
 
