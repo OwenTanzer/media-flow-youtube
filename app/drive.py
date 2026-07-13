@@ -9,7 +9,8 @@ import logging
 import re
 import threading
 
-from google.oauth2 import service_account
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
@@ -18,6 +19,7 @@ from .config import settings
 logger = logging.getLogger("media_flow.drive")
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+TOKEN_URI = "https://oauth2.googleapis.com/token"
 INDEX_FILENAME = "_index.json"
 
 _lock = threading.RLock()
@@ -37,9 +39,18 @@ def transcript_filename(video_id: str, title: str) -> str:
 def get_drive_service():
     global _service
     if _service is None:
-        creds = service_account.Credentials.from_service_account_info(
-            settings.service_account_info, scopes=SCOPES
+        oauth = settings.require_oauth_credentials()
+        creds = Credentials(
+            token=None,
+            refresh_token=oauth.refresh_token,
+            token_uri=TOKEN_URI,
+            client_id=oauth.client_id,
+            client_secret=oauth.client_secret,
+            scopes=SCOPES,
         )
+        # Refresh eagerly so a revoked/invalid refresh token fails fast here
+        # instead of surfacing later as an opaque error on the first upload.
+        creds.refresh(Request())
         _service = build("drive", "v3", credentials=creds, cache_discovery=False)
     return _service
 

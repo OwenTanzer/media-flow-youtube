@@ -51,16 +51,34 @@ auto_generated: false
 
 ## Setup
 
-### 1. Create a Google Cloud service account
+### 1. Get OAuth credentials for your Google account
+
+The app authenticates to Drive as **your own Google account**, not a
+service account — service accounts have zero Drive storage quota and
+can't create new files in a personal ("My Drive") folder, only edit
+files someone else already owns. Since a personal Gmail account can't
+use Shared Drives or domain-delegated service accounts (those require
+Google Workspace), OAuth user credentials are the fix.
 
 1. In the [Google Cloud Console](https://console.cloud.google.com/), create
    (or reuse) a project and enable the **Google Drive API**.
-2. Create a service account, then create and download a JSON key for it.
-3. In Google Drive, create the folder you want transcripts archived to,
-   and **share it with the service account's `client_email`** (Editor
-   access). The service account has no access of its own — this share is
-   what grants it.
-4. Copy the folder's ID from its URL (`https://drive.google.com/drive/folders/<THIS_PART>`).
+2. Under **APIs & Services → Credentials**, create an **OAuth client ID**
+   of type **Desktop app**. Note the client ID and client secret.
+3. Locally, run the one-time authorization script to mint a refresh token:
+   ```bash
+   pip install google-auth-oauthlib
+   python get_refresh_token.py
+   ```
+   This opens a browser for you to sign in and grant Drive access, then
+   prints `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, and
+   `GOOGLE_OAUTH_REFRESH_TOKEN` — set all three wherever the app runs.
+4. In Google Drive, create the folder you want transcripts archived to.
+   No sharing step is needed — you own it, since the app now acts as you.
+5. Copy the folder's ID from its URL (`https://drive.google.com/drive/folders/<THIS_PART>`).
+
+Treat the client secret and refresh token like passwords: set them only
+in Railway's environment variables (or a local, gitignored `.env`) —
+never commit them, and never paste them into a public place.
 
 ### 2. Configure environment variables
 
@@ -69,7 +87,7 @@ See [`.env.example`](.env.example) for the full list. At minimum:
 | Variable | Description |
 |---|---|
 | `DRIVE_FOLDER_ID` | The Drive folder ID from step 1. |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | The service account key JSON — raw or base64-encoded (`base64 -w0 key.json`). Base64 is recommended since some hosting UIs mangle multi-line env vars. |
+| `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` / `GOOGLE_OAUTH_REFRESH_TOKEN` | From `get_refresh_token.py` above. |
 | `API_KEY` | Shared secret required in the `X-API-Key` header. The app refuses to start without it unless `DRY_RUN=true`, since the deployed URL is otherwise public and unauthenticated. |
 
 ### 3. Run locally
@@ -181,4 +199,5 @@ app/
   config.py         environment variable loading/validation
   models.py         request/response schemas
 batch_runner.py     standalone entrypoint for a separate Railway Cron Job service
+get_refresh_token.py  one-time local script to mint the Drive OAuth refresh token
 ```

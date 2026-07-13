@@ -1,42 +1,41 @@
-import base64
-import json
-
 import pytest
 
-from app.config import ConfigError, Settings
+from app.config import ConfigError, OAuthCredentials, Settings
+
+_OAUTH_ENV_KEYS = ("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_OAUTH_REFRESH_TOKEN")
 
 
 def _settings_with(monkeypatch, **env):
-    for key in ("GOOGLE_SERVICE_ACCOUNT_JSON", "DRIVE_FOLDER_ID", "API_KEY", "TRANSCRIPT_LANGUAGES"):
+    for key in (*_OAUTH_ENV_KEYS, "DRIVE_FOLDER_ID", "API_KEY", "TRANSCRIPT_LANGUAGES"):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     return Settings()
 
 
-def test_service_account_info_parses_raw_json(monkeypatch):
-    payload = {"client_email": "svc@example.com", "type": "service_account"}
-    settings = _settings_with(monkeypatch, GOOGLE_SERVICE_ACCOUNT_JSON=json.dumps(payload))
-    assert settings.service_account_info == payload
+def test_require_oauth_credentials_present(monkeypatch):
+    settings = _settings_with(
+        monkeypatch,
+        GOOGLE_OAUTH_CLIENT_ID="client-id",
+        GOOGLE_OAUTH_CLIENT_SECRET="client-secret",
+        GOOGLE_OAUTH_REFRESH_TOKEN="refresh-token",
+    )
+    creds = settings.require_oauth_credentials()
+    assert creds == OAuthCredentials(
+        client_id="client-id", client_secret="client-secret", refresh_token="refresh-token"
+    )
 
 
-def test_service_account_info_parses_base64_json(monkeypatch):
-    payload = {"client_email": "svc@example.com", "type": "service_account"}
-    encoded = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
-    settings = _settings_with(monkeypatch, GOOGLE_SERVICE_ACCOUNT_JSON=encoded)
-    assert settings.service_account_info == payload
-
-
-def test_service_account_info_missing_raises_config_error(monkeypatch):
+def test_require_oauth_credentials_missing_raises(monkeypatch):
     settings = _settings_with(monkeypatch)
-    with pytest.raises(ConfigError):
-        settings.service_account_info
+    with pytest.raises(ConfigError, match="GOOGLE_OAUTH_CLIENT_ID"):
+        settings.require_oauth_credentials()
 
 
-def test_service_account_info_garbage_raises_config_error(monkeypatch):
-    settings = _settings_with(monkeypatch, GOOGLE_SERVICE_ACCOUNT_JSON="not json and not base64 either!!")
-    with pytest.raises(ConfigError):
-        settings.service_account_info
+def test_require_oauth_credentials_partial_raises(monkeypatch):
+    settings = _settings_with(monkeypatch, GOOGLE_OAUTH_CLIENT_ID="client-id")
+    with pytest.raises(ConfigError, match="GOOGLE_OAUTH_CLIENT_SECRET"):
+        settings.require_oauth_credentials()
 
 
 def test_require_drive_folder_id_missing_raises(monkeypatch):

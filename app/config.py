@@ -1,10 +1,16 @@
-import base64
-import json
 import os
+from dataclasses import dataclass
 
 
 class ConfigError(RuntimeError):
     pass
+
+
+@dataclass
+class OAuthCredentials:
+    client_id: str
+    client_secret: str
+    refresh_token: str
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -33,28 +39,31 @@ class Settings:
         self.enable_scheduler: bool = _env_bool("ENABLE_SCHEDULER", False)
         self.schedule_cron: str | None = _env("SCHEDULE_CRON")
 
-        self._service_account_raw = _env("GOOGLE_SERVICE_ACCOUNT_JSON")
+        self.oauth_client_id: str | None = _env("GOOGLE_OAUTH_CLIENT_ID")
+        self.oauth_client_secret: str | None = _env("GOOGLE_OAUTH_CLIENT_SECRET")
+        self.oauth_refresh_token: str | None = _env("GOOGLE_OAUTH_REFRESH_TOKEN")
 
-    @property
-    def service_account_info(self) -> dict:
-        if not self._service_account_raw:
-            raise ConfigError(
-                "GOOGLE_SERVICE_ACCOUNT_JSON is not set. Provide the service account "
-                "credentials JSON (raw or base64-encoded) as an environment variable."
+    def require_oauth_credentials(self) -> OAuthCredentials:
+        missing = [
+            name
+            for name, value in (
+                ("GOOGLE_OAUTH_CLIENT_ID", self.oauth_client_id),
+                ("GOOGLE_OAUTH_CLIENT_SECRET", self.oauth_client_secret),
+                ("GOOGLE_OAUTH_REFRESH_TOKEN", self.oauth_refresh_token),
             )
-        raw = self._service_account_raw.strip()
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            pass
-        try:
-            decoded = base64.b64decode(raw).decode("utf-8")
-            return json.loads(decoded)
-        except Exception as exc:  # noqa: BLE001
+            if not value
+        ]
+        if missing:
             raise ConfigError(
-                "GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed as JSON or "
-                "base64-encoded JSON."
-            ) from exc
+                f"Missing required OAuth environment variable(s): {', '.join(missing)}. "
+                "Run get_refresh_token.py once locally to obtain a refresh token, "
+                "then set all three."
+            )
+        return OAuthCredentials(
+            client_id=self.oauth_client_id,
+            client_secret=self.oauth_client_secret,
+            refresh_token=self.oauth_refresh_token,
+        )
 
     def require_drive_folder_id(self) -> str:
         if not self.drive_folder_id:
