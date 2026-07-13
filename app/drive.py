@@ -67,6 +67,19 @@ def _find_file(service, folder_id: str, filename: str) -> dict | None:
     return files[0] if files else None
 
 
+def list_file_ids(folder_id: str, filename: str) -> list[str]:
+    """Returns the Drive file IDs of every file with this name in the
+    folder. Drive allows duplicate filenames within one folder, so this
+    can be more than one - most notably when two writers race to create
+    the same file at nearly the same time (see job_lock.py)."""
+
+    service = get_drive_service()
+    escaped = filename.replace("'", "\\'")
+    query = f"name = '{escaped}' and '{folder_id}' in parents and trashed = false"
+    results = service.files().list(q=query, spaces="drive", fields="files(id, name)", pageSize=10).execute()
+    return [f["id"] for f in results.get("files", [])]
+
+
 def upload_text_file(
     folder_id: str, filename: str, content: str, mime_type: str = "text/markdown"
 ) -> str:

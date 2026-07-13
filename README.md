@@ -282,6 +282,21 @@ racing it. `DISCOVERY_LOCK_TTL_SECONDS` (default `1800`) controls how old
 that lock must be before a new run assumes the previous one crashed and
 proceeds anyway.
 
+This lock is deliberately advisory, not a true distributed
+compare-and-swap (that redesign - Drive revision/ETag preconditions plus
+retry, or a transactional shared store - is explicitly out of scope for
+this feature). Its acquire is a check-then-write that isn't atomic across
+processes, and Drive additionally permits duplicate filenames in one
+folder, so two near-simultaneous invocations could otherwise both believe
+they hold the lock. Two things narrow that window: every lock carries a
+random ownership token, so a run can only ever delete or take over a
+lease it actually recognizes (a slow/crashed run can't steal or clear a
+*different* run's active lock); and immediately after writing its lock,
+a run re-checks that exactly one lock file exists and it's the one that
+run just wrote, backing off if a concurrent writer is detected. Real
+overlap (e.g. Railway Cron drift plus a manual run) is caught; a
+sub-second true race at the Drive API level is not fully eliminated.
+
 **Recovery:** if a run crashed and you're certain nothing is actually in
 flight, you don't have to wait out the TTL — just delete
 `_discovery_lock.json` from the Drive folder and the next run will

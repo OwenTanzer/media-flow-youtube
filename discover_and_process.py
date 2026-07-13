@@ -32,10 +32,11 @@ def main() -> int:
         logger.error("Run aborted: %s", exc)
         return 1
 
-    if not job_lock.acquire_lock(folder_id, settings.discovery_lock_ttl_seconds):
+    lock_token = job_lock.acquire_lock(folder_id, settings.discovery_lock_ttl_seconds)
+    if lock_token is None:
         logger.error(
             "Another discover-and-process run appears to be in progress (lock held, "
-            "age < %ds); exiting without acting.",
+            "age < %ds), or lost a race to acquire the lock; exiting without acting.",
             settings.discovery_lock_ttl_seconds,
         )
         return 1
@@ -63,7 +64,7 @@ def main() -> int:
                 logger.info("  %s (%s): %s", r.video_id or r.url, r.status, r.message)
         return 0
     finally:
-        job_lock.release_lock(folder_id)
+        job_lock.release_lock(folder_id, lock_token)
 
 
 if __name__ == "__main__":
