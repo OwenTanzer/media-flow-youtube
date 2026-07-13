@@ -64,3 +64,41 @@ def test_startup_fails_closed_without_api_key_or_dry_run(monkeypatch):
     with pytest.raises(RuntimeError, match="API_KEY is not set"):
         with TestClient(app):
             pass
+
+
+def test_startup_validates_drive_credentials_when_not_dry_run(monkeypatch):
+    from app import drive
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "dry_run", False)
+    monkeypatch.setattr(drive, "get_drive_service", lambda: object())
+
+    with TestClient(app):
+        pass  # should not raise
+
+
+def test_startup_fails_when_drive_credentials_are_invalid(monkeypatch):
+    from app import drive
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "dry_run", False)
+
+    def _boom():
+        raise RuntimeError("invalid_grant: token has been revoked")
+
+    monkeypatch.setattr(drive, "get_drive_service", _boom)
+
+    with pytest.raises(RuntimeError, match="Failed to validate Google Drive OAuth credentials"):
+        with TestClient(app):
+            pass
+
+
+def test_startup_fails_when_drive_folder_id_missing_and_not_dry_run(monkeypatch):
+    from app.config import ConfigError, settings
+
+    monkeypatch.setattr(settings, "dry_run", False)
+    monkeypatch.setattr(settings, "drive_folder_id", None)
+
+    with pytest.raises(ConfigError):
+        with TestClient(app):
+            pass
