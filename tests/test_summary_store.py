@@ -176,6 +176,8 @@ def test_summarize_eligible_summarizes_a_newly_eligible_video(monkeypatch):
     # No published_at on this index entry (see _INDEX_ONE_VIDEO) - only
     # known for RSS-discovered videos.
     assert written_artifact["video_published_at"] is None
+    # Same for channel_id - not on this index entry either.
+    assert written_artifact["channel_id"] is None
 
 
 def test_summarize_eligible_surfaces_video_published_at_from_the_index(monkeypatch):
@@ -202,6 +204,31 @@ def test_summarize_eligible_surfaces_video_published_at_from_the_index(monkeypat
     summary_store.summarize_eligible("folder-id")
 
     assert written["abc123XYZde.json"]["video_published_at"] == "2026-07-01T00:00:00+00:00"
+
+
+def test_summarize_eligible_surfaces_channel_id_from_the_index(monkeypatch):
+    """Regression test: the dashboard (issue #8) needs to join a summary
+    back to its channels.json entry via a stable ID, not the free-text
+    "author" field - this must be carried from _index.json into the
+    artifact the same way video_published_at is."""
+    index_with_channel_id = {"abc123XYZde": {**_INDEX_ONE_VIDEO["abc123XYZde"], "channel_id": "UC_a"}}
+    written = _stub_drive(
+        monkeypatch, index=index_with_channel_id, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN}
+    )
+    output = ModelSummaryOutput(
+        video_type="Analytic Overview",
+        summary="Summary.",
+        points=[SummaryPoint(importance="major", main_point="Point", explanation="Because.", timestamp_seconds=0)],
+    )
+    monkeypatch.setattr(
+        summary_store,
+        "summarize_transcript",
+        lambda body, model, max_output_tokens: (output, Usage(input_tokens=10, output_tokens=5), False),
+    )
+
+    summary_store.summarize_eligible("folder-id")
+
+    assert written["abc123XYZde.json"]["channel_id"] == "UC_a"
 
 
 def test_summarize_eligible_skips_already_current_summary(monkeypatch):

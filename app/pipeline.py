@@ -13,7 +13,12 @@ from .models import VideoResult
 logger = logging.getLogger("media_flow.pipeline")
 
 
-def process_video(url_or_id: str, languages: list[str] | None = None, published_at: str | None = None) -> VideoResult:
+def process_video(
+    url_or_id: str,
+    languages: list[str] | None = None,
+    published_at: str | None = None,
+    channel_id: str | None = None,
+) -> VideoResult:
     languages = languages or settings.languages
 
     try:
@@ -35,7 +40,7 @@ def process_video(url_or_id: str, languages: list[str] | None = None, published_
             title=metadata.title,
             message=transcript.message,
         )
-        _record_index_entry(video_id, result, fetched_at, published_at)
+        _record_index_entry(video_id, result, fetched_at, published_at, channel_id)
         return result
 
     folder_id = settings.require_drive_folder_id()
@@ -62,25 +67,32 @@ def process_video(url_or_id: str, languages: list[str] | None = None, published_
         filename=filename,
         drive_file_id=file_id,
     )
-    return _record_index_entry(video_id, result, fetched_at, published_at)
+    return _record_index_entry(video_id, result, fetched_at, published_at, channel_id)
 
 
 def safe_process_video(
-    url_or_id: str, languages: list[str] | None = None, published_at: str | None = None
+    url_or_id: str,
+    languages: list[str] | None = None,
+    published_at: str | None = None,
+    channel_id: str | None = None,
 ) -> VideoResult:
     """Same as process_video(), but never raises: Drive/library failures that
     aren't already modeled as a status become an "error" result instead of
     aborting whichever batch of videos is being processed."""
 
     try:
-        return process_video(url_or_id, languages, published_at)
+        return process_video(url_or_id, languages, published_at, channel_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Unexpected error processing %s", url_or_id)
         return VideoResult(video_id="", url=url_or_id, status="error", message=str(exc))
 
 
 def _record_index_entry(
-    video_id: str, result: VideoResult, fetched_at: str, published_at: str | None = None
+    video_id: str,
+    result: VideoResult,
+    fetched_at: str,
+    published_at: str | None = None,
+    channel_id: str | None = None,
 ) -> VideoResult:
     try:
         folder_id = settings.require_drive_folder_id()
@@ -88,17 +100,20 @@ def _record_index_entry(
         return result
 
     try:
-        if published_at is None:
+        if published_at is None or channel_id is None:
             # update_index_entry() replaces the whole stored entry, not just
             # the fields we're setting here - a direct/manual reprocess
             # (e.g. via /transcripts or /batch/run with an explicit URL, or
-            # a queue entry with no known publish date) has no source of
-            # its own for this, so without this fallback it would silently
-            # erase a publish date recorded by an earlier, RSS-discovered
-            # run of the same video.
+            # a queue entry with no known publish date/channel) has no
+            # source of its own for these, so without this fallback it
+            # would silently erase a publish date or channel_id recorded by
+            # an earlier, RSS-discovered run of the same video.
             existing_entry = drive.read_index(folder_id).get(video_id)
             if existing_entry:
-                published_at = existing_entry.get("published_at")
+                if published_at is None:
+                    published_at = existing_entry.get("published_at")
+                if channel_id is None:
+                    channel_id = existing_entry.get("channel_id")
 
         drive.update_index_entry(
             folder_id,
@@ -113,6 +128,7 @@ def _record_index_entry(
                 "message": result.message,
                 "fetched_at": fetched_at,
                 "published_at": published_at,
+                "channel_id": channel_id,
             },
         )
     except Exception as exc:  # noqa: BLE001

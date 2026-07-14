@@ -436,6 +436,7 @@ required once it's set - all other settings have working defaults. See
   "author": "Rick Astley",
   "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
   "video_published_at": "2026-07-10T14:00:00+00:00",
+  "channel_id": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
   "video_type": "Analytic Overview",
   "summary": "...",
   "points": [
@@ -450,12 +451,16 @@ required once it's set - all other settings have working defaults. See
 }
 ```
 
-`title`, `author`, `url`, `video_published_at`, the source Drive file ID,
-and the transcript hash are always populated by application code from
-`_index.json` and the archived transcript file itself - never trusted
-from the model's output. `video_published_at` is `null` unless the video
-was discovered via RSS (see "Transcript file format" above) - there's no
-other source for it.
+`title`, `author`, `url`, `video_published_at`, `channel_id`, the source
+Drive file ID, and the transcript hash are always populated by application
+code from `_index.json` and the archived transcript file itself - never
+trusted from the model's output. `video_published_at` and `channel_id` are
+both `null` unless the video was discovered via RSS (see "Transcript file
+format" above) - there's no other source for either. `channel_id` is the
+stable `channels.json` ID, not the free-text `author` name embedded in the
+transcript - a downstream consumer that needs to reliably match a summary
+back to its channel registry entry (e.g. the Streamlit dashboard, issue #8)
+should join on `channel_id`, not `author`.
 Claude only produces `video_type`, `summary`, and each point's
 `importance`, `main_point`, `explanation`, and `timestamp_seconds`,
 constrained by a JSON schema (`output_config.format`) so the response is

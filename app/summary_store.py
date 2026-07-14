@@ -275,6 +275,12 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
             # content chronologically by when it was actually said, not by
             # our own processing order.
             "video_published_at": entry.get("published_at"),
+            # Only known for RSS-discovered videos, same as
+            # video_published_at above - lets a future consumer (the
+            # Streamlit dashboard, issue #8) join a video back to its
+            # channels.json entry (and thus its group) reliably, instead
+            # of matching on the free-text "author" field above.
+            "channel_id": entry.get("channel_id"),
             "model": settings.summary_model,
             "prompt_version": PROMPT_VERSION,
             "generated_at": generated_at_dt.isoformat(),

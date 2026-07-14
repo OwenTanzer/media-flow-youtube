@@ -72,7 +72,8 @@ def run_batch(
         video_url = queue_store.entry_url(entry) if use_queue else entry
         video_languages = queue_store.entry_languages(entry, languages) if use_queue else languages
         video_published_at = queue_store.entry_published_at(entry) if use_queue else None
-        result = safe_process_video(video_url, video_languages, video_published_at)
+        video_channel_id = queue_store.entry_channel_id(entry) if use_queue else None
+        result = safe_process_video(video_url, video_languages, video_published_at, video_channel_id)
         results.append(result)
 
         if not use_queue:
