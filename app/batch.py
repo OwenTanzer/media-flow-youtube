@@ -5,6 +5,7 @@ so re-running the job doesn't refetch everything."""
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 
 from . import queue_store
 from .config import settings
@@ -14,6 +15,21 @@ from .pipeline import safe_process_video
 logger = logging.getLogger("media_flow.batch")
 
 _TERMINAL_STATUSES = ("ok", "no_captions", "unavailable", "invalid_url")
+
+
+def _within_no_captions_grace_period(entry: str | dict) -> bool:
+    """A video discovered very recently (e.g. an in-progress livestream)
+    may not have captions yet purely because it hasn't ended, or YouTube
+    hasn't finished processing them. Give entries with a known discovery
+    time (see app/discovery.py) a grace period of retries before
+    "no_captions" is treated as permanent. Manually-added entries with no
+    first_seen_at get no grace period, same as before this existed."""
+
+    first_seen_at = queue_store.entry_first_seen_at(entry)
+    if first_seen_at is None:
+        return False
+    age = datetime.now(timezone.utc) - first_seen_at
+    return age < timedelta(hours=settings.no_captions_grace_hours)
 
 
 def run_batch(urls: list[str] | None = None, languages: list[str] | None = None) -> list[VideoResult]:
@@ -35,9 +51,17 @@ def run_batch(urls: list[str] | None = None, languages: list[str] | None = None)
         video_languages = queue_store.entry_languages(entry, languages) if use_queue else languages
         result = safe_process_video(video_url, video_languages)
         results.append(result)
-        if use_queue and result.status not in _TERMINAL_STATUSES:
-            # Transient failure (e.g. rate limiting) - keep it in the queue for next
-            # run, preserving the original str/dict shape so a language override survives.
+
+        if not use_queue:
+            continue
+
+        is_terminal = result.status in _TERMINAL_STATUSES
+        if is_terminal and result.status == "no_captions" and _within_no_captions_grace_period(entry):
+            is_terminal = False
+        if not is_terminal:
+            # Transient failure (e.g. rate limiting, or a livestream still within
+            # its no-captions grace period) - keep it in the queue for next run,
+            # preserving the original str/dict shape so overrides survive.
             remaining.append(entry)
 
     if use_queue:

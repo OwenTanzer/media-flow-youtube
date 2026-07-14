@@ -40,6 +40,7 @@ class Settings:
         self.schedule_cron: str | None = _env("SCHEDULE_CRON")
 
         self.discovery_lock_ttl_seconds: int = int(_env("DISCOVERY_LOCK_TTL_SECONDS", "1800"))
+        self.no_captions_grace_hours: float = float(_env("NO_CAPTIONS_GRACE_HOURS", "24"))
 
         self.oauth_client_id: str | None = _env("GOOGLE_OAUTH_CLIENT_ID")
         self.oauth_client_secret: str | None = _env("GOOGLE_OAUTH_CLIENT_SECRET")

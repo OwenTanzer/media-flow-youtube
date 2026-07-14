@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import requests
 
@@ -69,6 +70,10 @@ def fetch_channel_feed(channel_id: str, timeout: float = 10.0) -> list[Discovere
     return videos
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _known_video_ids(folder_id: str, existing_queue: list[str | dict]) -> set[str]:
     known = set(drive.read_index(folder_id).keys())
     for entry in existing_queue:
@@ -107,10 +112,10 @@ def discover_and_enqueue(folder_id: str) -> DiscoveryReport:
                 continue
             seen_this_run.add(video.video_id)
             url = youtube.canonical_url(video.video_id)
+            entry: dict = {"url": url, "first_seen_at": _utcnow().isoformat()}
             if channel.languages:
-                new_entries.append({"url": url, "languages": channel.languages})
-            else:
-                new_entries.append(url)
+                entry["languages"] = channel.languages
+            new_entries.append(entry)
 
     if new_entries:
         queue_store.write_queue(folder_id, existing_queue + new_entries)

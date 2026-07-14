@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from app import batch
 from app.models import VideoResult
 
@@ -71,6 +73,49 @@ def test_run_batch_requeues_transient_failure_as_the_same_dict_entry(monkeypatch
     batch.run_batch()
 
     assert written["urls"] == [entry]
+
+
+def test_run_batch_retries_no_captions_within_grace_period(monkeypatch):
+    """Regression test for livestream handling: a video discovered recently
+    (e.g. a livestream still in progress) shouldn't have "no_captions"
+    treated as final - it should stay queued for the next run."""
+    recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    entry = {"url": "https://youtu.be/x", "first_seen_at": recent}
+    monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: [entry])
+    written = {}
+    monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: written.setdefault("urls", urls))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result("x", "no_captions", url))
+
+    batch.run_batch()
+
+    assert written["urls"] == [entry]
+
+
+def test_run_batch_drops_no_captions_past_grace_period(monkeypatch):
+    old = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+    entry = {"url": "https://youtu.be/x", "first_seen_at": old}
+    monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: [entry])
+    written = {}
+    monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: written.setdefault("urls", urls))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result("x", "no_captions", url))
+
+    batch.run_batch()
+
+    assert written["urls"] == []
+
+
+def test_run_batch_drops_no_captions_immediately_when_entry_has_no_first_seen_at(monkeypatch):
+    """Manually-added queue.json entries (plain strings, or dicts without
+    first_seen_at) get no grace period - same behavior as before this
+    existed."""
+    monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: ["https://youtu.be/x"])
+    written = {}
+    monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: written.setdefault("urls", urls))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result("x", "no_captions", url))
+
+    batch.run_batch()
+
+    assert written["urls"] == []
 
 
 def test_run_batch_empty_queue_is_a_noop(monkeypatch):

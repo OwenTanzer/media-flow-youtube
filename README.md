@@ -302,6 +302,24 @@ flight, you don't have to wait out the TTL — just delete
 `_discovery_lock.json` from the Drive folder and the next run will
 acquire the lock immediately.
 
+### Livestreams
+
+YouTube's RSS feed lists a livestream as soon as it starts, well before
+it ends or captions exist for it. Without special handling, discovery
+would try to fetch its transcript immediately, get "no_captions", and -
+since that's normally a terminal status - drop the video for good,
+losing it even after the stream ends and captions become available.
+
+To avoid that, every video discovery queues carries a `first_seen_at`
+timestamp, and a "no_captions" result for such a video is retried on
+every subsequent run rather than treated as final, until it's older than
+`NO_CAPTIONS_GRACE_HOURS` (default `24`) - long enough to cover even a
+multi-hour livestream plus YouTube's post-stream caption-processing
+delay. Past that window, it's treated as genuinely caption-less and
+dropped, same as any other video. Videos added manually to `queue.json`
+(no `first_seen_at`) get no grace period - "no_captions" is terminal for
+them immediately, exactly as before this existed.
+
 ## Project layout
 
 ```
@@ -311,7 +329,7 @@ app/
   batch.py          run_batch(): queue-driven or explicit-list batch runs
   youtube.py        URL parsing, transcript fetch, oEmbed title lookup, Markdown rendering
   drive.py          Drive upload/read + generic Drive file helpers
-  queue_store.py    queue.json read/write helpers (plain URLs or {"url","languages"} entries)
+  queue_store.py    queue.json read/write helpers (plain URLs or {"url","languages","first_seen_at"} entries)
   channel_store.py  channels.json read helper (the discovery source registry)
   discovery.py      RSS feed fetch/parse + discover_and_enqueue(): queues unseen uploads
   job_lock.py       Drive-based advisory lock preventing overlapping discovery runs
