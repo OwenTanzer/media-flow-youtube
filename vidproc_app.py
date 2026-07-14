@@ -14,7 +14,10 @@ below.
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
+import time
 
 import streamlit as st
 
@@ -30,12 +33,38 @@ from vidproc.state import (
 )
 from vidproc.styling import CHROME_CSS
 
+logger = logging.getLogger("media_flow.vidproc_app")
+
 CACHE_TTL_SECONDS = int(os.environ.get("VIDPROC_CACHE_TTL_SECONDS", "300"))
+MIN_REFRESH_INTERVAL_SECONDS = int(os.environ.get("VIDPROC_MIN_REFRESH_INTERVAL_SECONDS", "60"))
+
+# st.cache_data is shared across every concurrent Streamlit session in this
+# process, not per-viewer - the Refresh button below therefore can't just
+# clear it on every click, since this app is public/unauthenticated (see
+# module docstring) and an unauthenticated visitor could otherwise mash
+# Refresh to force a full Drive read for every other concurrent viewer.
+# This tracks the last clear process-wide (not in st.session_state, which
+# is per-viewer) so the rate limit actually holds across sessions.
+_refresh_lock = threading.Lock()
+_last_cache_clear_at = 0.0
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def _load_snapshot_cached(folder_id: str) -> InsightsSnapshot:
     return load_snapshot(folder_id)
+
+
+def _try_clear_snapshot_cache() -> bool:
+    """Clears the shared snapshot cache if MIN_REFRESH_INTERVAL_SECONDS has
+    elapsed since the last clear (by any viewer); returns whether it did."""
+    global _last_cache_clear_at
+    now = time.monotonic()
+    with _refresh_lock:
+        if now - _last_cache_clear_at < MIN_REFRESH_INTERVAL_SECONDS:
+            return False
+        _last_cache_clear_at = now
+    _load_snapshot_cached.clear()
+    return True
 
 
 def render_unavailable_state() -> None:
@@ -52,7 +81,12 @@ def render_unavailable_state() -> None:
 
 def _init_session_state() -> None:
     st.session_state.setdefault("active_channel_selection", {})  # group -> list[channel_id]
-    st.session_state.setdefault("selected_video_id", None)
+    # Keyed per group, not a single shared value - every tab's body executes
+    # on every rerun (Streamlit doesn't lazily skip inactive tabs), so a
+    # single shared selection would get cleared by whichever other group's
+    # render happens to run afterward and finds the selected video out of
+    # its own scope.
+    st.session_state.setdefault("selected_video_id_by_group", {})  # group -> video_id
     st.session_state.setdefault("show_minor_points", True)
 
 
@@ -67,8 +101,10 @@ def render_header(snapshot: InsightsSnapshot) -> None:
             unsafe_allow_html=True,
         )
         if st.button("Refresh", use_container_width=True):
-            _load_snapshot_cached.clear()
-            st.rerun()
+            if _try_clear_snapshot_cache():
+                st.rerun()
+            else:
+                st.toast("Refresh was rate-limited - already refreshed recently.")
 
     notices = []
     if snapshot.pending_count:
@@ -105,20 +141,22 @@ def render_group(group: str, snapshot: InsightsSnapshot) -> None:
 
     scoped_videos = sorted_feed(filter_videos(snapshot.videos, group, selected_ids))
 
-    if st.session_state.selected_video_id is not None:
-        selected = next((v for v in scoped_videos if v.video_id == st.session_state.selected_video_id), None)
+    selected_video_id = st.session_state.selected_video_id_by_group.get(group)
+    if selected_video_id is not None:
+        selected = next((v for v in scoped_videos if v.video_id == selected_video_id), None)
         if selected is not None:
             if st.button("← Back to feed", key=f"back-{group}"):
-                st.session_state.selected_video_id = None
+                st.session_state.selected_video_id_by_group[group] = None
                 st.rerun()
             st.session_state.show_minor_points = st.checkbox(
                 "Show minor points", value=st.session_state.show_minor_points, key=f"show-minor-{group}"
             )
             render_detail(selected, show_minor=st.session_state.show_minor_points)
             return
-        # The previously selected video fell out of this scope (filter/group
-        # changed) - fall through and show the feed instead of a stale detail view.
-        st.session_state.selected_video_id = None
+        # The previously selected video fell out of this group's own scope
+        # (filter/group changed) - fall through and show the feed instead of
+        # a stale detail view.
+        st.session_state.selected_video_id_by_group[group] = None
 
     if not scoped_videos:
         render_empty_state("No insights yet for this selection.")
@@ -126,7 +164,7 @@ def render_group(group: str, snapshot: InsightsSnapshot) -> None:
 
     for video in scoped_videos:
         if render_feed_card(video, key_prefix=f"card-{group}"):
-            st.session_state.selected_video_id = video.video_id
+            st.session_state.selected_video_id_by_group[group] = video.video_id
             st.rerun()
 
 
@@ -144,7 +182,14 @@ def main() -> None:
 
     try:
         snapshot = _load_snapshot_cached(folder_id)
-    except ConfigError:
+    except Exception:  # noqa: BLE001
+        # This is the public application boundary - a real Drive/credential
+        # failure (OAuth refresh error, HttpError, timeout, malformed
+        # response) must never leak a stack trace or internal detail to an
+        # unauthenticated visitor. Log the full exception server-side and
+        # render only the generic unavailable state, exactly like the
+        # ConfigError case above.
+        logger.exception("Failed to load dashboard snapshot")
         render_unavailable_state()
         return
 
