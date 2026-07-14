@@ -215,10 +215,10 @@ def test_summarize_eligible_surfaces_channel_id_from_the_index(monkeypatch):
     written = _stub_drive(
         monkeypatch, index=index_with_channel_id, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN}
     )
-    output = ModelSummaryOutput(
+    output = ResolvedSummary(
         video_type="Analytic Overview",
         summary="Summary.",
-        points=[SummaryPoint(importance="major", main_point="Point", explanation="Because.", timestamp_seconds=0)],
+        points=[ResolvedPoint(importance="major", main_point="Point", explanation="Because.", timestamp_seconds=0)],
     )
     monkeypatch.setattr(
         summary_store,
