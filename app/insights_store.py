@@ -170,16 +170,18 @@ def load_snapshot(folder_id: str) -> InsightsSnapshot:
     index = drive.read_index(folder_id)
     ok_entries = [video_id for video_id, entry in index.items() if entry.get("status") == "ok"]
 
+    try:
+        artifacts = summary_store.read_summaries_bulk(folder_id, ok_entries)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to bulk-read summary artifacts: %s", exc)
+        load_errors.append("Summary artifacts could not be read.")
+        artifacts = {}
+
     videos: list[VideoInsight] = []
     pending_count = 0
 
     for video_id in ok_entries:
-        try:
-            artifact = summary_store.read_summary(folder_id, video_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to read summary artifact for %s: %s", video_id, exc)
-            load_errors.append(f"Summary artifact for {video_id} could not be read.")
-            continue
+        artifact = artifacts.get(video_id)
 
         if artifact is None or artifact.get("status") != "ok":
             # Not yet summarized, or a recorded failure (status: "error") -

@@ -67,6 +67,52 @@ def _find_file(service, folder_id: str, filename: str) -> dict | None:
     return files[0] if files else None
 
 
+def list_files(folder_id: str) -> dict[str, str]:
+    """Returns every file directly in this folder as {filename: file_id}.
+    One paginated listing instead of one query per file - callers that need
+    to resolve many known filenames in the same folder (e.g. the dashboard
+    loading every summaries/<video_id>.json) should use this plus
+    download_text_by_id() rather than N calls to download_text(), which
+    would otherwise cost a separate Drive list query per file on top of
+    the download itself.
+
+    Only the last file wins for a duplicate filename within the folder -
+    fine for this module's read-mostly callers, which don't rely on
+    Drive's atypical allowance for duplicate names."""
+
+    service = get_drive_service()
+    query = f"'{folder_id}' in parents and trashed = false"
+    files: dict[str, str] = {}
+    page_token = None
+    while True:
+        results = (
+            service.files()
+            .list(q=query, spaces="drive", fields="nextPageToken, files(id, name)", pageSize=1000, pageToken=page_token)
+            .execute()
+        )
+        for f in results.get("files", []):
+            files[f["name"]] = f["id"]
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
+def download_text_by_id(file_id: str) -> str:
+    """Downloads a file's raw text content directly by its known Drive
+    file ID, skipping the name-lookup download_text() does - use this when
+    the ID is already known (e.g. from list_files())."""
+
+    service = get_drive_service()
+    buffer = io.BytesIO()
+    request = service.files().get_media(fileId=file_id)
+    downloader = MediaIoBaseDownload(buffer, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buffer.getvalue().decode("utf-8")
+
+
 def list_file_ids(folder_id: str, filename: str) -> list[str]:
     """Returns the Drive file IDs of every file with this name in the
     folder. Drive allows duplicate filenames within one folder, so this

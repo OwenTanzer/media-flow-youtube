@@ -134,6 +134,57 @@ def _stub_drive(monkeypatch, *, index, transcripts, existing_summaries=None):
     return written
 
 
+def test_read_summaries_bulk_lists_folder_once_and_downloads_by_id(monkeypatch):
+    monkeypatch.setattr(summary_store.settings, "dry_run", False)
+    folder_calls = []
+    monkeypatch.setattr(
+        summary_store.drive,
+        "get_or_create_folder",
+        lambda parent, name: folder_calls.append((parent, name)) or "summaries-folder-id",
+    )
+    list_calls = []
+    monkeypatch.setattr(
+        summary_store.drive,
+        "list_files",
+        lambda folder_id: list_calls.append(folder_id)
+        or {"vid1.json": "file-1", "vid2.json": "file-2", "unrelated.txt": "file-3"},
+    )
+    download_calls = []
+    artifacts_by_file_id = {
+        "file-1": {"status": "ok", "video_id": "vid1"},
+        "file-2": {"status": "ok", "video_id": "vid2"},
+    }
+    monkeypatch.setattr(
+        summary_store.drive,
+        "download_text_by_id",
+        lambda file_id: download_calls.append(file_id) or json.dumps(artifacts_by_file_id[file_id]),
+    )
+
+    result = summary_store.read_summaries_bulk("folder-id", ["vid1", "vid2", "vid3-missing"])
+
+    assert folder_calls == [("folder-id", summary_store.SUMMARIES_FOLDER_NAME)]
+    assert list_calls == ["summaries-folder-id"]
+    assert sorted(download_calls) == ["file-1", "file-2"]
+    assert result == {"vid1": {"status": "ok", "video_id": "vid1"}, "vid2": {"status": "ok", "video_id": "vid2"}}
+
+
+def test_read_summaries_bulk_skips_invalid_json(monkeypatch):
+    monkeypatch.setattr(summary_store.settings, "dry_run", False)
+    monkeypatch.setattr(summary_store.drive, "get_or_create_folder", lambda parent, name: "summaries-folder-id")
+    monkeypatch.setattr(summary_store.drive, "list_files", lambda folder_id: {"vid1.json": "file-1"})
+    monkeypatch.setattr(summary_store.drive, "download_text_by_id", lambda file_id: "not json")
+
+    result = summary_store.read_summaries_bulk("folder-id", ["vid1"])
+
+    assert result == {}
+
+
+def test_read_summaries_bulk_returns_empty_in_dry_run(monkeypatch):
+    monkeypatch.setattr(summary_store.settings, "dry_run", True)
+    result = summary_store.read_summaries_bulk("folder-id", ["vid1"])
+    assert result == {}
+
+
 _INDEX_ONE_VIDEO = {
     "abc123XYZde": {
         "status": "ok",

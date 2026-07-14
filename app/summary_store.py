@@ -70,6 +70,37 @@ def read_summary(folder_id: str, video_id: str) -> dict | None:
         return None
 
 
+def read_summaries_bulk(folder_id: str, video_ids: list[str]) -> dict[str, dict]:
+    """Like read_summary(), but for many videos at once - resolves the
+    summaries folder and lists its contents exactly once instead of once
+    per video_id, then downloads only the files that are actually present.
+    Built for the dashboard's snapshot load (app/insights_store.py), which
+    otherwise paid a Drive folder-lookup and a name-lookup query per video
+    on top of every download, dominating load time once there are more
+    than a handful of videos.
+
+    video_ids with no summary file yet are simply absent from the
+    returned dict, same as read_summary() returning None for them."""
+
+    if settings.dry_run:
+        return {}
+
+    summaries_folder_id = drive.get_or_create_folder(folder_id, SUMMARIES_FOLDER_NAME)
+    files_by_name = drive.list_files(summaries_folder_id)
+
+    artifacts: dict[str, dict] = {}
+    for video_id in video_ids:
+        file_id = files_by_name.get(_summary_filename(video_id))
+        if file_id is None:
+            continue
+        text = drive.download_text_by_id(file_id)
+        try:
+            artifacts[video_id] = json.loads(text)
+        except json.JSONDecodeError:
+            logger.warning("Summary artifact for %s was not valid JSON; treating as absent.", video_id)
+    return artifacts
+
+
 def write_summary(folder_id: str, video_id: str, artifact: dict) -> None:
     summaries_folder_id = drive.get_or_create_folder(folder_id, SUMMARIES_FOLDER_NAME)
     drive.upload_text_file(

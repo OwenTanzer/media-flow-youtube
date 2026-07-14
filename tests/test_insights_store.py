@@ -39,7 +39,11 @@ def _stub(monkeypatch, *, channels, index, summaries=None):
     monkeypatch.setattr(insights_store.channel_store, "read_channels", lambda folder_id: channels)
     monkeypatch.setattr(insights_store.drive, "read_index", lambda folder_id: index)
     summaries = summaries or {}
-    monkeypatch.setattr(insights_store.summary_store, "read_summary", lambda folder_id, video_id: summaries.get(video_id))
+    monkeypatch.setattr(
+        insights_store.summary_store,
+        "read_summaries_bulk",
+        lambda folder_id, video_ids: {vid: summaries[vid] for vid in video_ids if vid in summaries},
+    )
 
 
 def test_load_snapshot_happy_path_resolves_group_and_channel_name(monkeypatch):
