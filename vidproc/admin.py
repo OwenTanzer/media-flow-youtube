@@ -72,7 +72,10 @@ def add_channel_and_backfill(
     its currently-visible RSS feed (see app/discovery.py's
     backfill_new_channels()) so it doesn't have to wait for the next
     discover_and_process.py cron cycle just because it was added through
-    this panel instead of a manual Drive edit.
+    this panel instead of a manual Drive edit. A channel added with
+    enabled=False skips the backfill attempt entirely - both discovery
+    and backfill only ever consider enabled channels, so there's nothing
+    for it to find until the channel is enabled.
 
     Raises ValueError for a blank/malformed channel_id or one whose feed
     can't be fetched (checked *before* writing anything, so a typo is
@@ -119,6 +122,16 @@ def add_channel_and_backfill(
     new_channel = Channel(channel_id=channel_id, name=name, enabled=enabled, languages=languages, group=group)
     channel_store.write_channels(folder_id, [*existing, new_channel])
 
+    if not enabled:
+        # find_unbackfilled_channels() (and discover_and_enqueue()'s
+        # normal poll) both filter to enabled channels only, so a
+        # disabled channel can never be backfilled or discovered either
+        # way until it's enabled - skip straight to returning rather than
+        # wasting a lock acquisition/feed refetch on a call that would
+        # always find nothing, and rather than reporting a misleading
+        # "0 videos queued" success (see admin_flash_for()).
+        return AddChannelResult(channel=new_channel)
+
     lock_token = job_lock.acquire_lock(folder_id, settings.discovery_lock_ttl_seconds)
     if lock_token is None:
         return AddChannelResult(channel=new_channel, backfill_deferred=True)
@@ -143,6 +156,11 @@ def admin_flash_for(result: AddChannelResult) -> tuple[str, str]:
     backfill step specifically, not whether the channel itself was added."""
 
     channel_id = result.channel.channel_id
+    if not result.channel.enabled:
+        return "info", (
+            f"Channel {channel_id} added, but disabled - no backfill will run until it's enabled "
+            "(disabled channels are skipped by both discovery and backfill)."
+        )
     if result.backfill_deferred:
         return "info", (
             f"Channel {channel_id} added. Immediate backfill was skipped because "

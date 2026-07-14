@@ -149,6 +149,30 @@ def test_add_channel_and_backfill_defers_when_discovery_lock_is_held(monkeypatch
     assert release_calls == []  # never acquired, so nothing to release
 
 
+def test_add_channel_and_backfill_skips_backfill_entirely_for_a_disabled_channel(monkeypatch):
+    """Regression test for the review finding: a disabled channel is
+    excluded from find_unbackfilled_channels() (and from discovery's
+    normal poll) entirely, so attempting a backfill for it would always
+    find nothing - must not even try, let alone report a misleading
+    "0 videos queued" success."""
+    written, release_calls = _stub(monkeypatch, existing=[])
+    acquire_calls = []
+    monkeypatch.setattr(admin.job_lock, "acquire_lock", lambda folder_id, ttl_seconds: acquire_calls.append(1))
+    backfill_calls = []
+    monkeypatch.setattr(admin.discovery, "backfill_new_channels", lambda folder_id: backfill_calls.append(1))
+
+    result = admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="New Channel", enabled=False)
+
+    assert written["channels"] == [Channel(VALID_CHANNEL_ID, "New Channel", False)]
+    assert result.channel.enabled is False
+    assert result.backfill_report is None
+    assert result.backfill_deferred is False
+    assert result.backfill_error is None
+    assert acquire_calls == []  # never even tried to acquire the lock
+    assert backfill_calls == []
+    assert release_calls == []
+
+
 def test_add_channel_and_backfill_reports_a_backfill_error_without_losing_the_added_channel(monkeypatch):
     """Regression test for the review finding: if backfill itself raises
     after channels.json was already written, the caller must be able to
@@ -171,9 +195,9 @@ def test_add_channel_and_backfill_reports_a_backfill_error_without_losing_the_ad
     assert release_calls == ["the-token"]  # still released despite the failure
 
 
-def _result(*, deferred=False, error=None, report=None):
+def _result(*, deferred=False, error=None, report=None, enabled=True):
     return admin.AddChannelResult(
-        channel=Channel(VALID_CHANNEL_ID, "New Channel"),
+        channel=Channel(VALID_CHANNEL_ID, "New Channel", enabled),
         backfill_report=report,
         backfill_deferred=deferred,
         backfill_error=error,
@@ -184,6 +208,16 @@ def test_admin_flash_for_success():
     level, message = admin.admin_flash_for(_result(report=DiscoveryReport(1, 1, 3, 2, 0, [])))
     assert level == "success"
     assert "2 video(s) queued" in message
+
+
+def test_admin_flash_for_disabled_channel():
+    """Regression test for the review finding: adding a disabled channel
+    must not read as "queued"/"next run will pick it up" messaging, since
+    neither discovery nor backfill ever considers a disabled channel."""
+    level, message = admin.admin_flash_for(_result(enabled=False))
+    assert level == "info"
+    assert "disabled" in message
+    assert "no backfill" in message
 
 
 def test_admin_flash_for_deferred():
