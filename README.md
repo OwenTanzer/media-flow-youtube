@@ -401,8 +401,11 @@ complete.
 
 Set `ANTHROPIC_API_KEY` (resolved automatically by the Anthropic SDK - not
 touched by this app's own config or logs) wherever `discover_and_process.py`
-runs. Nothing else is required - all other settings have working defaults.
-See [`.env.example`](.env.example) for `SUMMARY_MODEL` (default
+runs. This stage is genuinely optional: if the key isn't set, it's skipped
+cleanly (logged, not an error) rather than failing the whole run - discovery
+and transcript archiving are unaffected either way. Nothing else is
+required once it's set - all other settings have working defaults. See
+[`.env.example`](.env.example) for `SUMMARY_MODEL` (default
 `claude-haiku-4-5`) and the cost/length controls below.
 
 ### Output format
@@ -481,16 +484,36 @@ or prompt version). A run's `SummaryReport` (logged by
 that had a prior non-`ok` attempt for the same transcript/model/prompt -
 separate from the `failed` count of this run's own outcomes.
 
-A genuine auth/credential problem is handled differently from a per-video
-failure, deliberately: it's checked once per video *before* that video's
-attempt count is touched or anything is written for it (as a side effect
-of the real pre-flight token count described in Cost controls below), and
-if it fails, the whole run aborts immediately instead of writing a
-`status: "error"` artifact. This matters because a credential problem
-isn't a property of any one video's content - if it were recorded as a
-non-retryable per-video failure the normal way, fixing the credential
-afterward wouldn't un-poison it, since nothing about that video's own
-transcript hash, model, or prompt version changed.
+A retryable failure also records `next_retry_at`
+(`generated_at` + `SUMMARY_RETRY_BACKOFF_SECONDS`, default `900`) and isn't
+eligible again until that time passes - without this, a transient failure
+would otherwise be retried again on the very next invocation regardless of
+how recently it just failed. A non-retryable failure has no
+`next_retry_at` at all, since it isn't retried regardless of elapsed time.
+
+A genuine, still-broken auth/credential problem is handled differently
+from a per-video failure, deliberately - two ways:
+
+- If `ANTHROPIC_API_KEY` isn't set at all, the whole summarization stage
+  is skipped cleanly before touching any video or making any API call
+  (see Setup above) - this stage is optional, and an unconfigured
+  deployment shouldn't fail discover_and_process.py's entire run over it.
+- If the key is set but invalid/expired/lacking access, that's detected as
+  a side effect of the real pre-flight token count (see Cost controls
+  below) *before* a given video's attempt count is touched or anything is
+  written for it, and aborts the whole run immediately instead of writing
+  a `status: "error"` artifact. This matters because a credential problem
+  isn't a property of any one video's content - if it were recorded as a
+  non-retryable per-video failure the normal way, fixing the credential
+  afterward wouldn't un-poison it, since nothing about that video's own
+  transcript hash, model, or prompt version changed.
+
+A transient failure on that same pre-flight token count (a rate limit,
+connection error, or 5xx - as opposed to a genuine credential problem) is
+*not* treated this way: it's recorded as an ordinary per-video failure
+like any other, since aborting the whole run over a momentary blip would
+otherwise skip every remaining video in the backlog with no durable retry
+state to show for it.
 
 ### Transcript length policy
 
@@ -536,11 +559,14 @@ unrecognized model would make cost estimation silently return `None` and
 disable `SUMMARY_MAX_COST_USD_PER_RUN` entirely. A failure that still
 received a billed response from the API (a safety refusal, or output that
 failed to parse/validate) has its usage counted against these caps too,
-even though it's recorded as `status: "error"` - only a failure before any
-response was ever returned (a connection error, for instance, or the rare
-case where the SDK's response-parsing step fails before any usage is
-accessible) contributes no usage, since none is known to have been
-billed.
+even though it's recorded as `status: "error"`. The one case where real
+usage isn't accessible at all - the SDK's own schema-validation step
+raising before we get access to the raw response - is conservatively
+charged this call's own reserved worst-case estimate instead of
+contributing zero, since a response plausibly still happened and was
+billed; only a failure before any response was ever returned at all (a
+connection error, for instance) contributes no usage, since none is known
+to have been billed.
 
 ### Concurrency
 

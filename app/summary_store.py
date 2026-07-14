@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from . import drive
 from .config import settings
@@ -31,6 +32,17 @@ logger = logging.getLogger("media_flow.summary_store")
 SUMMARIES_FOLDER_NAME = "summaries"
 
 _CHANNEL_RE = re.compile(r"^channel: (.+)$", re.MULTILINE)
+
+_EMPTY_REPORT_KWARGS = dict(
+    eligible=0,
+    skipped_current=0,
+    summarized=0,
+    failed=0,
+    retried=0,
+    total_input_tokens=0,
+    total_output_tokens=0,
+    total_estimated_cost_usd=0.0,
+)
 
 
 def _summary_filename(video_id: str) -> str:
@@ -83,19 +95,22 @@ def needs_summarization(
     model: str,
     prompt_version: str,
     max_attempts: int | None = None,
+    now: datetime | None = None,
 ) -> bool:
     """True unless a current, successful summary already exists for this
     exact (transcript hash, model, prompt version) combination, or a prior
     failure for that same combination has already exhausted its retry
-    budget or was classified as non-retryable (e.g. a safety refusal, or an
-    auth/credential failure - both deterministic for the same input, so
-    retrying wastes budget without changing the outcome). A changed hash,
-    model, or prompt version always makes a video eligible again, resetting
-    the attempt count, since that's a new unit of work.
+    budget, was classified as non-retryable (e.g. a safety refusal -
+    deterministic for the same input, so retrying wastes budget without
+    changing the outcome), or hasn't reached its recorded next_retry_at
+    yet (a retryable failure gets a backoff window, not an immediate retry
+    on the very next invocation). A changed hash, model, or prompt version
+    always makes a video eligible again, resetting the attempt count,
+    since that's a new unit of work.
 
-    max_attempts is optional only so existing single-argument call sites
-    (e.g. simple "does this need redoing at all" checks) keep working;
-    summarize_eligible() always passes it."""
+    max_attempts and now are optional only so existing simpler call sites
+    keep working; summarize_eligible() always passes max_attempts (now
+    defaults to the real current time)."""
 
     if existing is None:
         return True
@@ -107,6 +122,14 @@ def needs_summarization(
         return False
     if max_attempts is not None and existing.get("attempts", 0) >= max_attempts:
         return False
+    next_retry_at = existing.get("next_retry_at")
+    if next_retry_at:
+        try:
+            due_at = datetime.fromisoformat(next_retry_at)
+        except ValueError:
+            due_at = None
+        if due_at is not None and (now or datetime.now(timezone.utc)) < due_at:
+            return False
     return True
 
 
@@ -142,6 +165,22 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
     status: "error" artifact) and never aborts the run - discovery and
     transcript archiving have already completed by the time this runs.
 
+    Two distinct failure handling paths exist, deliberately:
+
+    - Transient, per-video failures (rate limits, connection errors,
+      unparseable/invalid output) are recorded on that video's artifact
+      and never abort the run.
+    - A genuine, still-broken credential problem (detected either by
+      ANTHROPIC_API_KEY being entirely unset, checked once up front, or by
+      count_prompt_tokens() raising an auth error mid-run) aborts the
+      whole run instead. A credential problem isn't a property of any one
+      video's content, so recording it as a per-video failure would
+      poison that video permanently in a way that fixing the credential
+      couldn't undo (nothing about the video's own hash/model/prompt
+      changes when only the environment does) - and since summarization is
+      an optional stage, an unconfigured deployment should skip it
+      cleanly rather than fail discover_and_process.py's whole run.
+
     on_progress is called (a) right before the model call, so a long-running
     lock lease (see discover_and_process.py) is renewed going into a
     potentially slow request, and (b) again right before every write to
@@ -150,6 +189,10 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
     stops this function before it writes anything under a lease it no
     longer holds, rather than writing first and only noticing the loss
     afterward."""
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        logger.info("ANTHROPIC_API_KEY is not set; skipping the (optional) summarization stage.")
+        return SummaryReport(**_EMPTY_REPORT_KWARGS)
 
     index = drive.read_index(folder_id)
     ok_entries = [(video_id, entry) for video_id, entry in index.items() if entry.get("status") == "ok"]
@@ -172,6 +215,11 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
         cost = estimate_cost_usd(settings.summary_model, input_tokens, output_tokens)
         if cost is not None:
             total_cost += cost
+
+    def _next_retry_at(retryable: bool, generated_at_dt: datetime) -> str | None:
+        if not retryable:
+            return None
+        return (generated_at_dt + timedelta(seconds=settings.summary_retry_backoff_seconds)).isoformat()
 
     for video_id, entry in ok_entries:
         filename = entry.get("filename")
@@ -213,16 +261,57 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
             stopped_on_budget = True
             break
 
+        generated_at_dt = datetime.now(timezone.utc)
+        base_fields = {
+            "video_id": video_id,
+            "source_drive_file_id": entry.get("drive_file_id"),
+            "source_transcript_hash": source_hash,
+            "title": entry.get("title"),
+            "author": _extract_channel(markdown),
+            "url": entry.get("url"),
+            "model": settings.summary_model,
+            "prompt_version": PROMPT_VERSION,
+            "generated_at": generated_at_dt.isoformat(),
+            "attempts": this_attempt,
+        }
+        if truncated:
+            base_fields["transcript_truncated"] = True
+
+        def _write_failure_artifact(exc: SummarizationError) -> None:
+            if on_progress is not None:
+                # Re-check lock ownership immediately before writing, not
+                # just after - a takeover during the model call must stop
+                # this write, not merely be noticed once it's too late.
+                on_progress()
+            write_summary(
+                folder_id,
+                video_id,
+                {
+                    **base_fields,
+                    "status": "error",
+                    "retryable": exc.retryable,
+                    "message": str(exc),
+                    "next_retry_at": _next_retry_at(exc.retryable, generated_at_dt),
+                },
+            )
+
         # A real pre-flight token count (system prompt + output schema
         # overhead + the transcript itself), not a chars-per-token guess -
-        # reserved against the per-run caps before this call is made,
+        # reserved against the per-run caps before the model call is made,
         # rather than only checking totals accumulated from prior calls.
-        # Deliberately uncaught here: this runs before this video's attempt
-        # count is touched or anything is written for it, so any failure -
-        # including an auth/credential problem - aborts the whole run
-        # cleanly instead of being recorded as a permanent per-video
-        # failure (see count_prompt_tokens()'s docstring for why).
-        input_tokens_estimate = count_prompt_tokens(model_input, model=settings.summary_model)
+        # Only a genuine, still-broken credential problem propagates
+        # unwrapped here (see count_prompt_tokens()'s docstring); anything
+        # recognized as transient comes back as a normal per-video
+        # SummarizationError instead, so a blip on this endpoint doesn't
+        # abort the whole run and skip every remaining video.
+        try:
+            input_tokens_estimate = count_prompt_tokens(model_input, model=settings.summary_model)
+        except SummarizationError as exc:
+            failed += 1
+            failures.append((video_id, str(exc)))
+            _write_failure_artifact(exc)
+            continue
+
         reserved_tokens = input_tokens_estimate + settings.summary_max_output_tokens
         reserved_cost = estimate_cost_usd(settings.summary_model, input_tokens_estimate, settings.summary_max_output_tokens)
 
@@ -255,21 +344,6 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
             break
 
         eligible += 1
-        generated_at = datetime.now(timezone.utc).isoformat()
-        base_fields = {
-            "video_id": video_id,
-            "source_drive_file_id": entry.get("drive_file_id"),
-            "source_transcript_hash": source_hash,
-            "title": entry.get("title"),
-            "author": _extract_channel(markdown),
-            "url": entry.get("url"),
-            "model": settings.summary_model,
-            "prompt_version": PROMPT_VERSION,
-            "generated_at": generated_at,
-            "attempts": this_attempt,
-        }
-        if truncated:
-            base_fields["transcript_truncated"] = True
 
         if on_progress is not None:
             # Renew before the (possibly slow) model call, not just after -
@@ -290,16 +364,16 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
                 # refusal or an unparseable structured output. Count it,
                 # or the budget silently under-tracks real spend.
                 _count_usage(exc.usage.input_tokens, exc.usage.output_tokens)
-            if on_progress is not None:
-                # Re-check lock ownership immediately before writing, not
-                # just after - a takeover during the model call must stop
-                # this write, not merely be noticed once it's too late.
-                on_progress()
-            write_summary(
-                folder_id,
-                video_id,
-                {**base_fields, "status": "error", "retryable": exc.retryable, "message": str(exc)},
-            )
+            elif exc.possibly_billed:
+                # Usage is unknown but a response plausibly still happened
+                # (e.g. the SDK's own schema validation raising before we
+                # get access to the raw response). Conservatively charge
+                # this call's reserved worst-case estimate rather than
+                # contributing zero - otherwise repeated failures like this
+                # could let real spend exceed the cap with nothing to show
+                # for it in our own tracked totals.
+                _count_usage(input_tokens_estimate, settings.summary_max_output_tokens)
+            _write_failure_artifact(exc)
             continue
 
         _count_usage(usage.input_tokens, usage.output_tokens)

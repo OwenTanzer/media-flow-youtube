@@ -151,3 +151,14 @@ def test_summary_max_attempts_per_video_rejects_non_positive_values(monkeypatch,
     monkeypatch.setenv("SUMMARY_MAX_ATTEMPTS_PER_VIDEO", value)
     with pytest.raises(ConfigError, match="SUMMARY_MAX_ATTEMPTS_PER_VIDEO"):
         _settings_with(monkeypatch)
+
+
+def test_summary_retry_backoff_seconds_defaults_to_900(monkeypatch):
+    assert _settings_with(monkeypatch).summary_retry_backoff_seconds == 900
+
+
+@pytest.mark.parametrize("value", ["-1", "-0.5", "nan", "inf"])
+def test_summary_retry_backoff_seconds_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("SUMMARY_RETRY_BACKOFF_SECONDS", value)
+    with pytest.raises(ConfigError, match="SUMMARY_RETRY_BACKOFF_SECONDS"):
+        _settings_with(monkeypatch)

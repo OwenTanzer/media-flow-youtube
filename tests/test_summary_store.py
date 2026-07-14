@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -106,6 +107,10 @@ def test_extract_channel_returns_none_when_absent():
 
 def _stub_drive(monkeypatch, *, index, transcripts, existing_summaries=None):
     monkeypatch.setattr(summary_store.settings, "dry_run", False)
+    # summarize_eligible() now checks this directly (not via Settings, per
+    # the project's convention of never routing the key through our own
+    # config) to decide whether the optional summarization stage runs at all.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.setattr(summary_store.drive, "read_index", lambda folder_id: index)
     monkeypatch.setattr(summary_store.drive, "get_or_create_folder", lambda parent, name: "summaries-folder-id")
 
@@ -538,3 +543,129 @@ def test_summarize_eligible_does_not_write_if_lock_is_lost_before_the_write(monk
     assert raised is True
     assert len(calls) == 2
     assert "abc123XYZde.json" not in written
+
+
+def test_summarize_eligible_skips_the_stage_when_no_api_key_is_configured(monkeypatch):
+    """Regression test: summarization is documented as optional. A
+    deployment without ANTHROPIC_API_KEY must skip it cleanly instead of
+    crashing discover_and_process.py's whole run every scheduled invocation."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    read_index_calls = []
+    monkeypatch.setattr(summary_store.drive, "read_index", lambda folder_id: read_index_calls.append(1))
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert report.eligible == 0
+    assert report.summarized == 0
+    assert read_index_calls == []  # never even looked at the index
+
+
+def test_summarize_eligible_treats_a_transient_token_count_failure_as_a_per_video_failure(monkeypatch):
+    """Regression test: count_prompt_tokens() failures that are recognized
+    as transient (rate limit, connection error, 5xx) must not abort the
+    whole run and skip every remaining video with no durable retry state -
+    only a genuine credential problem should do that."""
+    written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+
+    def _raise(*a, **k):
+        raise SummarizationError("token count rate limited", retryable=True)
+
+    monkeypatch.setattr(summary_store, "count_prompt_tokens", _raise)
+    calls = []
+    monkeypatch.setattr(summary_store, "summarize_transcript", lambda *a, **k: calls.append(1))
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert report.failed == 1
+    assert calls == []
+    assert written["abc123XYZde.json"]["status"] == "error"
+    assert written["abc123XYZde.json"]["retryable"] is True
+    assert written["abc123XYZde.json"]["next_retry_at"] is not None
+
+
+def test_summarize_eligible_conservatively_charges_reserved_estimate_for_possibly_billed_failures(monkeypatch):
+    """Regression test: a schema-validation failure (real usage
+    unavailable, but a response plausibly happened and was billed) must
+    not silently contribute zero to the run's tracked spend - repeated
+    failures like this could otherwise let real spend exceed the
+    configured cap with nothing to show for it in our own totals."""
+    _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model: 500)
+    monkeypatch.setattr(summary_store.settings, "summary_max_output_tokens", 200)
+
+    def _raise(*a, **k):
+        raise SummarizationError("schema validation failed", retryable=True, possibly_billed=True)
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert report.failed == 1
+    # Charged the reserved estimate (500 input + 200 output), not zero.
+    assert report.total_input_tokens == 500
+    assert report.total_output_tokens == 200
+    assert report.total_estimated_cost_usd > 0
+
+
+def test_needs_summarization_false_before_the_backoff_window_elapses():
+    existing = {
+        "status": "error",
+        "source_transcript_hash": "sha256:abc",
+        "model": "claude-haiku-4-5",
+        "prompt_version": "v1",
+        "attempts": 1,
+        "retryable": True,
+        "next_retry_at": "2026-07-14T13:00:00+00:00",
+    }
+    now = datetime(2026, 7, 14, 12, 0, 0, tzinfo=timezone.utc)  # before next_retry_at
+    assert (
+        summary_store.needs_summarization(existing, "sha256:abc", "claude-haiku-4-5", "v1", max_attempts=3, now=now)
+        is False
+    )
+
+
+def test_needs_summarization_true_after_the_backoff_window_elapses():
+    existing = {
+        "status": "error",
+        "source_transcript_hash": "sha256:abc",
+        "model": "claude-haiku-4-5",
+        "prompt_version": "v1",
+        "attempts": 1,
+        "retryable": True,
+        "next_retry_at": "2026-07-14T13:00:00+00:00",
+    }
+    now = datetime(2026, 7, 14, 14, 0, 0, tzinfo=timezone.utc)  # after next_retry_at
+    assert (
+        summary_store.needs_summarization(existing, "sha256:abc", "claude-haiku-4-5", "v1", max_attempts=3, now=now)
+        is True
+    )
+
+
+def test_summarize_eligible_records_a_next_retry_at_for_retryable_failures(monkeypatch):
+    written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+    monkeypatch.setattr(summary_store.settings, "summary_retry_backoff_seconds", 900)
+
+    def _raise(*a, **k):
+        raise SummarizationError("boom", retryable=True)
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
+
+    summary_store.summarize_eligible("folder-id")
+
+    artifact = written["abc123XYZde.json"]
+    generated_at = datetime.fromisoformat(artifact["generated_at"])
+    next_retry_at = datetime.fromisoformat(artifact["next_retry_at"])
+    assert (next_retry_at - generated_at).total_seconds() == pytest.approx(900)
+
+
+def test_summarize_eligible_does_not_record_a_next_retry_at_for_non_retryable_failures(monkeypatch):
+    written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+
+    def _raise(*a, **k):
+        raise SummarizationError("refused", retryable=False)
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
+
+    summary_store.summarize_eligible("folder-id")
+
+    assert written["abc123XYZde.json"]["next_retry_at"] is None

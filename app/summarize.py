@@ -80,12 +80,25 @@ class SummarizationError(RuntimeError):
     call was billed) even though it's being treated as a failure - e.g. a
     safety refusal or an unparseable structured output still consumes
     tokens. Callers should count this usage against the run's budget the
-    same as a successful call's."""
+    same as a successful call's.
 
-    def __init__(self, message: str, *, retryable: bool = True, usage: "Usage | None" = None):
+    possibly_billed is for the rarer case where usage is unknown but a
+    response plausibly still happened (the SDK's own schema validation
+    raising pydantic.ValidationError, where the exception propagates
+    before real usage is accessible) - as opposed to usage=None meaning
+    definitely not billed (e.g. a connection error before any response).
+    Callers should conservatively charge an estimated cost against the
+    run's budget in this case rather than contributing zero, since
+    repeated failures like this could otherwise let real spend exceed the
+    configured cap unnoticed."""
+
+    def __init__(
+        self, message: str, *, retryable: bool = True, usage: "Usage | None" = None, possibly_billed: bool = False
+    ):
         super().__init__(message)
         self.retryable = retryable
         self.usage = usage
+        self.possibly_billed = possibly_billed
 
 
 class SummaryPoint(BaseModel):
@@ -152,24 +165,47 @@ def count_prompt_tokens(transcript_body: str, *, model: str) -> int:
     excluded the system prompt/schema and wasn't a true upper bound either
     way.
 
-    Deliberately raises its caller's exception straight through rather than
-    wrapping it in SummarizationError: this is a lightweight pre-flight
-    call made before summarize_eligible() commits to processing a given
-    video (before incrementing its attempt count or writing anything for
-    it), so a failure here - including an auth/credential problem - should
-    abort the whole run rather than being recorded as a permanent, per-video
-    failure. A credential issue isn't a property of any one video's
-    content, and poisoning every video it happens to touch with a
-    non-retryable failure wouldn't get fixed by fixing the credential,
-    since nothing about the video's own hash/model/prompt_version changes."""
+    A genuine, still-broken credential problem (AuthenticationError /
+    PermissionDeniedError - the key is present but invalid/expired/lacks
+    access) propagates unwrapped: this call happens before
+    summarize_eligible() commits to processing a given video (before its
+    attempt count is touched or anything is written for it), so this
+    specific failure mode should abort the whole run rather than being
+    recorded as a permanent per-video failure - a credential problem isn't
+    a property of any one video's content, and poisoning every video it
+    touches wouldn't get fixed by fixing the credential, since nothing
+    about the video's own hash/model/prompt_version changes.
 
-    client = anthropic.Anthropic(max_retries=_CLIENT_MAX_RETRIES)
-    result = client.messages.count_tokens(
-        model=model,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": transcript_body}],
-        output_format=ModelSummaryOutput,
-    )
+    Anything else recognized as transient (rate limits, connection errors,
+    5xx) is wrapped in a retryable SummarizationError instead, same as
+    summarize_transcript()'s own classification - a blip on this endpoint
+    specifically must not abort the whole run and skip every remaining
+    video with no durable retry state, the way an unconditional re-raise
+    would."""
+
+    try:
+        client = anthropic.Anthropic(max_retries=_CLIENT_MAX_RETRIES)
+        result = client.messages.count_tokens(
+            model=model,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": transcript_body}],
+            output_format=ModelSummaryOutput,
+        )
+    except (anthropic.AuthenticationError, anthropic.PermissionDeniedError):
+        raise
+    except anthropic.RateLimitError as exc:
+        raise SummarizationError(f"Token count rate limited: {exc}", retryable=True) from exc
+    except anthropic.APIConnectionError as exc:
+        raise SummarizationError(f"Token count connection error: {exc}", retryable=True) from exc
+    except anthropic.APIStatusError as exc:
+        retryable = exc.status_code >= 500 or exc.status_code == 429
+        raise SummarizationError(f"Token count API error ({exc.status_code}): {exc.message}", retryable=retryable) from exc
+    except anthropic.AnthropicError:
+        # Anything else unanticipated (e.g. a credential-resolution
+        # failure at client construction) is treated conservatively as a
+        # config/environment problem, same as AuthenticationError above,
+        # rather than guessed to be transient.
+        raise
     return result.input_tokens
 
 
@@ -256,7 +292,9 @@ def summarize_transcript(
         # of being isolated to this one video. Usage can't be recovered
         # here (the exception propagates before we get access to the raw
         # response object) - a known limitation, not a missed case.
-        raise SummarizationError(f"Model response failed schema validation: {exc}", retryable=True) from exc
+        raise SummarizationError(
+            f"Model response failed schema validation: {exc}", retryable=True, possibly_billed=True
+        ) from exc
 
     response_usage = Usage(input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
 

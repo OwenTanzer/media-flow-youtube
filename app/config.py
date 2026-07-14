@@ -122,6 +122,13 @@ class Settings:
                 f"SUMMARY_MAX_ATTEMPTS_PER_VIDEO must be a positive integer, got {self.summary_max_attempts_per_video}."
             )
 
+        self.summary_retry_backoff_seconds: float = float(_env("SUMMARY_RETRY_BACKOFF_SECONDS", "900"))
+        if self.summary_retry_backoff_seconds < 0 or not math.isfinite(self.summary_retry_backoff_seconds):
+            raise ConfigError(
+                f"SUMMARY_RETRY_BACKOFF_SECONDS must be a non-negative, finite number of seconds, "
+                f"got {self.summary_retry_backoff_seconds}."
+            )
+
     def require_oauth_credentials(self) -> OAuthCredentials:
         missing = [
             name

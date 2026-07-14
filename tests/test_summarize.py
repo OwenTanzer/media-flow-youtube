@@ -87,15 +87,24 @@ def test_count_prompt_tokens_returns_the_real_input_token_count(monkeypatch):
     assert seen_kwargs["output_format"] is summarize.ModelSummaryOutput
 
 
-def test_count_prompt_tokens_propagates_failures_unwrapped(monkeypatch):
-    """Deliberately not wrapped in SummarizationError - see the function's
-    docstring: this runs before a video's attempt count is touched or
-    anything is written for it, so a failure (including an auth/credential
-    problem) should abort the whole run, not poison one video."""
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        lambda: anthropic.AuthenticationError("invalid api key", response=_fake_httpx_response(401), body=None),
+        lambda: anthropic.PermissionDeniedError("no access", response=_fake_httpx_response(403), body=None),
+    ],
+)
+def test_count_prompt_tokens_propagates_credential_failures_unwrapped(monkeypatch, exc_factory):
+    """A genuine, still-broken credential problem is deliberately not
+    wrapped in SummarizationError - see the function's docstring: this
+    runs before a video's attempt count is touched or anything is written
+    for it, so this specific failure mode should abort the whole run, not
+    poison one video."""
+    exc = exc_factory()
 
     class _FakeMessages:
         def count_tokens(self, **kwargs):
-            raise anthropic.AuthenticationError("invalid api key", response=_fake_httpx_response(401), body=None)
+            raise exc
 
     class _FakeClient:
         def __init__(self, *a, **k):
@@ -103,8 +112,37 @@ def test_count_prompt_tokens_propagates_failures_unwrapped(monkeypatch):
 
     monkeypatch.setattr(summarize.anthropic, "Anthropic", _FakeClient)
 
-    with pytest.raises(anthropic.AuthenticationError):
+    with pytest.raises(type(exc)):
         summarize.count_prompt_tokens(SAMPLE_BODY, model="claude-haiku-4-5")
+
+
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        lambda: anthropic.RateLimitError("boom", response=_fake_httpx_response(429), body=None),
+        lambda: anthropic.APIConnectionError(request=_fake_httpx_request()),
+        lambda: anthropic.APIStatusError("boom", response=_fake_httpx_response(500), body=None),
+    ],
+)
+def test_count_prompt_tokens_wraps_transient_failures_as_retryable(monkeypatch, exc_factory):
+    """Regression test: a blip on the token-counting endpoint specifically
+    (rate limit, connection error, 5xx) must not abort the whole run and
+    skip every remaining video with no durable retry state - only a
+    genuine credential problem should do that."""
+
+    class _FakeMessages:
+        def count_tokens(self, **kwargs):
+            raise exc_factory()
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            self.messages = _FakeMessages()
+
+    monkeypatch.setattr(summarize.anthropic, "Anthropic", _FakeClient)
+
+    with pytest.raises(summarize.SummarizationError) as exc_info:
+        summarize.count_prompt_tokens(SAMPLE_BODY, model="claude-haiku-4-5")
+    assert exc_info.value.retryable is True
 
 
 def test_max_transcript_seconds_finds_the_last_timestamp():
@@ -312,6 +350,11 @@ def test_summarize_transcript_raises_on_real_pydantic_validation_error(monkeypat
     with pytest.raises(summarize.SummarizationError, match="schema validation") as exc_info:
         summarize.summarize_transcript(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
     assert exc_info.value.retryable is True
+    # Real usage is unavailable in this specific failure path, but a
+    # response plausibly still happened and was billed - callers must
+    # conservatively account for that rather than assuming zero cost.
+    assert exc_info.value.usage is None
+    assert exc_info.value.possibly_billed is True
 
 
 @pytest.mark.parametrize(
