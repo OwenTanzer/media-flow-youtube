@@ -20,7 +20,7 @@ logger = logging.getLogger("media_flow.summarize")
 # changes. Deliberately a code constant, not an env var - drifting it
 # independently of the prompt text would corrupt the idempotency check in
 # summary_store.needs_summarization().
-PROMPT_VERSION = "v4"
+PROMPT_VERSION = "v5"
 
 # Convenience tuple for callers/tests - must be kept in sync with
 # ModelSummaryOutput.video_type's Literal values below.
@@ -47,13 +47,13 @@ Identify the transcript-supported major and minor points made in the video. Incl
 
 Do NOT create points for routine housekeeping/administrative content - schedule or streaming-cadence announcements, membership/Patreon/sponsor plugs, "welcome back"/sign-off preambles, asks to like/subscribe, or similar channel-admin remarks - even if the transcript spends real time on them. Exclude this by default so the (especially limited, on longer videos) point budget goes to actual substantive content instead. The only exception: if a piece of "housekeeping" is itself substantively important to understanding the video (e.g. a schedule change that materially affects when to expect the next analysis), it may still get a point.
 
-For each point:
+Every transcript line is prefixed with its own timestamp in brackets, e.g. "[14:32] ..." or "[1:02:15] ...". For each point:
 - "importance" is "major" for a point central to the video's purpose, "minor" for a supporting or secondary point.
 - "main_point" is one sentence or phrase stating the point.
 - "explanation" is 2 to 4 sentences of supporting detail, using only what the transcript actually supports - favor giving real substance and specifics (numbers, reasoning, context) over being terse.
-- "timestamp_seconds" is the timestamp of the transcript line where this point is first mentioned or introduced, taken from the transcript's own timestamps.
+- "timestamp_seconds" MUST be copied from one specific transcript line's own bracketed timestamp - the line where this point is first mentioned or introduced - converted to a plain integer number of seconds (e.g. "[14:32]" -> 872, "[1:02:15]" -> 3735). Never estimate, round, or invent a timestamp: pick an actual bracketed line you are citing and convert only that line's own value. This value can never exceed the transcript's own last timestamp.
 
-Many videos (livestreams especially) revisit the same topic more than once - e.g. the same asset, subject, or claim comes up early, then again later in more depth. When that happens, timestamp the point wherever you judge it's best substantiated, and write the point/explanation to reflect the fullest picture of what was said about it across all those mentions - points do not need to be in strict chronological order if a topic is revisited.
+Many videos (livestreams especially) revisit the same topic more than once - e.g. the same asset, subject, or claim comes up early, then again later in more depth. When that happens, write the point/explanation to reflect the fullest picture of what was said about it across all those mentions, but still set "timestamp_seconds" to one single real transcript line you are citing (e.g. wherever the point is best substantiated) - never a value synthesized or averaged across multiple mentions. Points do not need to be in strict chronological order if a topic is revisited.
 
 Be concise and factual. State uncertainty explicitly (e.g. "the speaker suggests..." vs "the speaker states...") rather than presenting an inference as a stated fact. Do not include information not supported by the transcript text.
 
