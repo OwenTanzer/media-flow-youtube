@@ -451,6 +451,9 @@ and the transcript hash are always populated by application code from
 from the model's output. `video_published_at` is `null` unless the video
 was discovered via RSS (see "Transcript file format" above) - there's no
 other source for it.
+This is the normal shape - see "Idempotency and retries" below for the
+one exception (a fallback plain-prose summary, with `points: []` and
+`video_type: null`, used only after a video exhausts its retry budget).
 Claude only produces `video_type`, `summary`, and each point's
 `importance`, `main_point`, `explanation`, `source_timestamp`, and
 `source_anchor`, constrained by a JSON schema (`output_config.format`) so
@@ -558,6 +561,25 @@ eligible again until that time passes - without this, a transient failure
 would otherwise be retried again on the very next invocation regardless of
 how recently it just failed. A non-retryable failure has no
 `next_retry_at` at all, since it isn't retried regardless of elapsed time.
+
+**Fallback summary on the last attempt.** Some speakers - meandering,
+conversational, non-linear delivery - make the per-point timestamp
+citation genuinely hard to ground even when the model clearly understood
+the content; a video like that can otherwise exhaust its retry budget and
+sit permanently as `status: "error"` with no usable output at all. When a
+retryable failure happens on a video's *last* allowed attempt, one extra
+call is made for a much simpler ask - a plain 2-3 paragraph prose summary
+of the video as a whole, with no per-line citation to get wrong. If that
+succeeds, the artifact is written as `status: "ok"` with an empty `points`
+list, `"fallback_summary": true`, and the summary text itself prefixed
+with a `⚠️` marker so it reads as visually distinct anywhere it's
+displayed, not just via that field. A non-retryable failure (e.g. a
+safety refusal) skips the fallback attempt entirely - the simpler prompt
+would very likely be refused for the same reason and isn't worth the
+extra call. If the fallback call itself fails, the video falls through to
+the normal `status: "error"` artifact exactly as it would have otherwise -
+this is a best-effort extra attempt, not a guarantee every video
+eventually gets a summary.
 
 A genuine, still-broken auth/credential problem is handled differently
 from a per-video failure, deliberately - two ways:

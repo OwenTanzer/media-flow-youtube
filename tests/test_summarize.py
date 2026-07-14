@@ -579,3 +579,65 @@ def test_summary_point_rejects_empty_strings(field_name):
     kwargs[field_name] = ""
     with pytest.raises(summarize.pydantic.ValidationError):
         summarize.SummaryPoint(**kwargs)
+
+
+def test_fallback_summary_output_rejects_empty_summary():
+    with pytest.raises(summarize.pydantic.ValidationError):
+        summarize.FallbackSummaryOutput(summary="")
+
+
+def test_summarize_fallback_success(monkeypatch):
+    expected = summarize.FallbackSummaryOutput(summary="A plain 2-3 paragraph summary.")
+    monkeypatch.setattr(
+        summarize.anthropic, "Anthropic", _fake_client(_FakeParsedMessage(expected, usage=_FakeUsage(80, 30)))
+    )
+
+    summary, usage = summarize.summarize_fallback(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
+
+    assert summary == "A plain 2-3 paragraph summary."
+    assert usage.input_tokens == 80
+    assert usage.output_tokens == 30
+
+
+def test_summarize_fallback_raises_on_refusal(monkeypatch):
+    monkeypatch.setattr(
+        summarize.anthropic,
+        "Anthropic",
+        _fake_client(_FakeParsedMessage(None, stop_reason="refusal", usage=_FakeUsage(100, 5))),
+    )
+
+    with pytest.raises(summarize.SummarizationError, match="refus") as exc_info:
+        summarize.summarize_fallback(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
+
+    assert exc_info.value.retryable is False
+    assert exc_info.value.usage.input_tokens == 100
+
+
+def test_summarize_fallback_raises_when_output_did_not_parse(monkeypatch):
+    monkeypatch.setattr(
+        summarize.anthropic,
+        "Anthropic",
+        _fake_client(_FakeParsedMessage(None, stop_reason="max_tokens", usage=_FakeUsage(150, 10))),
+    )
+
+    with pytest.raises(summarize.SummarizationError, match="max_tokens") as exc_info:
+        summarize.summarize_fallback(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
+
+    assert exc_info.value.retryable is True
+    assert exc_info.value.usage.input_tokens == 150
+
+
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        lambda: anthropic.RateLimitError("boom", response=_fake_httpx_response(429), body=None),
+        lambda: anthropic.APIConnectionError(request=_fake_httpx_request()),
+    ],
+)
+def test_summarize_fallback_wraps_transient_sdk_exceptions_as_retryable(monkeypatch, exc_factory):
+    monkeypatch.setattr(summarize.anthropic, "Anthropic", _fake_client(exc_factory()))
+
+    with pytest.raises(summarize.SummarizationError) as exc_info:
+        summarize.summarize_fallback(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
+    assert exc_info.value.retryable is True
+    assert exc_info.value.usage is None

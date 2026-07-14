@@ -69,6 +69,14 @@ Also provide:
 - "summary": one to three sentences summarizing the video as a whole.
 """
 
+def _build_fallback_system_prompt() -> str:
+    return """You are writing a summary of a YouTube video transcript for a viewer who wants the gist without watching it.
+
+Write 2 to 3 paragraphs covering the main ideas, claims, and conclusions the speaker makes, in your own words. Cover the video as a whole - do not focus narrowly on just its opening or closing minutes. Do not include timestamps, line citations, or references to "the transcript" - write as if describing the video's content directly.
+
+Be concise and factual. State uncertainty explicitly (e.g. "the speaker suggests..." vs "the speaker states...") rather than presenting an inference as a stated fact. Do not include information not supported by the transcript text. Skip routine housekeeping/administrative content - schedule announcements, membership/sponsor plugs, sign-off preambles, like-and-subscribe asks - unless it's itself substantively important to understanding the video."""
+
+
 _FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n\n", re.DOTALL)
 
 # Matches the "[HH:MM:SS] " / "[MM:SS] " prefix youtube.render_transcript_markdown()
@@ -215,6 +223,20 @@ class ModelSummaryOutput(BaseModel):
     video_type: Literal["Post-Market Update", "Thesis Piece", "Analytic Overview", "Pre-Market Brief"]
     summary: str = Field(min_length=1)
     points: list[SummaryPoint] = Field(min_length=1)
+
+
+class FallbackSummaryOutput(BaseModel):
+    """The much simpler schema used when a video has exhausted its normal
+    per-point citation attempts (see summarize_fallback() and
+    summary_store.summarize_eligible()'s last-attempt handling). Some
+    speakers - meandering, conversational, non-linear delivery - make it
+    hard for the model to pin one point to one specific transcript line
+    even though it clearly understood the content; asking for a plain
+    prose summary instead sidesteps that entirely, since there's no
+    per-line citation to get wrong. No timestamps, no points - just a
+    freeform summary of the video as a whole."""
+
+    summary: str = Field(min_length=1)
 
 
 @dataclass
@@ -541,3 +563,57 @@ def summarize_transcript(
     )
 
     return output, response_usage, points_truncated
+
+
+def summarize_fallback(transcript_body: str, *, model: str, max_output_tokens: int) -> tuple[str, Usage]:
+    """Last-resort path used only after a video has exhausted its normal
+    per-point citation attempts (see summary_store.summarize_eligible()'s
+    last-attempt handling) - produces a plain 2-3 paragraph summary
+    instead, with no per-line citations to get wrong. Some speakers
+    (meandering, conversational, non-linear delivery) make source_timestamp/
+    source_anchor grounding hard even when the model clearly understood
+    the content; this sidesteps that failure mode entirely rather than
+    trying to fix it with more retries of the same approach.
+
+    Same error-handling shape as summarize_transcript() (see there for the
+    rationale behind each branch) - deliberately not shared code, since
+    this call has no points to resolve and a much simpler failure surface."""
+
+    try:
+        client = anthropic.Anthropic(max_retries=_CLIENT_MAX_RETRIES)
+        response = client.messages.parse(
+            model=model,
+            max_tokens=max_output_tokens,
+            system=_build_fallback_system_prompt(),
+            messages=[{"role": "user", "content": transcript_body}],
+            output_format=FallbackSummaryOutput,
+        )
+    except anthropic.RateLimitError as exc:
+        raise SummarizationError(f"Rate limited: {exc}", retryable=True) from exc
+    except anthropic.APIConnectionError as exc:
+        raise SummarizationError(f"Connection error: {exc}", retryable=True) from exc
+    except anthropic.APIStatusError as exc:
+        retryable = exc.status_code >= 500 or exc.status_code == 429
+        raise SummarizationError(f"API error ({exc.status_code}): {exc.message}", retryable=retryable) from exc
+    except anthropic.AnthropicError as exc:
+        raise SummarizationError(f"Anthropic SDK error: {exc}", retryable=False) from exc
+    except pydantic.ValidationError as exc:
+        raise SummarizationError(
+            f"Fallback model response failed schema validation: {exc}", retryable=True, possibly_billed=True
+        ) from exc
+
+    response_usage = Usage(input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
+
+    if response.stop_reason == "refusal":
+        raise SummarizationError(
+            "Model declined to produce a fallback summary (safety refusal).", retryable=False, usage=response_usage
+        )
+    if response.parsed_output is None:
+        raise SummarizationError(
+            f"Fallback model response did not contain valid structured output "
+            f"(stop_reason={response.stop_reason!r}).",
+            retryable=True,
+            usage=response_usage,
+        )
+
+    return response.parsed_output.summary, response_usage
