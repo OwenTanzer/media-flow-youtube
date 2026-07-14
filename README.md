@@ -444,7 +444,7 @@ required once it's set - all other settings have working defaults. See
   ],
   "status": "ok",
   "model": "claude-haiku-4-5",
-  "prompt_version": "v4",
+  "prompt_version": "v6",
   "generated_at": "2026-07-14T12:00:00+00:00",
   "attempts": 1,
   "usage": {"input_tokens": 1234, "output_tokens": 456, "estimated_cost_usd": 0.0035}
@@ -461,35 +461,53 @@ stable `channels.json` ID, not the free-text `author` name embedded in the
 transcript - a downstream consumer that needs to reliably match a summary
 back to its channel registry entry (e.g. the Streamlit dashboard, issue #8)
 should join on `channel_id`, not `author`.
+This is the normal shape - see "Idempotency and retries" below for the
+one exception (a fallback plain-prose summary, with `points: []` and
+`video_type: null`, used only after a video exhausts its retry budget).
 Claude only produces `video_type`, `summary`, and each point's
-`importance`, `main_point`, `explanation`, and `timestamp_seconds`,
-constrained by a JSON schema (`output_config.format`) so the response is
-always valid JSON with no Markdown fences or surrounding prose.
-`video_type` is one of exactly four categories - `"Post-Market Update"`,
+`importance`, `main_point`, `explanation`, `source_timestamp`, and
+`source_anchor`, constrained by a JSON schema (`output_config.format`) so
+the response is always valid JSON with no Markdown fences or surrounding
+prose. `video_type` is one of exactly four categories - `"Post-Market Update"`,
 `"Pre-Market Brief"`, `"Thesis Piece"`, or `"Analytic Overview"` - enforced
 by the schema itself (a `Literal`, not a free-text field), so an
 unrecognized classification is rejected the same way a missing field
 would be. Every string field and the `points` list itself also require at
 least one character/item, since an empty response is otherwise
-schema-valid despite not being a usable summary. The human-readable
-`timestamp` string is never taken from the
-model either - it's derived deterministically in application code from
-`timestamp_seconds` (the same formatter transcript Markdown files use), so
-the two can never disagree. Every `timestamp_seconds` is also validated
-against the transcript's own timestamp range (rejecting a value outside
-`[0, last transcript timestamp]`) - Pydantic alone only validates that
-it's an integer, not that it's plausible, so this catches a model
-inventing an out-of-range value. Points are **not** required to be in
-chronological order: real videos (livestreams especially) revisit the
-same topic more than once, and an earlier strict-ordering requirement
-rejected genuinely well-formed output for that content in testing. A
-failed attempt (provider error, safety refusal, unparseable/invalid
-structured output, or an out-of-range timestamp) writes `status: "error"`
-with a `message`, a `retryable` flag, and the `attempts` count so far
-instead - this includes the case where the SDK's own
-response-parsing step raises a schema validation error directly (a
-`pydantic.ValidationError`, not one of the SDK's own exception types),
-which would otherwise escape per-video isolation and abort the whole run.
+schema-valid despite not being a usable summary.
+
+**`timestamp_seconds` is never trusted from the model at all - not even as
+a self-reported number.** An earlier version asked the model to compute
+`timestamp_seconds` directly and only range-checked the result, which let
+a wrong-but-plausible value through whenever the model mis-remembered
+*where* in the transcript something was said (worst on videos that
+revisit the same topic more than once - the model would sometimes report
+a timestamp synthesized or averaged across several mentions instead of
+one real line). Instead, the model is asked only to copy visible evidence:
+`source_timestamp` must be one transcript line's own bracketed timestamp,
+verbatim, and `source_anchor` a short verbatim excerpt from that same
+line. Application code then verifies both - `source_timestamp` must parse
+and exactly match one of the transcript's own real line timestamps (not
+merely fall within range), and `source_anchor` must actually appear
+(case/whitespace-insensitive) within two lines of that timestamp - before
+computing the final `timestamp_seconds` and the human-readable `timestamp`
+string (via the same formatter transcript Markdown files use) itself.
+Neither field the model produces ever reaches the persisted artifact
+directly; both are inputs to a verification step that either produces a
+trustworthy `timestamp_seconds` or fails the point. Points are **not**
+required to be in chronological order: real videos (livestreams
+especially) revisit the same topic more than once, and an earlier
+strict-ordering requirement rejected genuinely well-formed output for that
+content in testing - the `explanation` may still synthesize across every
+mention of a revisited topic, it's only the citation itself that must
+point at one real line. A failed attempt (provider error, safety refusal,
+unparseable/invalid structured output, an unrecognized `source_timestamp`,
+or a `source_anchor` that doesn't check out) writes `status: "error"` with
+a `message`, a `retryable` flag, and the `attempts` count so far instead -
+this includes the case where the SDK's own response-parsing step raises a
+schema validation error directly (a `pydantic.ValidationError`, not one of
+the SDK's own exception types), which would otherwise escape per-video
+isolation and abort the whole run.
 
 ### Point count
 
@@ -553,6 +571,25 @@ eligible again until that time passes - without this, a transient failure
 would otherwise be retried again on the very next invocation regardless of
 how recently it just failed. A non-retryable failure has no
 `next_retry_at` at all, since it isn't retried regardless of elapsed time.
+
+**Fallback summary on the last attempt.** Some speakers - meandering,
+conversational, non-linear delivery - make the per-point timestamp
+citation genuinely hard to ground even when the model clearly understood
+the content; a video like that can otherwise exhaust its retry budget and
+sit permanently as `status: "error"` with no usable output at all. When a
+retryable failure happens on a video's *last* allowed attempt, one extra
+call is made for a much simpler ask - a plain 2-3 paragraph prose summary
+of the video as a whole, with no per-line citation to get wrong. If that
+succeeds, the artifact is written as `status: "ok"` with an empty `points`
+list, `"fallback_summary": true`, and the summary text itself prefixed
+with a `⚠️` marker so it reads as visually distinct anywhere it's
+displayed, not just via that field. A non-retryable failure (e.g. a
+safety refusal) skips the fallback attempt entirely - the simpler prompt
+would very likely be refused for the same reason and isn't worth the
+extra call. If the fallback call itself fails, the video falls through to
+the normal `status: "error"` artifact exactly as it would have otherwise -
+this is a best-effort extra attempt, not a guarantee every video
+eventually gets a summary.
 
 A genuine, still-broken auth/credential problem is handled differently
 from a per-video failure, deliberately - two ways:

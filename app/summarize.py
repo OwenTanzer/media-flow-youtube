@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from dataclasses import dataclass
 from typing import Literal
 
 import anthropic
@@ -20,7 +21,7 @@ logger = logging.getLogger("media_flow.summarize")
 # changes. Deliberately a code constant, not an env var - drifting it
 # independently of the prompt text would corrupt the idempotency check in
 # summary_store.needs_summarization().
-PROMPT_VERSION = "v4"
+PROMPT_VERSION = "v6"
 
 # Convenience tuple for callers/tests - must be kept in sync with
 # ModelSummaryOutput.video_type's Literal values below.
@@ -47,13 +48,14 @@ Identify the transcript-supported major and minor points made in the video. Incl
 
 Do NOT create points for routine housekeeping/administrative content - schedule or streaming-cadence announcements, membership/Patreon/sponsor plugs, "welcome back"/sign-off preambles, asks to like/subscribe, or similar channel-admin remarks - even if the transcript spends real time on them. Exclude this by default so the (especially limited, on longer videos) point budget goes to actual substantive content instead. The only exception: if a piece of "housekeeping" is itself substantively important to understanding the video (e.g. a schedule change that materially affects when to expect the next analysis), it may still get a point.
 
-For each point:
+Every transcript line is prefixed with its own timestamp in brackets, e.g. "[14:32] ..." or "[1:02:15] ...". For each point:
 - "importance" is "major" for a point central to the video's purpose, "minor" for a supporting or secondary point.
 - "main_point" is one sentence or phrase stating the point.
 - "explanation" is 2 to 4 sentences of supporting detail, using only what the transcript actually supports - favor giving real substance and specifics (numbers, reasoning, context) over being terse.
-- "timestamp_seconds" is the timestamp of the transcript line where this point is first mentioned or introduced, taken from the transcript's own timestamps.
+- "source_timestamp" is the exact bracketed timestamp of ONE transcript line that supports this point - copy it verbatim, brackets included (e.g. "[14:32]" or "[1:02:15]"). Do not compute, estimate, convert, or invent anything here - just copy the bracket text of a real transcript line.
+- "source_anchor" is a short excerpt (a few words to one sentence) copied verbatim from that same transcript line, so your citation can be checked against the transcript. Do not paraphrase or summarize it - copy the actual words.
 
-Many videos (livestreams especially) revisit the same topic more than once - e.g. the same asset, subject, or claim comes up early, then again later in more depth. When that happens, timestamp the point wherever you judge it's best substantiated, and write the point/explanation to reflect the fullest picture of what was said about it across all those mentions - points do not need to be in strict chronological order if a topic is revisited.
+Many videos (livestreams especially) revisit the same topic more than once - e.g. the same asset, subject, or claim comes up early, then again later in more depth. When that happens, "explanation" may still draw on the fullest picture of what was said about it across all those mentions - but "source_timestamp"/"source_anchor" must always point at ONE single real line you are citing, never a value that combines, averages, or estimates across multiple mentions. Pick whichever one mention you're citing evidence from. Points do not need to be in strict chronological order if a topic is revisited.
 
 Be concise and factual. State uncertainty explicitly (e.g. "the speaker suggests..." vs "the speaker states...") rather than presenting an inference as a stated fact. Do not include information not supported by the transcript text.
 
@@ -67,11 +69,67 @@ Also provide:
 - "summary": one to three sentences summarizing the video as a whole.
 """
 
+def _build_fallback_system_prompt() -> str:
+    return """You are writing a summary of a YouTube video transcript for a viewer who wants the gist without watching it.
+
+Write 2 to 3 paragraphs covering the main ideas, claims, and conclusions the speaker makes, in your own words. Cover the video as a whole - do not focus narrowly on just its opening or closing minutes. Do not include timestamps, line citations, or references to "the transcript" - write as if describing the video's content directly.
+
+Be concise and factual. State uncertainty explicitly (e.g. "the speaker suggests..." vs "the speaker states...") rather than presenting an inference as a stated fact. Do not include information not supported by the transcript text. Skip routine housekeeping/administrative content - schedule announcements, membership/sponsor plugs, sign-off preambles, like-and-subscribe asks - unless it's itself substantively important to understanding the video."""
+
+
 _FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n\n", re.DOTALL)
 
 # Matches the "[HH:MM:SS] " / "[MM:SS] " prefix youtube.render_transcript_markdown()
 # puts at the start of every transcript line.
 _TIMESTAMP_LINE_RE = re.compile(r"^\[(?:(\d+):)?(\d{1,2}):(\d{2})\] ", re.MULTILINE)
+
+# Matches a bare "source_timestamp" value the model is asked to copy
+# verbatim from a transcript line's own bracket - e.g. "[14:32]" or
+# "[1:02:15]" - optionally without the brackets, in case the model drops
+# them despite the prompt's instruction to keep them.
+_SOURCE_TIMESTAMP_RE = re.compile(r"^\[?(?:(\d+):)?(\d{1,2}):(\d{2})\]?$")
+
+# How many transcript lines on either side of the cited line source_anchor
+# is allowed to be found in - a little slack for an excerpt that straddles
+# a line break, without being loose enough to accept a citation for
+# unrelated content elsewhere in the transcript.
+_ANCHOR_WINDOW_LINES = 2
+
+# Fraction of source_anchor's significant words that must appear in the
+# cited window for the anchor to count as grounded. Not a stricter exact-
+# substring match: live testing showed the model reliably finds the right
+# real transcript line (source_timestamp was correct 16/16 times) but
+# routinely cleans up raw, informal ASR captions into a grammatical
+# paraphrase when asked to "copy verbatim" - so a byte-exact substring
+# requirement rejected genuinely well-grounded citations, not just
+# hallucinated ones. Word overlap tolerates that paraphrasing while still
+# catching an anchor that describes unrelated content.
+#
+# 0.4 was the initial guess; a live A/B re-test against it showed several
+# genuinely well-grounded paraphrases clustered at 29-36% overlap - just
+# under the cutoff - while citations describing clearly unrelated content
+# scored far lower (0-12%). 0.25 was chosen empirically from that gap: it
+# recovers the near-miss cluster without accepting the low-overlap ones,
+# which stay rejected (and simply get retried on a later run) rather than
+# being waved through on a guess.
+_ANCHOR_WORD_OVERLAP_THRESHOLD = 0.25
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+_STOPWORDS = frozenset(
+    """
+    a an the and or but is are was were be been being to of in on for with
+    that this these those it its as at by from up down out over under
+    again then once here there when where why how all any both each few
+    more most other some such no nor not only own same so than too very
+    can will just should now we you he she they i them their what which
+    who whom
+    """.split()
+)
+
+
+def _significant_words(text: str) -> set[str]:
+    return {w for w in _WORD_RE.findall(text.lower()) if w not in _STOPWORDS}
 
 # From the Claude API pricing table, USD per million tokens (input, output).
 # Unrecognized models return None from estimate_cost_usd() rather than
@@ -117,22 +175,54 @@ class SummarizationError(RuntimeError):
     Callers should conservatively charge an estimated cost against the
     run's budget in this case rather than contributing zero, since
     repeated failures like this could otherwise let real spend exceed the
-    configured cap unnoticed."""
+    configured cap unnoticed.
+
+    fallback_eligible marks a failure as a content/structured-output
+    problem with *this specific attempt's response* - unparseable/invalid
+    structured output, or a citation that failed _resolve_points()'s
+    grounding check - as opposed to a provider-level problem (rate limit,
+    connection error, 5xx) that's retryable in the sense that a *later*
+    attempt may succeed, but where an immediate second call right now
+    can't fix anything and, for a rate limit specifically, actively makes
+    it worse. Only fallback_eligible failures are candidates for
+    summary_store.summarize_eligible()'s last-attempt fallback path
+    (summarize_fallback()); every other retryable failure just waits for
+    next_retry_at like normal, even on the final attempt."""
 
     def __init__(
-        self, message: str, *, retryable: bool = True, usage: "Usage | None" = None, possibly_billed: bool = False
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        usage: "Usage | None" = None,
+        possibly_billed: bool = False,
+        fallback_eligible: bool = False,
     ):
         super().__init__(message)
         self.retryable = retryable
         self.usage = usage
         self.possibly_billed = possibly_billed
+        self.fallback_eligible = fallback_eligible
 
 
 class SummaryPoint(BaseModel):
+    """The schema the model must produce for one point. Deliberately asks
+    for literal transcript evidence only, never a computed value: the
+    model copies a real line's bracketed timestamp and a verbatim excerpt
+    from it, and application code (_resolve_points()) is solely
+    responsible for verifying that evidence against the transcript and
+    converting it to timestamp_seconds - the earlier design let the model
+    both "remember" a line and compute its own timestamp_seconds in one
+    step, and validated only that the result was plausible (in range),
+    which let a wrong-but-plausible number through. Requiring literal
+    copy-paste evidence, checked against the transcript, is a strictly
+    stronger guarantee than range-checking a self-reported number."""
+
     importance: Literal["major", "minor"]
     main_point: str = Field(min_length=1)
     explanation: str = Field(min_length=1)
-    timestamp_seconds: int
+    source_timestamp: str = Field(min_length=1)
+    source_anchor: str = Field(min_length=1)
 
 
 class ModelSummaryOutput(BaseModel):
@@ -140,10 +230,9 @@ class ModelSummaryOutput(BaseModel):
     the persisted artifact (title, author, url, source ids, hash, model,
     prompt_version, display timestamps, usage, status) is filled in or
     derived by application code from the known source artifact - see
-    summary_store.py. In particular, the human-readable "timestamp" string
-    is never taken from the model - it's derived deterministically from
-    timestamp_seconds via youtube.format_timestamp(), so the two can't
-    disagree with each other.
+    summary_store.py. In particular, points' timestamp_seconds and the
+    human-readable "timestamp" string are never taken from the model - see
+    ResolvedPoint below.
 
     Minimum lengths on every field (including requiring at least one point)
     are deliberate: an empty/blank response is schema-valid by Pydantic's
@@ -153,6 +242,45 @@ class ModelSummaryOutput(BaseModel):
     video_type: Literal["Post-Market Update", "Thesis Piece", "Analytic Overview", "Pre-Market Brief"]
     summary: str = Field(min_length=1)
     points: list[SummaryPoint] = Field(min_length=1)
+
+
+class FallbackSummaryOutput(BaseModel):
+    """The much simpler schema used when a video has exhausted its normal
+    per-point citation attempts (see summarize_fallback() and
+    summary_store.summarize_eligible()'s last-attempt handling). Some
+    speakers - meandering, conversational, non-linear delivery - make it
+    hard for the model to pin one point to one specific transcript line
+    even though it clearly understood the content; asking for a plain
+    prose summary instead sidesteps that entirely, since there's no
+    per-line citation to get wrong. No timestamps, no points - just a
+    freeform summary of the video as a whole."""
+
+    summary: str = Field(min_length=1)
+
+
+@dataclass
+class ResolvedPoint:
+    """A SummaryPoint after its source_timestamp/source_anchor have been
+    verified against the transcript and converted to a real
+    timestamp_seconds - see _resolve_points(). This, not SummaryPoint, is
+    what summarize_transcript() actually returns to callers (see
+    ResolvedSummary): nothing downstream ever sees a model-reported
+    timestamp, computed or otherwise."""
+
+    importance: Literal["major", "minor"]
+    main_point: str
+    explanation: str
+    timestamp_seconds: int
+
+
+@dataclass
+class ResolvedSummary:
+    """summarize_transcript()'s actual return shape - same fields as
+    ModelSummaryOutput, but with points resolved (see ResolvedPoint)."""
+
+    video_type: str
+    summary: str
+    points: list[ResolvedPoint]
 
 
 class Usage(BaseModel):
@@ -237,40 +365,127 @@ def count_prompt_tokens(transcript_body: str, *, model: str) -> int:
     return result.input_tokens
 
 
-def _max_transcript_seconds(transcript_body: str) -> int:
-    """Highest timestamp actually present in the transcript body shown to
-    the model, used to validate the model didn't invent an out-of-range
-    timestamp_seconds for some point."""
+def _index_transcript_lines(transcript_body: str) -> list[tuple[int, str]]:
+    """Returns (timestamp_seconds, line_text) for every timestamped line in
+    the transcript, in original order - the shared source of truth for the
+    max-timestamp check, the "is this a real line" check, and source_anchor
+    window matching below."""
 
-    max_seconds = 0
+    lines = []
     for match in _TIMESTAMP_LINE_RE.finditer(transcript_body):
         hours = int(match.group(1)) if match.group(1) else 0
         minutes = int(match.group(2))
         seconds = int(match.group(3))
-        max_seconds = max(max_seconds, hours * 3600 + minutes * 60 + seconds)
-    return max_seconds
+        line_end = transcript_body.find("\n", match.end())
+        if line_end == -1:
+            line_end = len(transcript_body)
+        lines.append((hours * 3600 + minutes * 60 + seconds, transcript_body[match.end() : line_end]))
+    return lines
 
 
-def _validate_points(points: list[SummaryPoint], transcript_body: str) -> None:
-    """Raises ValueError if a point's timestamp_seconds isn't trustworthy:
-    negative, or beyond the transcript's own timestamp range - Pydantic
-    only validates that it's an int, not that it's plausible. Points are
-    deliberately *not* required to be in chronological order: real videos
-    (livestreams especially) revisit the same topic more than once, and a
-    strict ordering requirement rejected genuinely well-formed output for
-    that content - see _select_significant_points() for the actual bound
-    that matters for long videos (a cap on point count, not their order)."""
+def _max_transcript_seconds(transcript_body: str) -> int:
+    """Highest timestamp actually present in the transcript body shown to
+    the model - used to size the point budget (_max_points_for_duration())."""
 
-    max_seconds = _max_transcript_seconds(transcript_body)
+    return max((seconds for seconds, _ in _index_transcript_lines(transcript_body)), default=0)
+
+
+def _parse_source_timestamp(raw: str) -> int | None:
+    """Parses a model-supplied source_timestamp value (expected verbatim
+    from a transcript line's own bracket, e.g. "[14:32]") into seconds.
+    Returns None if it doesn't match the expected [H:MM:SS]/[MM:SS] shape
+    at all - a distinct failure from "parses fine but isn't a real
+    transcript line", which _resolve_points() checks separately."""
+
+    match = _SOURCE_TIMESTAMP_RE.match(raw.strip())
+    if not match:
+        return None
+    hours = int(match.group(1)) if match.group(1) else 0
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _resolve_points(points: list[SummaryPoint], transcript_body: str) -> list[ResolvedPoint]:
+    """Verifies each point's cited evidence against the transcript and
+    computes its real timestamp_seconds - the model never computes or
+    reports this number itself; it only cites a literal transcript line
+    (source_timestamp) and a short excerpt from it (source_anchor). Raises
+    ValueError - a content/grounding failure Pydantic's schema check alone
+    can't catch, same as the old range check - if:
+
+      - source_timestamp doesn't parse as a "[H:MM:SS]"/"[MM:SS]" value;
+      - that exact value isn't one of the transcript's own real line
+        timestamps (strict equality, not "in range" - the model must cite
+        a real line, not merely land on a plausible-sounding number); or
+      - fewer than _ANCHOR_WORD_OVERLAP_THRESHOLD of source_anchor's
+        significant (non-stopword) words appear within _ANCHOR_WINDOW_LINES
+        lines of that timestamp - a fuzzy check, not exact-substring
+        containment, since the model reliably finds the right real line but
+        doesn't reliably reproduce raw ASR caption text byte-for-byte even
+        when told to; see _ANCHOR_WORD_OVERLAP_THRESHOLD's own comment.
+
+    Points are deliberately *not* required to be in chronological order:
+    real videos (livestreams especially) revisit the same topic more than
+    once, and a strict ordering requirement rejected genuinely well-formed
+    output for that content - see _select_significant_points() for the
+    actual bound that matters for long videos (a cap on point count, not
+    their order)."""
+
+    indexed = _index_transcript_lines(transcript_body)
+    # Transcript timestamps are truncated to whole seconds
+    # (youtube.format_timestamp()), so more than one caption line can
+    # legitimately share the same rendered [MM:SS] - map each second to
+    # *every* matching line index, not just the first, or a valid anchor
+    # on a later same-second cue would be rejected just because an
+    # earlier cue at that same second happened to come first.
+    line_indices_by_second: dict[int, list[int]] = {}
+    for i, (seconds, _text) in enumerate(indexed):
+        line_indices_by_second.setdefault(seconds, []).append(i)
+
+    resolved: list[ResolvedPoint] = []
     for point in points:
-        if point.timestamp_seconds < 0 or point.timestamp_seconds > max_seconds:
+        seconds = _parse_source_timestamp(point.source_timestamp)
+        if seconds is None:
             raise ValueError(
-                f"timestamp_seconds={point.timestamp_seconds} is outside the transcript's own "
-                f"range [0, {max_seconds}] for point {point.main_point!r}."
+                f"source_timestamp {point.source_timestamp!r} is not a valid [H:MM:SS]/[MM:SS] "
+                f"value for point {point.main_point!r}."
+            )
+        line_indices = line_indices_by_second.get(seconds)
+        if line_indices is None:
+            raise ValueError(
+                f"source_timestamp {point.source_timestamp!r} ({seconds}s) is not one of the "
+                f"transcript's own line timestamps for point {point.main_point!r}."
             )
 
+        anchor_words = _significant_words(point.source_anchor)
+        best_overlap = 0.0
+        for line_index in line_indices:
+            window_start = max(0, line_index - _ANCHOR_WINDOW_LINES)
+            window_end = min(len(indexed), line_index + _ANCHOR_WINDOW_LINES + 1)
+            window_text = " ".join(text for _, text in indexed[window_start:window_end])
+            window_words = _significant_words(window_text)
+            overlap = len(anchor_words & window_words) / len(anchor_words) if anchor_words else 0.0
+            best_overlap = max(best_overlap, overlap)
+        if best_overlap < _ANCHOR_WORD_OVERLAP_THRESHOLD:
+            raise ValueError(
+                f"source_anchor {point.source_anchor!r} has only {best_overlap:.0%} word overlap with "
+                f"content within {_ANCHOR_WINDOW_LINES} line(s) of {point.source_timestamp!r} "
+                f"(need >= {_ANCHOR_WORD_OVERLAP_THRESHOLD:.0%}) for point {point.main_point!r}."
+            )
 
-def _select_significant_points(points: list[SummaryPoint], max_points: int) -> tuple[list[SummaryPoint], bool]:
+        resolved.append(
+            ResolvedPoint(
+                importance=point.importance,
+                main_point=point.main_point,
+                explanation=point.explanation,
+                timestamp_seconds=seconds,
+            )
+        )
+    return resolved
+
+
+def _select_significant_points(points: list[ResolvedPoint], max_points: int) -> tuple[list[ResolvedPoint], bool]:
     """Enforces _max_points_for_duration()'s cap as a hard backstop,
     independent of whether the model already respected it in the prompt:
     if the model still returns more than max_points, keep only the most
@@ -290,9 +505,11 @@ def _select_significant_points(points: list[SummaryPoint], max_points: int) -> t
 
 def summarize_transcript(
     transcript_body: str, *, model: str, max_output_tokens: int
-) -> tuple[ModelSummaryOutput, Usage, bool]:
-    """Calls Claude to produce a ModelSummaryOutput for one transcript.
-    Raises SummarizationError on any provider failure or invalid/unparseable
+) -> tuple[ResolvedSummary, Usage, bool]:
+    """Calls Claude to produce a ResolvedSummary for one transcript (the
+    model itself produces a ModelSummaryOutput; _resolve_points() verifies
+    and converts it - see that function's docstring). Raises
+    SummarizationError on any provider failure or invalid/unparseable
     output - never raises a raw SDK exception, so callers don't need to know
     the SDK's exception hierarchy. Returns (output, usage, points_truncated) -
     points_truncated is True if _select_significant_points() had to drop
@@ -340,7 +557,10 @@ def summarize_transcript(
         # here (the exception propagates before we get access to the raw
         # response object) - a known limitation, not a missed case.
         raise SummarizationError(
-            f"Model response failed schema validation: {exc}", retryable=True, possibly_billed=True
+            f"Model response failed schema validation: {exc}",
+            retryable=True,
+            possibly_billed=True,
+            fallback_eligible=True,
         ) from exc
 
     response_usage = Usage(input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
@@ -355,20 +575,85 @@ def summarize_transcript(
     if response.parsed_output is None:
         # A response was returned (and billed) but didn't parse against the
         # schema - plausibly a transient formatting hiccup, worth retrying.
+        # Also fallback_eligible: the fallback schema is far simpler (one
+        # free-text field, no per-point structure), so it needs much less
+        # output budget and is meaningfully more likely to actually parse.
         raise SummarizationError(
             f"Model response did not contain valid structured output (stop_reason={response.stop_reason!r}).",
             retryable=True,
             usage=response_usage,
+            fallback_eligible=True,
         )
 
     try:
-        _validate_points(response.parsed_output.points, transcript_body)
+        resolved_points = _resolve_points(response.parsed_output.points, transcript_body)
     except ValueError as exc:
-        raise SummarizationError(f"Model output failed validation: {exc}", retryable=True, usage=response_usage) from exc
+        # The core citation/grounding failure this whole mechanism exists
+        # for - fallback_eligible=True since a plain-prose fallback has no
+        # per-line citation to fail this same way.
+        raise SummarizationError(
+            f"Model output failed validation: {exc}", retryable=True, usage=response_usage, fallback_eligible=True
+        ) from exc
 
-    selected_points, points_truncated = _select_significant_points(response.parsed_output.points, max_points)
-    output = response.parsed_output
-    if points_truncated:
-        output = output.model_copy(update={"points": selected_points})
+    selected_points, points_truncated = _select_significant_points(resolved_points, max_points)
+    output = ResolvedSummary(
+        video_type=response.parsed_output.video_type,
+        summary=response.parsed_output.summary,
+        points=selected_points,
+    )
 
     return output, response_usage, points_truncated
+
+
+def summarize_fallback(transcript_body: str, *, model: str, max_output_tokens: int) -> tuple[str, Usage]:
+    """Last-resort path used only after a video has exhausted its normal
+    per-point citation attempts (see summary_store.summarize_eligible()'s
+    last-attempt handling) - produces a plain 2-3 paragraph summary
+    instead, with no per-line citations to get wrong. Some speakers
+    (meandering, conversational, non-linear delivery) make source_timestamp/
+    source_anchor grounding hard even when the model clearly understood
+    the content; this sidesteps that failure mode entirely rather than
+    trying to fix it with more retries of the same approach.
+
+    Same error-handling shape as summarize_transcript() (see there for the
+    rationale behind each branch) - deliberately not shared code, since
+    this call has no points to resolve and a much simpler failure surface."""
+
+    try:
+        client = anthropic.Anthropic(max_retries=_CLIENT_MAX_RETRIES)
+        response = client.messages.parse(
+            model=model,
+            max_tokens=max_output_tokens,
+            system=_build_fallback_system_prompt(),
+            messages=[{"role": "user", "content": transcript_body}],
+            output_format=FallbackSummaryOutput,
+        )
+    except anthropic.RateLimitError as exc:
+        raise SummarizationError(f"Rate limited: {exc}", retryable=True) from exc
+    except anthropic.APIConnectionError as exc:
+        raise SummarizationError(f"Connection error: {exc}", retryable=True) from exc
+    except anthropic.APIStatusError as exc:
+        retryable = exc.status_code >= 500 or exc.status_code == 429
+        raise SummarizationError(f"API error ({exc.status_code}): {exc.message}", retryable=retryable) from exc
+    except anthropic.AnthropicError as exc:
+        raise SummarizationError(f"Anthropic SDK error: {exc}", retryable=False) from exc
+    except pydantic.ValidationError as exc:
+        raise SummarizationError(
+            f"Fallback model response failed schema validation: {exc}", retryable=True, possibly_billed=True
+        ) from exc
+
+    response_usage = Usage(input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
+
+    if response.stop_reason == "refusal":
+        raise SummarizationError(
+            "Model declined to produce a fallback summary (safety refusal).", retryable=False, usage=response_usage
+        )
+    if response.parsed_output is None:
+        raise SummarizationError(
+            f"Fallback model response did not contain valid structured output "
+            f"(stop_reason={response.stop_reason!r}).",
+            retryable=True,
+            usage=response_usage,
+        )
+
+    return response.parsed_output.summary, response_usage

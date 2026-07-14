@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import pytest
 
 from app import summary_store
-from app.summarize import ModelSummaryOutput, SummarizationError, SummaryPoint, Usage
+from app.summarize import ResolvedPoint, ResolvedSummary, SummarizationError, Usage
 
 TRANSCRIPT_MARKDOWN = """---
 video_id: abc123XYZde
@@ -148,10 +148,10 @@ _INDEX_ONE_VIDEO = {
 def test_summarize_eligible_summarizes_a_newly_eligible_video(monkeypatch):
     written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
 
-    output = ModelSummaryOutput(
+    output = ResolvedSummary(
         video_type="Analytic Overview",
         summary="Summary.",
-        points=[SummaryPoint(importance="major", main_point="Point", explanation="Because.", timestamp_seconds=0)],
+        points=[ResolvedPoint(importance="major", main_point="Point", explanation="Because.", timestamp_seconds=0)],
     )
     monkeypatch.setattr(
         summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=10, output_tokens=5), False)
@@ -190,10 +190,10 @@ def test_summarize_eligible_surfaces_video_published_at_from_the_index(monkeypat
     written = _stub_drive(
         monkeypatch, index=index_with_published_at, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN}
     )
-    output = ModelSummaryOutput(
+    output = ResolvedSummary(
         video_type="Analytic Overview",
         summary="Summary.",
-        points=[SummaryPoint(importance="major", main_point="Point", explanation="Because.", timestamp_seconds=0)],
+        points=[ResolvedPoint(importance="major", main_point="Point", explanation="Because.", timestamp_seconds=0)],
     )
     monkeypatch.setattr(
         summary_store,
@@ -288,7 +288,7 @@ def test_summarize_eligible_hash_reflects_content_beyond_the_truncation_cutoff(m
         transcripts={"A Title [abc123XYZde].md": long_markdown},
         existing_summaries=existing_summaries,
     )
-    output = ModelSummaryOutput(video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
+    output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
         summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
@@ -426,7 +426,7 @@ def test_summarize_eligible_counts_a_retry_and_increments_attempts(monkeypatch):
         transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN},
         existing_summaries=existing_summaries,
     )
-    output = ModelSummaryOutput(video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
+    output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
         summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
@@ -436,6 +436,183 @@ def test_summarize_eligible_counts_a_retry_and_increments_attempts(monkeypatch):
     assert report.retried == 1
     assert report.summarized == 1
     assert written["abc123XYZde.json"]["attempts"] == 2
+
+
+def _existing_error(current_hash, *, attempts, retryable):
+    return {
+        "status": "error",
+        "source_transcript_hash": current_hash,
+        "model": "claude-haiku-4-5",
+        "prompt_version": summary_store.PROMPT_VERSION,
+        "attempts": attempts,
+        "retryable": retryable,
+    }
+
+
+def test_summarize_eligible_uses_a_fallback_summary_on_the_last_retryable_attempt(monkeypatch):
+    """A video that fails on its last allowed attempt gets one extra,
+    simpler call for a plain prose summary instead of being left
+    permanently as status: 'error' - see summarize_fallback()."""
+    body = summary_store.strip_frontmatter(TRANSCRIPT_MARKDOWN)
+    current_hash = summary_store.transcript_hash(body)
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 2)
+    existing_summaries = {"abc123XYZde": _existing_error(current_hash, attempts=1, retryable=True)}
+    written = _stub_drive(
+        monkeypatch,
+        index=_INDEX_ONE_VIDEO,
+        transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN},
+        existing_summaries=existing_summaries,
+    )
+
+    def _raise(*a, **k):
+        raise SummarizationError("grounding failed", retryable=True, fallback_eligible=True)
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
+    monkeypatch.setattr(
+        summary_store, "summarize_fallback", lambda body, model, max_output_tokens: ("A plain summary.", Usage(input_tokens=50, output_tokens=20))
+    )
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert report.summarized == 1
+    assert report.failed == 0
+    written_artifact = written["abc123XYZde.json"]
+    assert written_artifact["status"] == "ok"
+    assert written_artifact["fallback_summary"] is True
+    assert written_artifact["summary"] == f"{summary_store.FALLBACK_SUMMARY_SYMBOL} A plain summary."
+    assert written_artifact["points"] == []
+    assert written_artifact["video_type"] is None
+    assert written_artifact["usage"]["input_tokens"] == 50
+    assert report.total_input_tokens == 50
+    assert report.total_output_tokens == 20
+
+
+def test_summarize_eligible_does_not_use_fallback_before_the_last_attempt(monkeypatch):
+    """Every earlier attempt still gets a real shot at the normal,
+    per-point-cited format first - fallback is last-resort only. Uses a
+    fallback_eligible failure so this test isolates the "not the last
+    attempt yet" gate specifically, not the eligibility gate."""
+    body = summary_store.strip_frontmatter(TRANSCRIPT_MARKDOWN)
+    current_hash = summary_store.transcript_hash(body)
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 3)
+    existing_summaries = {"abc123XYZde": _existing_error(current_hash, attempts=1, retryable=True)}
+    written = _stub_drive(
+        monkeypatch,
+        index=_INDEX_ONE_VIDEO,
+        transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN},
+        existing_summaries=existing_summaries,
+    )
+
+    def _raise(*a, **k):
+        raise SummarizationError("grounding failed", retryable=True, fallback_eligible=True)
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
+    fallback_calls = []
+    monkeypatch.setattr(summary_store, "summarize_fallback", lambda *a, **k: fallback_calls.append(1))
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert fallback_calls == []
+    assert report.failed == 1
+    assert written["abc123XYZde.json"]["status"] == "error"
+
+
+def test_summarize_eligible_does_not_use_fallback_for_a_non_retryable_failure(monkeypatch):
+    """A non-retryable failure (e.g. a safety refusal) is deterministic for
+    the same input - the simpler fallback prompt would very likely be
+    refused too, so it's not worth the extra call."""
+    body = summary_store.strip_frontmatter(TRANSCRIPT_MARKDOWN)
+    current_hash = summary_store.transcript_hash(body)
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 2)
+    existing_summaries = {"abc123XYZde": _existing_error(current_hash, attempts=1, retryable=True)}
+    written = _stub_drive(
+        monkeypatch,
+        index=_INDEX_ONE_VIDEO,
+        transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN},
+        existing_summaries=existing_summaries,
+    )
+
+    def _raise(*a, **k):
+        raise SummarizationError("refused", retryable=False)
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
+    fallback_calls = []
+    monkeypatch.setattr(summary_store, "summarize_fallback", lambda *a, **k: fallback_calls.append(1))
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert fallback_calls == []
+    assert report.failed == 1
+    assert written["abc123XYZde.json"]["status"] == "error"
+
+
+def test_summarize_eligible_does_not_use_fallback_for_a_retryable_but_ineligible_failure(monkeypatch):
+    """Regression test: retryable=True also covers provider-level outages
+    (rate limits, connection errors, 5xx) via SummarizationError, not just
+    content/grounding problems. An immediate fallback call right after one
+    of those can't fix anything and, for a rate limit specifically, only
+    makes it worse - so the gate must check fallback_eligible, not just
+    retryable, even on the video's last attempt."""
+    body = summary_store.strip_frontmatter(TRANSCRIPT_MARKDOWN)
+    current_hash = summary_store.transcript_hash(body)
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 2)
+    existing_summaries = {"abc123XYZde": _existing_error(current_hash, attempts=1, retryable=True)}
+    written = _stub_drive(
+        monkeypatch,
+        index=_INDEX_ONE_VIDEO,
+        transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN},
+        existing_summaries=existing_summaries,
+    )
+
+    def _raise(*a, **k):
+        # retryable=True (a later scheduled run may well succeed), but
+        # fallback_eligible defaults to False - this is what a real rate
+        # limit/connection/5xx failure looks like.
+        raise SummarizationError("Rate limited: boom", retryable=True)
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
+    fallback_calls = []
+    monkeypatch.setattr(summary_store, "summarize_fallback", lambda *a, **k: fallback_calls.append(1))
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert fallback_calls == []
+    assert report.failed == 1
+    assert written["abc123XYZde.json"]["status"] == "error"
+    assert written["abc123XYZde.json"]["retryable"] is True
+
+
+def test_summarize_eligible_falls_through_to_the_original_error_when_fallback_also_fails(monkeypatch):
+    body = summary_store.strip_frontmatter(TRANSCRIPT_MARKDOWN)
+    current_hash = summary_store.transcript_hash(body)
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 2)
+    existing_summaries = {"abc123XYZde": _existing_error(current_hash, attempts=1, retryable=True)}
+    written = _stub_drive(
+        monkeypatch,
+        index=_INDEX_ONE_VIDEO,
+        transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN},
+        existing_summaries=existing_summaries,
+    )
+
+    def _raise_primary(*a, **k):
+        raise SummarizationError("grounding failed", retryable=True, fallback_eligible=True)
+
+    def _raise_fallback(*a, **k):
+        raise SummarizationError("rate limited", retryable=True)
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _raise_primary)
+    monkeypatch.setattr(summary_store, "summarize_fallback", _raise_fallback)
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert report.failed == 1
+    assert report.summarized == 0
+    written_artifact = written["abc123XYZde.json"]
+    assert written_artifact["status"] == "error"
+    # The artifact preserves the *original* (primary-call) error message,
+    # not the fallback attempt's - the fallback is an implementation
+    # detail, not what actually explains why this video has no summary.
+    assert written_artifact["message"] == "grounding failed"
 
 
 def test_summarize_eligible_stops_at_max_videos_per_run(monkeypatch):
@@ -452,7 +629,7 @@ def test_summarize_eligible_stops_at_max_videos_per_run(monkeypatch):
     _stub_drive(monkeypatch, index=index, transcripts={f"vid{i}.md": TRANSCRIPT_MARKDOWN for i in range(3)})
     monkeypatch.setattr(summary_store.settings, "summary_max_videos_per_run", 1)
 
-    output = ModelSummaryOutput(video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
+    output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
         summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
@@ -518,7 +695,7 @@ def test_summarize_eligible_stops_on_budget_when_remaining_headroom_runs_out(mon
     # comfortably under this cap on its own, but two calls' worth isn't.
     monkeypatch.setattr(summary_store.settings, "summary_max_cost_usd_per_run", 0.0009)
 
-    output = ModelSummaryOutput(video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
+    output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
         summary_store,
         "summarize_transcript",
@@ -555,7 +732,7 @@ def test_summarize_eligible_aborts_without_writing_when_token_counting_fails(mon
 
 def test_summarize_eligible_calls_on_progress_before_model_call_and_before_write(monkeypatch):
     _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
-    output = ModelSummaryOutput(video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
+    output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
         summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
@@ -575,7 +752,7 @@ def test_summarize_eligible_does_not_write_if_lock_is_lost_before_the_write(monk
     acquired the lock. on_progress() raising (simulating a lost lock) must
     stop this function *before* it writes, not merely be observed after."""
     written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
-    output = ModelSummaryOutput(video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
+    output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
         summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
@@ -731,8 +908,8 @@ def test_summarize_eligible_records_points_truncated_flag(monkeypatch):
     """When summarize_transcript() reports it had to drop points to stay
     under the length-based cap, the artifact should say so."""
     written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
-    output = ModelSummaryOutput(
-        video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)]
+    output = ResolvedSummary(
+        video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)]
     )
     monkeypatch.setattr(
         summary_store,
@@ -747,8 +924,8 @@ def test_summarize_eligible_records_points_truncated_flag(monkeypatch):
 
 def test_summarize_eligible_omits_points_truncated_flag_when_not_truncated(monkeypatch):
     written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
-    output = ModelSummaryOutput(
-        video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)]
+    output = ResolvedSummary(
+        video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)]
     )
     monkeypatch.setattr(
         summary_store,
