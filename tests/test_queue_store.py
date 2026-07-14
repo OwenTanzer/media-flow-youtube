@@ -20,6 +20,17 @@ def test_entry_first_seen_at_returns_none_for_unparseable_value():
     assert queue_store.entry_first_seen_at({"url": "https://youtu.be/x", "first_seen_at": "not a date"}) is None
 
 
+def test_entry_first_seen_at_normalizes_naive_timestamp_to_utc():
+    """Regression test for the review finding: queue.json is operator-editable,
+    and datetime.fromisoformat() happily accepts a timezone-less timestamp
+    like "2026-07-14T12:00:00". Returning it naive would crash the
+    aware-vs-naive subtraction in batch.py's grace-period check."""
+    entry = {"url": "https://youtu.be/x", "first_seen_at": "2026-07-14T12:00:00"}
+    result = queue_store.entry_first_seen_at(entry)
+    assert result == datetime(2026, 7, 14, 12, 0, 0, tzinfo=timezone.utc)
+    assert result.tzinfo is not None
+
+
 def test_read_queue_preserves_first_seen_at(monkeypatch):
     monkeypatch.setattr(queue_store.settings, "dry_run", False)
     monkeypatch.setattr(

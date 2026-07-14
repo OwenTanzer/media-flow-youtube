@@ -118,6 +118,20 @@ def test_run_batch_drops_no_captions_immediately_when_entry_has_no_first_seen_at
     assert written["urls"] == []
 
 
+def test_run_batch_does_not_crash_on_a_timezone_naive_first_seen_at(monkeypatch):
+    """Regression test for the review finding: queue.json is operator-editable,
+    so a timezone-less first_seen_at (valid per datetime.fromisoformat) must
+    not crash the whole batch run via an aware-vs-naive subtraction."""
+    entry = {"url": "https://youtu.be/x", "first_seen_at": "2026-07-14T12:00:00"}
+    monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: [entry])
+    monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: None)
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result("x", "no_captions", url))
+
+    results = batch.run_batch()  # must not raise
+
+    assert len(results) == 1
+
+
 def test_run_batch_empty_queue_is_a_noop(monkeypatch):
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: [])
     write_calls = []

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from . import drive
 from .config import settings
@@ -48,9 +48,16 @@ def entry_first_seen_at(entry: str | dict) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        # queue.json is operator-editable, and a timezone-less ISO timestamp
+        # (e.g. "2026-07-14T12:00:00") is a realistic manual entry. Assume
+        # UTC rather than returning a naive datetime that would crash the
+        # aware-vs-naive subtraction in batch.py's grace-period check.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def read_queue(folder_id: str) -> list[str | dict]:
