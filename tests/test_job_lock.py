@@ -190,3 +190,64 @@ def test_acquire_and_release_are_no_ops_in_dry_run(monkeypatch):
     assert token is not None
     job_lock.release_lock("folder-id", token)
     assert not called
+
+
+def test_renew_lock_rewrites_a_fresh_timestamp_when_token_matches(monkeypatch):
+    """Regression test for the review finding: a large queue's cooldowns
+    alone can exceed DISCOVERY_LOCK_TTL_SECONDS, so a long-running batch
+    must be able to refresh its own lease rather than have a healthy run
+    look crashed to a concurrent invocation."""
+    _set_real_drive(monkeypatch)
+    stale = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    monkeypatch.setattr(
+        job_lock.drive,
+        "download_text",
+        lambda folder_id, filename: json.dumps({"acquired_at": stale, "token": "my-token"}),
+    )
+    written = {}
+    monkeypatch.setattr(
+        job_lock.drive,
+        "upload_text_file",
+        lambda folder_id, filename, content, **k: written.setdefault("content", content),
+    )
+
+    assert job_lock.renew_lock("folder-id", "my-token") is True
+    payload = json.loads(written["content"])
+    assert payload["token"] == "my-token"
+    assert datetime.fromisoformat(payload["acquired_at"]) > datetime.now(timezone.utc) - timedelta(seconds=5)
+
+
+def test_renew_lock_fails_without_writing_when_token_does_not_match(monkeypatch):
+    _set_real_drive(monkeypatch)
+    monkeypatch.setattr(
+        job_lock.drive,
+        "download_text",
+        lambda folder_id, filename: json.dumps(
+            {"acquired_at": datetime.now(timezone.utc).isoformat(), "token": "someone-elses-token"}
+        ),
+    )
+    write_calls = []
+    monkeypatch.setattr(job_lock.drive, "upload_text_file", lambda *a, **k: write_calls.append(1))
+
+    assert job_lock.renew_lock("folder-id", "my-token") is False
+    assert not write_calls
+
+
+def test_renew_lock_fails_when_lock_file_is_gone(monkeypatch):
+    _set_real_drive(monkeypatch)
+    monkeypatch.setattr(job_lock.drive, "download_text", lambda folder_id, filename: None)
+    write_calls = []
+    monkeypatch.setattr(job_lock.drive, "upload_text_file", lambda *a, **k: write_calls.append(1))
+
+    assert job_lock.renew_lock("folder-id", "my-token") is False
+    assert not write_calls
+
+
+def test_renew_lock_is_a_noop_in_dry_run(monkeypatch):
+    monkeypatch.setattr(job_lock.settings, "dry_run", True)
+    called = []
+    monkeypatch.setattr(job_lock.drive, "download_text", lambda *a, **k: called.append(1))
+    monkeypatch.setattr(job_lock.drive, "upload_text_file", lambda *a, **k: called.append(1))
+
+    assert job_lock.renew_lock("folder-id", "any-token") is True
+    assert not called

@@ -196,7 +196,22 @@ the clean rate back to baseline; a 20-second gap only partially helped.
 `BATCH_SIZE_THRESHOLD` queued entries (default `10`), it processes in
 chunks of that size with a `BATCH_COOLDOWN_SECONDS` (default `300`)
 cooldown between chunks, rather than burning through a large backlog in
-one continuous burst.
+one continuous burst. Both must be positive/non-negative - the app
+refuses to start with an invalid value, since a threshold `<= 0` would
+otherwise chunk the queue into zero batches and silently overwrite
+`queue.json` with an empty list. This only applies to the queue-driven
+path (`discover_and_process.py`/`batch_runner.py`) - an explicit URL list
+(e.g. a live `POST /batch/run` request) is never paced, since a large one
+would otherwise hold the HTTP connection open for the full cooldown
+duration. `queue.json` is checkpointed after every chunk rather than only
+once at the end, so a crash partway through a long run doesn't lose
+already-completed progress or force a full reprocess next time. Because a
+large queue's total cooldown time can exceed
+`DISCOVERY_LOCK_TTL_SECONDS`, `discover_and_process.py` renews its lock
+lease after every chunk (`job_lock.renew_lock()`) so a healthy long run
+doesn't look crashed to a concurrent invocation; if the lease is ever
+found to belong to someone else mid-run, the run aborts immediately
+rather than continuing to write against a lock it no longer holds.
 
 ## Usage
 

@@ -166,7 +166,11 @@ def test_run_batch_paces_in_cooled_down_chunks_when_above_threshold(monkeypatch)
     assert sleep_calls == [300, 300]
 
 
-def test_run_batch_paces_explicit_url_lists_too(monkeypatch):
+def test_run_batch_does_not_pace_explicit_url_lists(monkeypatch):
+    """Regression test for the review finding: pacing an explicit URL list
+    (e.g. from a live POST /batch/run request) would hold the HTTP
+    connection open for the full cooldown duration - confined to the
+    queue path, which is only ever driven by standalone scripts."""
     monkeypatch.setattr(batch.settings, "batch_size_threshold", 1)
     monkeypatch.setattr(batch.settings, "batch_cooldown_seconds", 300)
     monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
@@ -176,7 +180,63 @@ def test_run_batch_paces_explicit_url_lists_too(monkeypatch):
     results = batch.run_batch(urls=["a", "b", "c"])
 
     assert len(results) == 3
-    assert sleep_calls == [300, 300]
+    assert sleep_calls == []
+
+
+def test_run_batch_checkpoints_queue_after_every_chunk(monkeypatch):
+    """Regression test for the review finding: writing queue.json only once
+    at the very end means a crash partway through a long, multi-chunk run
+    loses all progress - the next run would reprocess everything from
+    scratch, including videos that already succeeded, recreating the exact
+    proxy pressure batching exists to relieve."""
+    monkeypatch.setattr(batch.settings, "batch_size_threshold", 2)
+    monkeypatch.setattr(batch.settings, "batch_cooldown_seconds", 300)
+    monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: ["a", "b", "c", "d", "e"])
+    monkeypatch.setattr(batch.time, "sleep", lambda seconds: None)
+
+    outcomes = {
+        "a": _result("a", "ok"),
+        "b": _result("b", "blocked"),  # transient - stays queued
+        "c": _result("c", "ok"),
+        "d": _result("d", "blocked"),  # transient - stays queued
+        "e": _result("e", "ok"),
+    }
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: outcomes[url])
+
+    checkpoints = []
+    monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: checkpoints.append(list(urls)))
+
+    batch.run_batch()
+
+    # Chunk 1 [a,b]: "b" transient, "c,d,e" untouched -> checkpoint = [b, c, d, e]
+    # Chunk 2 [c,d]: "d" transient, "e" untouched -> checkpoint = [b, d, e]
+    # Chunk 3 [e]: no untouched tail left -> checkpoint = [b, d]
+    assert checkpoints == [["b", "c", "d", "e"], ["b", "d", "e"], ["b", "d"]]
+
+
+def test_run_batch_calls_on_chunk_done_once_per_chunk(monkeypatch):
+    monkeypatch.setattr(batch.settings, "batch_size_threshold", 2)
+    monkeypatch.setattr(batch.settings, "batch_cooldown_seconds", 300)
+    monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: ["a", "b", "c", "d", "e"])
+    monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: None)
+    monkeypatch.setattr(batch.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
+
+    calls = []
+    batch.run_batch(on_chunk_done=lambda: calls.append(1))
+
+    assert len(calls) == 3  # 3 chunks: [a,b] [c,d] [e]
+
+
+def test_run_batch_does_not_call_on_chunk_done_when_unpaced(monkeypatch):
+    monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: ["a"])
+    monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: None)
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
+
+    calls = []
+    batch.run_batch(on_chunk_done=lambda: calls.append(1))
+
+    assert calls == []
 
 
 def test_run_batch_empty_queue_is_a_noop(monkeypatch):

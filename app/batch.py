@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 from . import queue_store
@@ -37,7 +38,17 @@ def _chunk(items: list, size: int) -> list[list]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
-def run_batch(urls: list[str] | None = None, languages: list[str] | None = None) -> list[VideoResult]:
+def run_batch(
+    urls: list[str] | None = None,
+    languages: list[str] | None = None,
+    on_chunk_done: Callable[[], None] | None = None,
+) -> list[VideoResult]:
+    """on_chunk_done is called after each paced chunk finishes (queue path
+    only - see below). discover_and_process.py uses it to renew its Drive
+    lock lease, since a large queue's total pacing time can otherwise
+    comfortably exceed the lock's TTL and let a second invocation take
+    over mid-run."""
+
     folder_id = settings.require_drive_folder_id()
     use_queue = urls is None
 
@@ -73,10 +84,15 @@ def run_batch(urls: list[str] | None = None, languages: list[str] | None = None)
     # A long, continuous run of requests through the rotating proxy pool
     # measurably degrades its success rate (observed empirically - see the
     # egress proxy section of the README). Above BATCH_SIZE_THRESHOLD
-    # entries, process in smaller chunks with a real cooldown between them
-    # so the pool gets a chance to recover, rather than burning through the
-    # whole thing in one continuous burst.
-    if len(entries) > settings.batch_size_threshold:
+    # entries, process the queue in smaller chunks with a real cooldown
+    # between them so the pool gets a chance to recover, rather than
+    # burning through the whole thing in one continuous burst.
+    #
+    # Confined to the queue path: an explicit URL list only ever comes from
+    # a live HTTP request (e.g. POST /batch/run), which would otherwise
+    # hold the connection open for the full cooldown duration - potentially
+    # hours for a large list.
+    if use_queue and len(entries) > settings.batch_size_threshold:
         chunks = _chunk(entries, settings.batch_size_threshold)
         logger.info(
             "%d entries exceeds the %d-entry batching threshold; processing in %d chunk(s) of "
@@ -92,9 +108,24 @@ def run_batch(urls: list[str] | None = None, languages: list[str] | None = None)
                 time.sleep(settings.batch_cooldown_seconds)
             for entry in chunk:
                 _process_one(entry)
-    else:
-        for entry in entries:
-            _process_one(entry)
+
+            # Checkpoint after every chunk rather than only at the end: a run
+            # covering many chunks can take a long time (cooldowns alone), and
+            # if it crashes partway, the untouched tail plus whatever's
+            # transiently failed so far should already be durably saved -
+            # otherwise a restart would reprocess everything from scratch,
+            # including videos that already succeeded this run, right back
+            # into the same proxy pressure this batching exists to relieve.
+            untouched_tail = [e for later_chunk in chunks[i + 1 :] for e in later_chunk]
+            queue_store.write_queue(folder_id, remaining + untouched_tail)
+
+            if on_chunk_done is not None:
+                on_chunk_done()
+
+        return results
+
+    for entry in entries:
+        _process_one(entry)
 
     if use_queue:
         queue_store.write_queue(folder_id, remaining)

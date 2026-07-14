@@ -52,3 +52,28 @@ def test_require_drive_folder_id_present(monkeypatch):
 def test_languages_default_and_parsing(monkeypatch):
     assert _settings_with(monkeypatch).languages == ["en"]
     assert _settings_with(monkeypatch, TRANSCRIPT_LANGUAGES="de, en ,fr").languages == ["de", "en", "fr"]
+
+
+def test_batch_size_threshold_defaults_to_ten(monkeypatch):
+    assert _settings_with(monkeypatch).batch_size_threshold == 10
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "-100"])
+def test_batch_size_threshold_rejects_non_positive_values(monkeypatch, value):
+    """Regression test for the review finding: a threshold <= 0 makes
+    run_batch() chunk the queue into zero batches, processing nothing and
+    silently overwriting queue.json with an empty list."""
+    monkeypatch.setenv("BATCH_SIZE_THRESHOLD", value)
+    with pytest.raises(ConfigError, match="BATCH_SIZE_THRESHOLD"):
+        _settings_with(monkeypatch)
+
+
+def test_batch_cooldown_seconds_defaults_to_300(monkeypatch):
+    assert _settings_with(monkeypatch).batch_cooldown_seconds == 300
+
+
+@pytest.mark.parametrize("value", ["-1", "-0.5", "nan", "inf"])
+def test_batch_cooldown_seconds_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("BATCH_COOLDOWN_SECONDS", value)
+    with pytest.raises(ConfigError, match="BATCH_COOLDOWN_SECONDS"):
+        _settings_with(monkeypatch)
