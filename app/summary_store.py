@@ -19,10 +19,12 @@ from .summarize import (
     PROMPT_VERSION,
     SummarizationError,
     estimate_cost_usd,
+    estimate_worst_case_cost_usd,
     strip_frontmatter,
     summarize_transcript,
     transcript_hash,
 )
+from .youtube import format_timestamp
 
 logger = logging.getLogger("media_flow.summary_store")
 
@@ -59,21 +61,53 @@ def write_summary(folder_id: str, video_id: str, artifact: dict) -> None:
     )
 
 
-def needs_summarization(existing: dict | None, source_hash: str, model: str, prompt_version: str) -> bool:
+def _is_same_work_item(existing: dict | None, source_hash: str, model: str, prompt_version: str) -> bool:
+    """True if an existing artifact was produced for this exact (transcript
+    hash, model, prompt version) combination - i.e. retrying/overwriting it
+    represents the same unit of work, not a fresh one. A changed hash,
+    model, or prompt version means prior attempts don't count against this
+    "new" work item's retry budget."""
+
+    if existing is None:
+        return False
+    return (
+        existing.get("source_transcript_hash") == source_hash
+        and existing.get("model") == model
+        and existing.get("prompt_version") == prompt_version
+    )
+
+
+def needs_summarization(
+    existing: dict | None,
+    source_hash: str,
+    model: str,
+    prompt_version: str,
+    max_attempts: int | None = None,
+) -> bool:
     """True unless a current, successful summary already exists for this
-    exact (transcript hash, model, prompt version) combination. A prior
-    failure (status != "ok") stays eligible until it succeeds - that's how
-    retries happen across runs, without a separate retry-tracking structure."""
+    exact (transcript hash, model, prompt version) combination, or a prior
+    failure for that same combination has already exhausted its retry
+    budget or was classified as non-retryable (e.g. a safety refusal, or an
+    auth/credential failure - both deterministic for the same input, so
+    retrying wastes budget without changing the outcome). A changed hash,
+    model, or prompt version always makes a video eligible again, resetting
+    the attempt count, since that's a new unit of work.
+
+    max_attempts is optional only so existing single-argument call sites
+    (e.g. simple "does this need redoing at all" checks) keep working;
+    summarize_eligible() always passes it."""
 
     if existing is None:
         return True
-    if existing.get("status") != "ok":
+    if not _is_same_work_item(existing, source_hash, model, prompt_version):
         return True
-    return (
-        existing.get("source_transcript_hash") != source_hash
-        or existing.get("model") != model
-        or existing.get("prompt_version") != prompt_version
-    )
+    if existing.get("status") == "ok":
+        return False
+    if existing.get("retryable") is False:
+        return False
+    if max_attempts is not None and existing.get("attempts", 0) >= max_attempts:
+        return False
+    return True
 
 
 def _extract_channel(markdown: str) -> str | None:
@@ -93,6 +127,7 @@ class SummaryReport:
     skipped_current: int
     summarized: int
     failed: int
+    retried: int
     total_input_tokens: int
     total_output_tokens: int
     total_estimated_cost_usd: float
@@ -105,7 +140,16 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
     already have a current summary artifact, up to the configured per-run
     budgets. A failure summarizing one video is isolated (recorded as a
     status: "error" artifact) and never aborts the run - discovery and
-    transcript archiving have already completed by the time this runs."""
+    transcript archiving have already completed by the time this runs.
+
+    on_progress is called (a) right before the model call, so a long-running
+    lock lease (see discover_and_process.py) is renewed going into a
+    potentially slow request, and (b) again right before every write to
+    Drive - the second call is the important one: if the lock was lost to a
+    concurrent run while the model call was in flight, on_progress raising
+    stops this function before it writes anything under a lease it no
+    longer holds, rather than writing first and only noticing the loss
+    afterward."""
 
     index = drive.read_index(folder_id)
     ok_entries = [(video_id, entry) for video_id, entry in index.items() if entry.get("status") == "ok"]
@@ -114,21 +158,22 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
     skipped_current = 0
     summarized = 0
     failed = 0
+    retried = 0
     total_input_tokens = 0
     total_output_tokens = 0
     total_cost = 0.0
     failures: list[tuple[str, str]] = []
     stopped_on_budget = False
 
-    for video_id, entry in ok_entries:
-        if (
-            summarized + failed >= settings.summary_max_videos_per_run
-            or total_input_tokens + total_output_tokens >= settings.summary_max_total_tokens_per_run
-            or total_cost >= settings.summary_max_cost_usd_per_run
-        ):
-            stopped_on_budget = True
-            break
+    def _count_usage(input_tokens: int, output_tokens: int) -> None:
+        nonlocal total_input_tokens, total_output_tokens, total_cost
+        total_input_tokens += input_tokens
+        total_output_tokens += output_tokens
+        cost = estimate_cost_usd(settings.summary_model, input_tokens, output_tokens)
+        if cost is not None:
+            total_cost += cost
 
+    for video_id, entry in ok_entries:
         filename = entry.get("filename")
         if not filename:
             continue
@@ -137,17 +182,49 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
             logger.warning("Transcript file for %s (%r) is missing; skipping.", video_id, filename)
             continue
 
-        body = strip_frontmatter(markdown)
+        full_body = strip_frontmatter(markdown)
+        # Hash the complete transcript, before any truncation - otherwise a
+        # real change beyond SUMMARY_MAX_TRANSCRIPT_CHARS would be invisible
+        # to the hash and a stale summary would look "current" forever.
+        source_hash = transcript_hash(full_body)
+        model_input = full_body
         truncated = False
-        if len(body) > settings.summary_max_transcript_chars:
-            body = body[: settings.summary_max_transcript_chars]
+        if len(model_input) > settings.summary_max_transcript_chars:
+            model_input = model_input[: settings.summary_max_transcript_chars]
             truncated = True
 
-        source_hash = transcript_hash(body)
         existing = read_summary(folder_id, video_id)
-        if not needs_summarization(existing, source_hash, settings.summary_model, PROMPT_VERSION):
+        if not needs_summarization(
+            existing, source_hash, settings.summary_model, PROMPT_VERSION, settings.summary_max_attempts_per_video
+        ):
             skipped_current += 1
             continue
+
+        prior_attempts = (
+            existing.get("attempts", 0)
+            if _is_same_work_item(existing, source_hash, settings.summary_model, PROMPT_VERSION)
+            else 0
+        )
+        this_attempt = prior_attempts + 1
+        if prior_attempts > 0:
+            retried += 1
+
+        # Reserve worst-case cost/tokens for this call before making it,
+        # rather than only checking totals accumulated from prior calls -
+        # otherwise a single expensive call starting just under the cap
+        # could push the run well past SUMMARY_MAX_COST_USD_PER_RUN or
+        # SUMMARY_MAX_TOTAL_TOKENS_PER_RUN before it's even noticed.
+        reserved_cost = estimate_worst_case_cost_usd(
+            settings.summary_model, len(model_input), settings.summary_max_output_tokens
+        )
+        reserved_tokens = len(model_input) // 4 + settings.summary_max_output_tokens
+        if (
+            summarized + failed >= settings.summary_max_videos_per_run
+            or total_input_tokens + total_output_tokens + reserved_tokens > settings.summary_max_total_tokens_per_run
+            or (reserved_cost is not None and total_cost + reserved_cost > settings.summary_max_cost_usd_per_run)
+        ):
+            stopped_on_budget = True
+            break
 
         eligible += 1
         generated_at = datetime.now(timezone.utc).isoformat()
@@ -161,31 +238,62 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
             "model": settings.summary_model,
             "prompt_version": PROMPT_VERSION,
             "generated_at": generated_at,
+            "attempts": this_attempt,
         }
+        if truncated:
+            base_fields["transcript_truncated"] = True
+
+        if on_progress is not None:
+            # Renew before the (possibly slow) model call, not just after -
+            # a long transcript or a slow provider response can otherwise
+            # run past the lock's TTL with no renewal at all in between.
+            on_progress()
 
         try:
             model_output, usage = summarize_transcript(
-                body, model=settings.summary_model, max_output_tokens=settings.summary_max_output_tokens
+                model_input, model=settings.summary_model, max_output_tokens=settings.summary_max_output_tokens
             )
         except SummarizationError as exc:
             failed += 1
             failures.append((video_id, str(exc)))
-            write_summary(folder_id, video_id, {**base_fields, "status": "error", "message": str(exc)})
+            if exc.usage is not None:
+                # The API still returned (and billed) a response even
+                # though it's being treated as a failure - e.g. a safety
+                # refusal or an unparseable structured output. Count it,
+                # or the budget silently under-tracks real spend.
+                _count_usage(exc.usage.input_tokens, exc.usage.output_tokens)
             if on_progress is not None:
+                # Re-check lock ownership immediately before writing, not
+                # just after - a takeover during the model call must stop
+                # this write, not merely be noticed once it's too late.
                 on_progress()
+            write_summary(
+                folder_id,
+                video_id,
+                {**base_fields, "status": "error", "retryable": exc.retryable, "message": str(exc)},
+            )
             continue
 
-        total_input_tokens += usage.input_tokens
-        total_output_tokens += usage.output_tokens
+        _count_usage(usage.input_tokens, usage.output_tokens)
         cost = estimate_cost_usd(settings.summary_model, usage.input_tokens, usage.output_tokens)
-        if cost is not None:
-            total_cost += cost
 
         artifact = {
             **base_fields,
             "subject": model_output.subject,
             "summary": model_output.summary,
-            "points": [point.model_dump() for point in model_output.points],
+            "points": [
+                {
+                    "importance": point.importance,
+                    "main_point": point.main_point,
+                    "explanation": point.explanation,
+                    "timestamp_seconds": point.timestamp_seconds,
+                    # Derived in application code, never trusted from the
+                    # model - guarantees it can't disagree with
+                    # timestamp_seconds.
+                    "timestamp": format_timestamp(point.timestamp_seconds),
+                }
+                for point in model_output.points
+            ],
             "status": "ok",
             "usage": {
                 "input_tokens": usage.input_tokens,
@@ -193,20 +301,18 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
                 "estimated_cost_usd": cost,
             },
         }
-        if truncated:
-            artifact["transcript_truncated"] = True
-
-        write_summary(folder_id, video_id, artifact)
-        summarized += 1
 
         if on_progress is not None:
             on_progress()
+        write_summary(folder_id, video_id, artifact)
+        summarized += 1
 
     return SummaryReport(
         eligible=eligible,
         skipped_current=skipped_current,
         summarized=summarized,
         failed=failed,
+        retried=retried,
         total_input_tokens=total_input_tokens,
         total_output_tokens=total_output_tokens,
         total_estimated_cost_usd=total_cost,

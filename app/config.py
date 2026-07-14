@@ -2,6 +2,8 @@ import math
 import os
 from dataclasses import dataclass
 
+from .summarize import PRICING_PER_MTOK_USD
+
 
 class ConfigError(RuntimeError):
     pass
@@ -77,6 +79,14 @@ class Settings:
         self.youtube_proxy_https_url: str | None = _env("YOUTUBE_PROXY_HTTPS_URL")
 
         self.summary_model: str = _env("SUMMARY_MODEL", "claude-haiku-4-5")
+        if self.summary_model not in PRICING_PER_MTOK_USD:
+            raise ConfigError(
+                f"SUMMARY_MODEL={self.summary_model!r} has no pricing entry in "
+                "app/summarize.py's PRICING_PER_MTOK_USD. estimate_cost_usd() would "
+                "silently return None for it, meaning SUMMARY_MAX_COST_USD_PER_RUN would "
+                "stop enforcing any real limit. Add a pricing entry for this model, or "
+                "use one that already has one."
+            )
 
         self.summary_max_output_tokens: int = int(_env("SUMMARY_MAX_OUTPUT_TOKENS", "4096"))
         if self.summary_max_output_tokens < 1:
@@ -104,6 +114,12 @@ class Settings:
         if self.summary_max_cost_usd_per_run < 0 or not math.isfinite(self.summary_max_cost_usd_per_run):
             raise ConfigError(
                 f"SUMMARY_MAX_COST_USD_PER_RUN must be a non-negative, finite number, got {self.summary_max_cost_usd_per_run}."
+            )
+
+        self.summary_max_attempts_per_video: int = int(_env("SUMMARY_MAX_ATTEMPTS_PER_VIDEO", "3"))
+        if self.summary_max_attempts_per_video < 1:
+            raise ConfigError(
+                f"SUMMARY_MAX_ATTEMPTS_PER_VIDEO must be a positive integer, got {self.summary_max_attempts_per_video}."
             )
 
     def require_oauth_credentials(self) -> OAuthCredentials:

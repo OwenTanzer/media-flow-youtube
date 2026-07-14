@@ -424,6 +424,7 @@ See [`.env.example`](.env.example) for `SUMMARY_MODEL` (default
   "model": "claude-haiku-4-5",
   "prompt_version": "v1",
   "generated_at": "2026-07-14T12:00:00+00:00",
+  "attempts": 1,
   "usage": {"input_tokens": 1234, "output_tokens": 456, "estimated_cost_usd": 0.0035}
 }
 ```
@@ -431,51 +432,96 @@ See [`.env.example`](.env.example) for `SUMMARY_MODEL` (default
 `title`, `author`, `url`, the source Drive file ID, and the transcript hash
 are always populated by application code from `_index.json` and the
 archived transcript file itself - never trusted from the model's output.
-Only `subject`, `summary`, and `points` come from Claude, constrained by a
-JSON schema (`output_config.format`) so the response is always valid JSON
-with no Markdown fences or surrounding prose. A failed attempt (provider
-error, safety refusal, or unparseable output) writes `status: "error"` with
-a `message` instead - durably recorded and automatically retried on the
-next run, since anything other than `status: "ok"` stays eligible.
+Claude only produces `subject`, `summary`, and each point's `importance`,
+`main_point`, `explanation`, and `timestamp_seconds`, constrained by a JSON
+schema (`output_config.format`) so the response is always valid JSON with
+no Markdown fences or surrounding prose. The human-readable `timestamp`
+string is never taken from the model either - it's derived deterministically
+in application code from `timestamp_seconds` (the same formatter transcript
+Markdown files use), so the two can never disagree. Every `timestamp_seconds`
+is also validated against the transcript's own timestamp range (rejecting a
+value outside `[0, last transcript timestamp]`) and checked for
+non-decreasing order across points - Pydantic alone only validates that
+they're integers, not that they're plausible, so this catches a model
+inventing an out-of-range or out-of-order value. A failed attempt (provider
+error, safety refusal, unparseable output, or failed validation) writes
+`status: "error"` with a `message`, a `retryable` flag, and the `attempts`
+count so far instead.
 
-### Idempotency
+### Idempotency and retries
 
 A video is skipped only when a summary already exists with `status: "ok"`
 and its `source_transcript_hash`, `model`, and `prompt_version` all still
-match. The hash covers only the transcript body (captions), not the
-Markdown file's frontmatter - so a transcript re-fetched with identical
-captions doesn't trigger a wasteful re-summary just because `fetched_at`
-changed. Changing `SUMMARY_MODEL`, or a future prompt revision (which bumps
-the `PROMPT_VERSION` constant in `app/summarize.py`), deliberately
-re-summarizes everything.
+match. The hash covers the **complete** transcript body (captions), not the
+Markdown file's frontmatter and not just the portion actually sent to the
+model when truncated (see below) - so a transcript re-fetched with
+identical captions doesn't trigger a wasteful re-summary just because
+`fetched_at` changed, but a real change anywhere in the transcript is never
+invisible. Changing `SUMMARY_MODEL`, or a future prompt revision (which
+bumps the `PROMPT_VERSION` constant in `app/summarize.py`), deliberately
+re-summarizes everything, resetting the attempt count below since it's a
+new unit of work.
+
+A failure isn't retried unconditionally forever. Each failure is classified
+`retryable` or not: rate limits, connection errors, transient malformed
+output, and failed point validation are retryable; a safety refusal or an
+auth/credential failure is not, since both are deterministic for the same
+input and retrying just burns budget for a guaranteed repeat. A retryable
+failure keeps being retried on subsequent runs (`attempts` incrementing
+each time) until it succeeds or hits `SUMMARY_MAX_ATTEMPTS_PER_VIDEO`
+(default `3`), at which point it stops being retried until something
+changes (the transcript hash, model, or prompt version). A run's
+`SummaryReport` (logged by `discover_and_process.py`) includes a `retried`
+count - videos this run that had a prior non-`ok` attempt for the same
+transcript/model/prompt - separate from the `failed` count of this run's
+own outcomes.
 
 ### Transcript length policy
 
-If a transcript's body exceeds `SUMMARY_MAX_TRANSCRIPT_CHARS` (default
-`400000`, comfortably covering a multi-hour video), it's truncated to that
-length before being sent to the model, and the resulting artifact is
-flagged `"transcript_truncated": true`. Points and timestamps within the
-retained (beginning) portion stay accurate; content past the cutoff simply
-isn't covered. This is a deliberate v1 simplification - explicit,
-visible truncation rather than multi-pass chunking-and-merging across
-several model calls.
+If a transcript's complete body exceeds `SUMMARY_MAX_TRANSCRIPT_CHARS`
+(default `400000`, comfortably covering a multi-hour video), only the first
+`SUMMARY_MAX_TRANSCRIPT_CHARS` of it is sent to the model, and the
+resulting artifact is flagged `"transcript_truncated": true`. Points and
+timestamps within the retained (beginning) portion stay accurate; content
+past the cutoff simply isn't covered - and the idempotency hash above still
+covers the complete, untruncated body, so a change past the cutoff still
+triggers re-summarization rather than looking unchanged. This is a
+deliberate v1 simplification - explicit, visible truncation rather than
+multi-pass chunking-and-merging across several model calls.
 
 ### Cost controls
 
 `SUMMARY_MAX_VIDEOS_PER_RUN`, `SUMMARY_MAX_TOTAL_TOKENS_PER_RUN`, and
-`SUMMARY_MAX_COST_USD_PER_RUN` each independently bound one run - hitting
-any one of them stops summarization for that run (logged as "stopped early
-on a per-run budget"), leaving the rest for the next scheduled run rather
-than failing or running unbounded.
+`SUMMARY_MAX_COST_USD_PER_RUN` each independently bound one run. Before
+each call, its worst-case cost/tokens are estimated (treating
+`SUMMARY_MAX_OUTPUT_TOKENS` as fully consumed, plus a rough chars-per-token
+estimate for input) and reserved against these caps - not just checked
+against totals from already-completed calls - so a single call starting
+just under a cap can't push the run well past it. Hitting any cap stops
+summarization for that run (logged as "stopped early on a per-run
+budget"), leaving the rest for the next scheduled run rather than failing
+or running unbounded. `SUMMARY_MODEL` must have a pricing entry in
+`app/summarize.py`'s `PRICING_PER_MTOK_USD` - the app refuses to start
+otherwise, since an unrecognized model would make cost estimation silently
+return `None` and disable `SUMMARY_MAX_COST_USD_PER_RUN` entirely. A
+failure that still received a billed response from the API (a safety
+refusal, or output that failed to parse/validate) has its usage counted
+against these caps too, even though it's recorded as `status: "error"` -
+only a failure before any response was ever returned (a connection error,
+for instance) contributes no usage, since none was actually billed.
 
 ### Concurrency
 
 Runs inside the same serialized `discover_and_process.py` job as discovery
 and queue processing, for the same reason batching does (see the
 concurrency invariant above): `_index.json` isn't safe for a second,
-independent writer. The advisory lock is renewed after every video
-summarized, same as during queue processing, so a run spending a while on
-model calls doesn't look crashed to a concurrent invocation.
+independent writer. The advisory lock is renewed twice per video: once
+before the (possibly slow) model call, so a long-running lease doesn't go
+stale purely from provider latency, and once again immediately before the
+resulting artifact is written to Drive - the second renewal is what
+actually matters, since it's the last chance to detect that a concurrent
+run has taken over the lock before this run would otherwise write under a
+lease it no longer holds.
 
 ## Project layout
 

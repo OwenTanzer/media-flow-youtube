@@ -237,7 +237,7 @@ def fetch_transcript(video_id: str, languages: list[str]) -> TranscriptResult:
     )
 
 
-def _format_timestamp(seconds: float) -> str:
+def format_timestamp(seconds: float) -> str:
     total = int(seconds)
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
@@ -275,5 +275,5 @@ def render_transcript_markdown(
         "---",
         "",
     ]
-    body = [f"[{_format_timestamp(start)}] {text}" for start, text in lines]
+    body = [f"[{format_timestamp(start)}] {text}" for start, text in lines]
     return "\n".join(frontmatter) + "\n".join(body) + "\n"

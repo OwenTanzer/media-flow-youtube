@@ -5,7 +5,14 @@ from app.discovery import DiscoveryReport
 from app.summary_store import SummaryReport
 
 _EMPTY_SUMMARY_REPORT = SummaryReport(
-    eligible=0, skipped_current=0, summarized=0, failed=0, total_input_tokens=0, total_output_tokens=0, total_estimated_cost_usd=0.0
+    eligible=0,
+    skipped_current=0,
+    summarized=0,
+    failed=0,
+    retried=0,
+    total_input_tokens=0,
+    total_output_tokens=0,
+    total_estimated_cost_usd=0.0,
 )
 
 

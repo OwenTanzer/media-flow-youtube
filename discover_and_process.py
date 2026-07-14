@@ -77,12 +77,13 @@ def main() -> int:
 
         summary_report = summarize_eligible(folder_id, on_progress=_renew_lock)
         logger.info(
-            "Summarization: %d eligible, %d already current, %d summarized, %d failed "
+            "Summarization: %d eligible, %d already current, %d summarized, %d failed, %d retried "
             "(~%d input / ~%d output tokens, ~$%.4f estimated)%s.",
             summary_report.eligible,
             summary_report.skipped_current,
             summary_report.summarized,
             summary_report.failed,
+            summary_report.retried,
             summary_report.total_input_tokens,
             summary_report.total_output_tokens,
             summary_report.total_estimated_cost_usd,
