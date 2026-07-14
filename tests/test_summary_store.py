@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from app import summary_store
 from app.summarize import ModelSummaryOutput, SummarizationError, SummaryPoint, Usage
 
@@ -121,6 +123,9 @@ def _stub_drive(monkeypatch, *, index, transcripts, existing_summaries=None):
 
     monkeypatch.setattr(summary_store.drive, "download_text", _download_text)
     monkeypatch.setattr(summary_store.drive, "upload_text_file", _upload_text_file)
+    # A small, fixed, real-looking token count by default - individual
+    # tests override this via monkeypatch when they care about the value.
+    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model: 100)
     return written
 
 
@@ -222,7 +227,7 @@ def test_summarize_eligible_hash_reflects_content_beyond_the_truncation_cutoff(m
         transcripts={"A Title [abc123XYZde].md": long_markdown},
         existing_summaries=existing_summaries,
     )
-    output = ModelSummaryOutput(subject="S", summary="S.", points=[])
+    output = ModelSummaryOutput(subject="S", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
         summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1))
     )
@@ -360,7 +365,7 @@ def test_summarize_eligible_counts_a_retry_and_increments_attempts(monkeypatch):
         transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN},
         existing_summaries=existing_summaries,
     )
-    output = ModelSummaryOutput(subject="S", summary="S.", points=[])
+    output = ModelSummaryOutput(subject="S", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
         summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1))
     )
@@ -386,7 +391,7 @@ def test_summarize_eligible_stops_at_max_videos_per_run(monkeypatch):
     _stub_drive(monkeypatch, index=index, transcripts={f"vid{i}.md": TRANSCRIPT_MARKDOWN for i in range(3)})
     monkeypatch.setattr(summary_store.settings, "summary_max_videos_per_run", 1)
 
-    output = ModelSummaryOutput(subject="S", summary="S.", points=[])
+    output = ModelSummaryOutput(subject="S", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
         summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1))
     )
@@ -397,11 +402,12 @@ def test_summarize_eligible_stops_at_max_videos_per_run(monkeypatch):
     assert report.stopped_on_budget is True
 
 
-def test_summarize_eligible_reserves_worst_case_cost_before_calling(monkeypatch):
+def test_summarize_eligible_skips_a_video_whose_own_worst_case_exceeds_the_entire_cap(monkeypatch):
     """A video whose worst-case cost (max_output_tokens fully consumed)
-    would push the run over SUMMARY_MAX_COST_USD_PER_RUN must not be
-    started at all - checking only after-the-fact totals could overshoot
-    the cap by a full call's worth of spend."""
+    exceeds the *entire* per-run cap, even from a fresh run, must be
+    skipped rather than treated as "stopped on budget" - the latter would
+    leave it first in line and permanently block every other eligible
+    video behind it, every single run."""
     index = {
         f"vid{i}": {
             "status": "ok",
@@ -424,12 +430,71 @@ def test_summarize_eligible_reserves_worst_case_cost_before_calling(monkeypatch)
     report = summary_store.summarize_eligible("folder-id")
 
     assert calls == []
+    assert report.eligible == 0
+    assert report.stopped_on_budget is False
+
+
+def test_summarize_eligible_stops_on_budget_when_remaining_headroom_runs_out(monkeypatch):
+    """Distinct from the "exceeds the entire cap" case above: here each
+    individual video's own worst case comfortably fits under the full cap,
+    but the *cumulative* total from an already-processed video doesn't
+    leave enough headroom for another - this legitimately should stop the
+    run (leaving the rest for next time), not skip-and-continue."""
+    index = {
+        f"vid{i}": {
+            "status": "ok",
+            "filename": f"vid{i}.md",
+            "drive_file_id": f"file-{i}",
+            "title": f"Title {i}",
+            "url": f"https://www.youtube.com/watch?v=vid{i}",
+        }
+        for i in range(2)
+    }
+    _stub_drive(monkeypatch, index=index, transcripts={f"vid{i}.md": TRANSCRIPT_MARKDOWN for i in range(2)})
+    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model: 100)
+    monkeypatch.setattr(summary_store.settings, "summary_max_output_tokens", 100)
+    # One call's reserved cost (100 input + 100 output tokens) is ~$0.0006 -
+    # comfortably under this cap on its own, but two calls' worth isn't.
+    monkeypatch.setattr(summary_store.settings, "summary_max_cost_usd_per_run", 0.0009)
+
+    output = ModelSummaryOutput(subject="S", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
+    monkeypatch.setattr(
+        summary_store,
+        "summarize_transcript",
+        lambda body, model, max_output_tokens: (output, Usage(input_tokens=100, output_tokens=100)),
+    )
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert report.summarized == 1
     assert report.stopped_on_budget is True
+
+
+def test_summarize_eligible_aborts_without_writing_when_token_counting_fails(monkeypatch):
+    """Regression test: count_prompt_tokens() (used to reserve budget)
+    runs before a video's attempt count is touched or anything is written
+    for it. A failure there - most importantly an auth/credential problem
+    - must abort the whole run rather than being recorded as a permanent,
+    per-video failure that fixing the credential wouldn't undo."""
+    written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+
+    def _raise(*a, **k):
+        raise RuntimeError("credential check failed")
+
+    monkeypatch.setattr(summary_store, "count_prompt_tokens", _raise)
+    calls = []
+    monkeypatch.setattr(summary_store, "summarize_transcript", lambda *a, **k: calls.append(1))
+
+    with pytest.raises(RuntimeError, match="credential check failed"):
+        summary_store.summarize_eligible("folder-id")
+
+    assert calls == []
+    assert written == {}
 
 
 def test_summarize_eligible_calls_on_progress_before_model_call_and_before_write(monkeypatch):
     _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
-    output = ModelSummaryOutput(subject="S", summary="S.", points=[])
+    output = ModelSummaryOutput(subject="S", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
         summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1))
     )
@@ -449,7 +514,7 @@ def test_summarize_eligible_does_not_write_if_lock_is_lost_before_the_write(monk
     acquired the lock. on_progress() raising (simulating a lost lock) must
     stop this function *before* it writes, not merely be observed after."""
     written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
-    output = ModelSummaryOutput(subject="S", summary="S.", points=[])
+    output = ModelSummaryOutput(subject="S", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
         summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1))
     )

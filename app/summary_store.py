@@ -18,8 +18,8 @@ from .config import settings
 from .summarize import (
     PROMPT_VERSION,
     SummarizationError,
+    count_prompt_tokens,
     estimate_cost_usd,
-    estimate_worst_case_cost_usd,
     strip_frontmatter,
     summarize_transcript,
     transcript_hash,
@@ -209,19 +209,47 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
         if prior_attempts > 0:
             retried += 1
 
-        # Reserve worst-case cost/tokens for this call before making it,
-        # rather than only checking totals accumulated from prior calls -
-        # otherwise a single expensive call starting just under the cap
-        # could push the run well past SUMMARY_MAX_COST_USD_PER_RUN or
-        # SUMMARY_MAX_TOTAL_TOKENS_PER_RUN before it's even noticed.
-        reserved_cost = estimate_worst_case_cost_usd(
-            settings.summary_model, len(model_input), settings.summary_max_output_tokens
-        )
-        reserved_tokens = len(model_input) // 4 + settings.summary_max_output_tokens
-        if (
-            summarized + failed >= settings.summary_max_videos_per_run
-            or total_input_tokens + total_output_tokens + reserved_tokens > settings.summary_max_total_tokens_per_run
-            or (reserved_cost is not None and total_cost + reserved_cost > settings.summary_max_cost_usd_per_run)
+        if summarized + failed >= settings.summary_max_videos_per_run:
+            stopped_on_budget = True
+            break
+
+        # A real pre-flight token count (system prompt + output schema
+        # overhead + the transcript itself), not a chars-per-token guess -
+        # reserved against the per-run caps before this call is made,
+        # rather than only checking totals accumulated from prior calls.
+        # Deliberately uncaught here: this runs before this video's attempt
+        # count is touched or anything is written for it, so any failure -
+        # including an auth/credential problem - aborts the whole run
+        # cleanly instead of being recorded as a permanent per-video
+        # failure (see count_prompt_tokens()'s docstring for why).
+        input_tokens_estimate = count_prompt_tokens(model_input, model=settings.summary_model)
+        reserved_tokens = input_tokens_estimate + settings.summary_max_output_tokens
+        reserved_cost = estimate_cost_usd(settings.summary_model, input_tokens_estimate, settings.summary_max_output_tokens)
+
+        if reserved_tokens > settings.summary_max_total_tokens_per_run or (
+            reserved_cost is not None and reserved_cost > settings.summary_max_cost_usd_per_run
+        ):
+            # This video's own worst case exceeds the *entire* configured
+            # cap by itself, even from a completely fresh run - not just
+            # this run's remaining headroom. Treating that the same as
+            # "stopped on budget" would leave it first in line and
+            # permanently block every other eligible video behind it,
+            # every single run. Skip it instead (it stays eligible next
+            # run, in case the caps are raised) rather than starving the
+            # whole backlog indefinitely.
+            logger.warning(
+                "%s's estimated cost/tokens exceed the entire per-run budget by itself "
+                "(~%d tokens, ~$%s) - skipping it rather than blocking the rest of the backlog. "
+                "Raise SUMMARY_MAX_TOTAL_TOKENS_PER_RUN/SUMMARY_MAX_COST_USD_PER_RUN if this "
+                "video should be summarized.",
+                video_id,
+                reserved_tokens,
+                f"{reserved_cost:.4f}" if reserved_cost is not None else "unknown",
+            )
+            continue
+
+        if total_input_tokens + total_output_tokens + reserved_tokens > settings.summary_max_total_tokens_per_run or (
+            reserved_cost is not None and total_cost + reserved_cost > settings.summary_max_cost_usd_per_run
         ):
             stopped_on_budget = True
             break

@@ -11,7 +11,8 @@ import re
 from typing import Literal
 
 import anthropic
-from pydantic import BaseModel
+import pydantic
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger("media_flow.summarize")
 
@@ -53,10 +54,16 @@ PRICING_PER_MTOK_USD = {
     "claude-haiku-4-5": (1.00, 5.00),
 }
 
-# Rough chars-per-token heuristic (English text) used only to reserve budget
-# for an upcoming call before we know its real usage - not used for anything
-# billed or persisted.
-_CHARS_PER_TOKEN_ESTIMATE = 4
+# The SDK's own automatic retry/backoff (default: 2 retries, each up to a
+# 10-minute timeout - up to ~30 minutes for one call) stacks badly with our
+# own outer per-video retry loop (SUMMARY_MAX_ATTEMPTS_PER_VIDEO, across
+# scheduled runs) and can silently run right up against
+# DISCOVERY_LOCK_TTL_SECONDS's default 30-minute window with no chance to
+# renew the lock in between. Disabling it bounds a single call to roughly
+# one request's timeout and makes our own outer retry (which the lock IS
+# renewed around) the sole retry authority - the same fix already applied
+# to the Webshare proxy's internal retries in app/youtube.py.
+_CLIENT_MAX_RETRIES = 0
 
 
 class SummarizationError(RuntimeError):
@@ -83,8 +90,8 @@ class SummarizationError(RuntimeError):
 
 class SummaryPoint(BaseModel):
     importance: Literal["major", "minor"]
-    main_point: str
-    explanation: str
+    main_point: str = Field(min_length=1)
+    explanation: str = Field(min_length=1)
     timestamp_seconds: int
 
 
@@ -96,11 +103,16 @@ class ModelSummaryOutput(BaseModel):
     summary_store.py. In particular, the human-readable "timestamp" string
     is never taken from the model - it's derived deterministically from
     timestamp_seconds via youtube.format_timestamp(), so the two can't
-    disagree with each other."""
+    disagree with each other.
 
-    subject: str
-    summary: str
-    points: list[SummaryPoint]
+    Minimum lengths on every field (including requiring at least one point)
+    are deliberate: an empty/blank response is schema-valid by Pydantic's
+    default rules despite the output contract requiring actual timestamped
+    insights, so without these an empty summary would be accepted as "ok"."""
+
+    subject: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    points: list[SummaryPoint] = Field(min_length=1)
 
 
 class Usage(BaseModel):
@@ -132,15 +144,33 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
     return (input_tokens / 1_000_000) * input_price + (output_tokens / 1_000_000) * output_price
 
 
-def estimate_worst_case_cost_usd(model: str, input_chars: int, max_output_tokens: int) -> float | None:
-    """Conservative pre-flight estimate used to reserve budget before making
-    a call, rather than only checking already-accumulated totals from prior
-    calls: treats max_output_tokens as fully consumed (the real worst case)
-    and a rough chars-per-token heuristic for input. Returns None if the
-    model has no known pricing (same as estimate_cost_usd)."""
+def count_prompt_tokens(transcript_body: str, *, model: str) -> int:
+    """Real input token count for this exact prompt (system prompt + output
+    schema overhead + the transcript itself) via the Anthropic token-
+    counting endpoint - used to reserve accurate per-run budget before a
+    call, replacing an earlier chars-per-token heuristic that both
+    excluded the system prompt/schema and wasn't a true upper bound either
+    way.
 
-    estimated_input_tokens = max(1, input_chars // _CHARS_PER_TOKEN_ESTIMATE)
-    return estimate_cost_usd(model, estimated_input_tokens, max_output_tokens)
+    Deliberately raises its caller's exception straight through rather than
+    wrapping it in SummarizationError: this is a lightweight pre-flight
+    call made before summarize_eligible() commits to processing a given
+    video (before incrementing its attempt count or writing anything for
+    it), so a failure here - including an auth/credential problem - should
+    abort the whole run rather than being recorded as a permanent, per-video
+    failure. A credential issue isn't a property of any one video's
+    content, and poisoning every video it happens to touch with a
+    non-retryable failure wouldn't get fixed by fixing the credential,
+    since nothing about the video's own hash/model/prompt_version changes."""
+
+    client = anthropic.Anthropic(max_retries=_CLIENT_MAX_RETRIES)
+    result = client.messages.count_tokens(
+        model=model,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": transcript_body}],
+        output_format=ModelSummaryOutput,
+    )
+    return result.input_tokens
 
 
 def _max_transcript_seconds(transcript_body: str) -> int:
@@ -188,7 +218,7 @@ def summarize_transcript(
     the SDK's exception hierarchy."""
 
     try:
-        client = anthropic.Anthropic()
+        client = anthropic.Anthropic(max_retries=_CLIENT_MAX_RETRIES)
         response = client.messages.parse(
             model=model,
             max_tokens=max_output_tokens,
@@ -215,6 +245,18 @@ def summarize_transcript(
         # retryable - this needs a config/credential fix, not another
         # attempt.
         raise SummarizationError(f"Anthropic SDK error: {exc}", retryable=False) from exc
+    except pydantic.ValidationError as exc:
+        # The pinned SDK's messages.parse() validates the model's JSON
+        # against our schema *inside* the same call (via a post_parser
+        # hook that runs before parse() returns), not afterward - so a
+        # malformed/truncated response raises pydantic.ValidationError
+        # directly out of client.messages.parse() itself, not any
+        # anthropic.* exception type. Uncaught, this would escape
+        # summarize_transcript() entirely and abort the whole run instead
+        # of being isolated to this one video. Usage can't be recovered
+        # here (the exception propagates before we get access to the raw
+        # response object) - a known limitation, not a missed case.
+        raise SummarizationError(f"Model response failed schema validation: {exc}", retryable=True) from exc
 
     response_usage = Usage(input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
 

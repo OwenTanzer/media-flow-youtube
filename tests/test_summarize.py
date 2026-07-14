@@ -58,15 +58,53 @@ def test_estimate_cost_usd_unknown_model_returns_none():
     assert summarize.estimate_cost_usd("some-future-model", 1000, 1000) is None
 
 
-def test_estimate_worst_case_cost_usd_uses_max_output_tokens_as_ceiling():
-    # 4000 chars / 4 chars-per-token estimate = 1000 input tokens.
-    cost = summarize.estimate_worst_case_cost_usd("claude-haiku-4-5", input_chars=4000, max_output_tokens=2000)
-    expected = (1000 / 1_000_000) * 1.00 + (2000 / 1_000_000) * 5.00
-    assert cost == pytest.approx(expected)
+class _FakeTokenCount:
+    def __init__(self, input_tokens):
+        self.input_tokens = input_tokens
 
 
-def test_estimate_worst_case_cost_usd_unknown_model_returns_none():
-    assert summarize.estimate_worst_case_cost_usd("some-future-model", 4000, 2000) is None
+def test_count_prompt_tokens_returns_the_real_input_token_count(monkeypatch):
+    seen_kwargs = {}
+
+    class _FakeMessages:
+        def count_tokens(self, **kwargs):
+            seen_kwargs.update(kwargs)
+            return _FakeTokenCount(input_tokens=321)
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            self.messages = _FakeMessages()
+
+    monkeypatch.setattr(summarize.anthropic, "Anthropic", _FakeClient)
+
+    count = summarize.count_prompt_tokens(SAMPLE_BODY, model="claude-haiku-4-5")
+
+    assert count == 321
+    # Must include the real system prompt and output schema, not just the
+    # transcript - otherwise the count undercounts exactly like the old
+    # chars-per-token heuristic did.
+    assert seen_kwargs["system"] == summarize.SYSTEM_PROMPT
+    assert seen_kwargs["output_format"] is summarize.ModelSummaryOutput
+
+
+def test_count_prompt_tokens_propagates_failures_unwrapped(monkeypatch):
+    """Deliberately not wrapped in SummarizationError - see the function's
+    docstring: this runs before a video's attempt count is touched or
+    anything is written for it, so a failure (including an auth/credential
+    problem) should abort the whole run, not poison one video."""
+
+    class _FakeMessages:
+        def count_tokens(self, **kwargs):
+            raise anthropic.AuthenticationError("invalid api key", response=_fake_httpx_response(401), body=None)
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            self.messages = _FakeMessages()
+
+    monkeypatch.setattr(summarize.anthropic, "Anthropic", _FakeClient)
+
+    with pytest.raises(anthropic.AuthenticationError):
+        summarize.count_prompt_tokens(SAMPLE_BODY, model="claude-haiku-4-5")
 
 
 def test_max_transcript_seconds_finds_the_last_timestamp():
@@ -118,7 +156,7 @@ class _FakeParsedMessage:
         self.status_code = status_code
 
 
-def _fake_client(parse_result_or_raiser):
+def _fake_client(parse_result_or_raiser, captured_init_kwargs=None):
     class _FakeMessages:
         def parse(self, **kwargs):
             if isinstance(parse_result_or_raiser, Exception):
@@ -127,6 +165,8 @@ def _fake_client(parse_result_or_raiser):
 
     class _FakeClient:
         def __init__(self, *a, **k):
+            if captured_init_kwargs is not None:
+                captured_init_kwargs.update(k)
             self.messages = _FakeMessages()
 
     return _FakeClient
@@ -234,3 +274,65 @@ def test_summarize_transcript_wraps_client_construction_failure(monkeypatch):
         summarize.summarize_transcript(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
     # Needs a config/credential fix, not another attempt.
     assert exc_info.value.retryable is False
+
+
+def test_summarize_transcript_disables_the_sdks_own_internal_retries(monkeypatch):
+    """Regression test: the SDK's default max_retries=2 (each up to a
+    10-minute timeout) can silently run a single call for up to ~30
+    minutes - right up against DISCOVERY_LOCK_TTL_SECONDS's default with
+    no chance to renew the lock in between. Our own outer per-video retry
+    loop is the sole retry authority now."""
+    captured = {}
+    fake = _FakeParsedMessage(
+        summarize.ModelSummaryOutput(
+            subject="S", summary="S.", points=[summarize.SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)]
+        )
+    )
+    monkeypatch.setattr(summarize.anthropic, "Anthropic", _fake_client(fake, captured_init_kwargs=captured))
+
+    summarize.summarize_transcript(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
+
+    assert captured["max_retries"] == 0
+
+
+def test_summarize_transcript_raises_on_real_pydantic_validation_error(monkeypatch):
+    """Regression test: the pinned SDK's messages.parse() validates the
+    model's JSON *inside* the same call via a post_parser hook, so a
+    malformed/truncated response raises pydantic.ValidationError directly
+    out of client.messages.parse() - not any anthropic.* exception type.
+    Uncaught, this would escape summarize_transcript() and abort the whole
+    run instead of being isolated to one video."""
+    try:
+        summarize.pydantic.TypeAdapter(summarize.ModelSummaryOutput).validate_json("not valid json at all")
+    except summarize.pydantic.ValidationError as exc:
+        real_validation_error = exc
+
+    monkeypatch.setattr(summarize.anthropic, "Anthropic", _fake_client(real_validation_error))
+
+    with pytest.raises(summarize.SummarizationError, match="schema validation") as exc_info:
+        summarize.summarize_transcript(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
+    assert exc_info.value.retryable is True
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"subject": "", "summary": "S.", "points": [{"importance": "major", "main_point": "P", "explanation": "E", "timestamp_seconds": 0}]},
+        {"subject": "S", "summary": "", "points": [{"importance": "major", "main_point": "P", "explanation": "E", "timestamp_seconds": 0}]},
+        {"subject": "S", "summary": "S.", "points": []},
+    ],
+)
+def test_model_summary_output_rejects_empty_content(kwargs):
+    """Regression test: an empty points list or blank subject/summary is
+    schema-valid by Pydantic's default rules despite the output contract
+    requiring actual timestamped insights."""
+    with pytest.raises(summarize.pydantic.ValidationError):
+        summarize.ModelSummaryOutput(**kwargs)
+
+
+@pytest.mark.parametrize("field_name", ["main_point", "explanation"])
+def test_summary_point_rejects_empty_strings(field_name):
+    kwargs = {"importance": "major", "main_point": "P", "explanation": "E", "timestamp_seconds": 0}
+    kwargs[field_name] = ""
+    with pytest.raises(summarize.pydantic.ValidationError):
+        summarize.SummaryPoint(**kwargs)
