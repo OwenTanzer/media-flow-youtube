@@ -317,7 +317,8 @@ its own via each channel's public RSS feed.
     {
       "channel_id": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
       "name": "Google for Developers",
-      "enabled": true
+      "enabled": true,
+      "group": "Google"
     },
     {
       "channel_id": "UCsomeSpanishChannelId",
@@ -334,6 +335,10 @@ its own via each channel's public RSS feed.
 - `enabled: false` skips a channel without deleting its entry.
 - `languages` is optional; when set, it overrides `TRANSCRIPT_LANGUAGES`
   for videos discovered from that channel only.
+- `group` is optional and drives the top-level tabs in the Streamlit
+  dashboard (see "Insight dashboard" below) - it defaults to `"Finance"`
+  when absent, so only channels that should appear under a different
+  group (currently just `"Google"`) need to set it explicitly.
 
 No deployment is needed to add, remove, enable, or disable a channel —
 just edit `channels.json` in Drive, same as `queue.json`.
