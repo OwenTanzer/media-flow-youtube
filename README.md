@@ -707,14 +707,70 @@ points bold, minor visually de-emphasized) with a "Show minor points"
 toggle in the detail view to hide them - no point is ever permanently
 hidden.
 
-### Deploying
+### Deploying the insight dashboard
 
-Runs as its own Railway service using `railway.vidproc.toml`
-(`streamlit run vidproc_app.py --server.port $PORT ...`), following the
-same multi-service-per-repo pattern as `railway.discover-and-process.toml`.
-See "Deploying the insight dashboard" further below for the full setup,
-including the `vidproc.moopertonic.net` custom domain, Cloudflare DNS, and
-rollback procedure.
+Runs as its own Railway service using `railway.vidproc.toml`, following
+the same multi-service-per-repo pattern already used for
+`railway.discover-and-process.toml` - each Railway service in the project
+picks a different `railway.*.toml` as its config file.
+
+**Note on the deployment target:** issue #8 originally asked for
+`moopertonic.net/vidproc` (an apex-domain path, via a Cloudflare Worker
+path-proxy). This deploys as a **subdomain**, `vidproc.moopertonic.net`,
+instead - the same pattern already used in production for
+`oil.moopertonic.net` (`OwenTanzer/oil-futures`, a Cloudflare-proxied
+CNAME straight to a Railway custom domain, no Worker). Simpler, and
+consistent with existing infrastructure.
+
+1. **Railway service.** In the existing Railway project, add a new
+   service pointed at this repo/branch, with `railway.vidproc.toml` as its
+   config file. Set its environment variables: `DRIVE_FOLDER_ID`,
+   `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` /
+   `GOOGLE_OAUTH_REFRESH_TOKEN` (the same read-only Drive credentials as
+   the main service), and optionally `VIDPROC_CACHE_TTL_SECONDS`.
+   **Do not set `API_KEY`** - this service has no gate. Deploy, and
+   confirm it boots correctly on its default `*.up.railway.app` domain
+   before touching DNS.
+
+2. **Custom domain.** In the new service's Railway settings → Networking →
+   Custom Domain, add `vidproc.moopertonic.net`. Railway generates a
+   target CNAME value specific to this binding.
+
+3. **Cloudflare DNS.** In the `moopertonic.net` zone, add a CNAME record:
+   Name `vidproc`, Target the value from step 2, Proxy status **Proxied**
+   - mirroring `oil.moopertonic.net`'s existing record (check its actual
+   TTL/proxy settings in the live zone first, to genuinely match it rather
+   than assume).
+
+4. Wait for DNS propagation and Railway's automatic TLS issuance, then
+   confirm `https://vidproc.moopertonic.net` serves the app correctly.
+
+**Rollback:** remove the Cloudflare CNAME record for `vidproc`, and remove
+(or leave unbound) the custom domain in the Railway service's settings.
+Neither step touches `railway.toml`, the main FastAPI service, or any
+other DNS record in the zone - this is an entirely separate service plus
+one additive DNS record, isolated by construction.
+
+**Deployed smoke test** (manual checklist - run once against
+`vidproc.moopertonic.net` after DNS/TLS settle):
+
+1. Direct navigation loads the header, tabs, and a populated (or cleanly
+   empty) feed.
+2. Hard refresh reloads correctly, no stale/broken state.
+3. Switching group tabs updates the feed and resets the channel filter to
+   "All channels" for the new group.
+4. Selecting individual channels vs. "All channels" narrows the feed
+   correctly, interactively (no full page reload).
+5. Opening a headline shows points in timestamp order; "Back to feed"
+   returns to the same group/channel scope.
+6. A point's timestamp link opens the source video anchored near the
+   right time.
+7. The Drive-transcript link (where present) opens a valid, view-only
+   link.
+8. The unavailable-service state is verified **locally** (temporarily
+   unset `DRIVE_FOLDER_ID` and confirm the clean, generic message with no
+   credential/stack-trace detail) - not tested against live prod, since
+   prod shouldn't be intentionally broken.
 
 ## Project layout
 
