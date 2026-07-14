@@ -438,7 +438,7 @@ def test_summarize_eligible_uses_a_fallback_summary_on_the_last_retryable_attemp
     )
 
     def _raise(*a, **k):
-        raise SummarizationError("grounding failed", retryable=True)
+        raise SummarizationError("grounding failed", retryable=True, fallback_eligible=True)
 
     monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
     monkeypatch.setattr(
@@ -462,7 +462,9 @@ def test_summarize_eligible_uses_a_fallback_summary_on_the_last_retryable_attemp
 
 def test_summarize_eligible_does_not_use_fallback_before_the_last_attempt(monkeypatch):
     """Every earlier attempt still gets a real shot at the normal,
-    per-point-cited format first - fallback is last-resort only."""
+    per-point-cited format first - fallback is last-resort only. Uses a
+    fallback_eligible failure so this test isolates the "not the last
+    attempt yet" gate specifically, not the eligibility gate."""
     body = summary_store.strip_frontmatter(TRANSCRIPT_MARKDOWN)
     current_hash = summary_store.transcript_hash(body)
     monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 3)
@@ -475,7 +477,7 @@ def test_summarize_eligible_does_not_use_fallback_before_the_last_attempt(monkey
     )
 
     def _raise(*a, **k):
-        raise SummarizationError("grounding failed", retryable=True)
+        raise SummarizationError("grounding failed", retryable=True, fallback_eligible=True)
 
     monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
     fallback_calls = []
@@ -517,6 +519,42 @@ def test_summarize_eligible_does_not_use_fallback_for_a_non_retryable_failure(mo
     assert written["abc123XYZde.json"]["status"] == "error"
 
 
+def test_summarize_eligible_does_not_use_fallback_for_a_retryable_but_ineligible_failure(monkeypatch):
+    """Regression test: retryable=True also covers provider-level outages
+    (rate limits, connection errors, 5xx) via SummarizationError, not just
+    content/grounding problems. An immediate fallback call right after one
+    of those can't fix anything and, for a rate limit specifically, only
+    makes it worse - so the gate must check fallback_eligible, not just
+    retryable, even on the video's last attempt."""
+    body = summary_store.strip_frontmatter(TRANSCRIPT_MARKDOWN)
+    current_hash = summary_store.transcript_hash(body)
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 2)
+    existing_summaries = {"abc123XYZde": _existing_error(current_hash, attempts=1, retryable=True)}
+    written = _stub_drive(
+        monkeypatch,
+        index=_INDEX_ONE_VIDEO,
+        transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN},
+        existing_summaries=existing_summaries,
+    )
+
+    def _raise(*a, **k):
+        # retryable=True (a later scheduled run may well succeed), but
+        # fallback_eligible defaults to False - this is what a real rate
+        # limit/connection/5xx failure looks like.
+        raise SummarizationError("Rate limited: boom", retryable=True)
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
+    fallback_calls = []
+    monkeypatch.setattr(summary_store, "summarize_fallback", lambda *a, **k: fallback_calls.append(1))
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert fallback_calls == []
+    assert report.failed == 1
+    assert written["abc123XYZde.json"]["status"] == "error"
+    assert written["abc123XYZde.json"]["retryable"] is True
+
+
 def test_summarize_eligible_falls_through_to_the_original_error_when_fallback_also_fails(monkeypatch):
     body = summary_store.strip_frontmatter(TRANSCRIPT_MARKDOWN)
     current_hash = summary_store.transcript_hash(body)
@@ -530,7 +568,7 @@ def test_summarize_eligible_falls_through_to_the_original_error_when_fallback_al
     )
 
     def _raise_primary(*a, **k):
-        raise SummarizationError("grounding failed", retryable=True)
+        raise SummarizationError("grounding failed", retryable=True, fallback_eligible=True)
 
     def _raise_fallback(*a, **k):
         raise SummarizationError("rate limited", retryable=True)

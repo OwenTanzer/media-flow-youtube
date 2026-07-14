@@ -219,6 +219,31 @@ def test_resolve_points_accepts_anchor_within_the_window_but_not_on_the_exact_li
     assert resolved[0].timestamp_seconds == 10
 
 
+def test_resolve_points_accepts_an_anchor_on_a_later_cue_sharing_the_same_rendered_second():
+    """Regression test: transcript timestamps are truncated to whole
+    seconds, so several distinct caption cues in quick succession (rapid
+    interjections, overlapping speech) can all render the same [MM:SS].
+    A valid anchor several cues later than the *first* cue at that second
+    must not be rejected just because that first cue's window doesn't
+    reach it - every line sharing the cited second needs its own window
+    checked, not just the first one found. The gap here (3 filler lines
+    between the first [00:10] cue and the one the anchor actually lives
+    on) is deliberately wider than _ANCHOR_WINDOW_LINES (2), so the old
+    setdefault-first-index bug would miss it entirely."""
+    body = (
+        "[00:00] intro line about nothing relevant here.\n"
+        "[00:10] Palantir is testing resistance near 40 dollars.\n"
+        "[00:10] quick aside about the weather today.\n"
+        "[00:10] quick aside about the schedule change.\n"
+        "[00:10] quick aside about upcoming plans.\n"
+        "[00:10] Meanwhile gold continues its historic rally past 3000.\n"
+        "[00:20] closing remarks for this segment.\n"
+    )
+    points = [_point(source_timestamp="[00:10]", source_anchor="gold continues its historic rally")]
+    resolved = summarize._resolve_points(points, body)
+    assert resolved[0].timestamp_seconds == 10
+
+
 def test_resolve_points_accepts_a_paraphrased_anchor_with_enough_word_overlap():
     """Regression test: live A/B testing showed the model reliably finds
     the right real transcript line (source_timestamp correct 16/16 times)
@@ -424,6 +449,10 @@ def test_summarize_transcript_raises_on_invalid_points(monkeypatch):
         summarize.summarize_transcript(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
     assert exc_info.value.retryable is True
     assert exc_info.value.usage is not None
+    # A grounding/citation failure is exactly the case summarize_fallback()
+    # exists for - the fallback prompt has no per-line citation to fail
+    # this same way.
+    assert exc_info.value.fallback_eligible is True
 
 
 def test_summarize_transcript_raises_on_refusal(monkeypatch):
@@ -440,6 +469,10 @@ def test_summarize_transcript_raises_on_refusal(monkeypatch):
     assert exc_info.value.retryable is False
     assert exc_info.value.usage.input_tokens == 200
     assert exc_info.value.usage.output_tokens == 10
+    # A refusal is deterministic - the simpler fallback prompt would very
+    # likely be refused too, so it's not fallback_eligible (also moot
+    # here since retryable=False already skips the fallback attempt).
+    assert exc_info.value.fallback_eligible is False
 
 
 def test_summarize_transcript_raises_when_output_did_not_parse(monkeypatch):
@@ -456,6 +489,10 @@ def test_summarize_transcript_raises_when_output_did_not_parse(monkeypatch):
     # response was still billed, so usage must be counted.
     assert exc_info.value.retryable is True
     assert exc_info.value.usage.input_tokens == 300
+    # A structured-output problem with this attempt's own response, not a
+    # provider-level outage - the much simpler fallback schema needs far
+    # less output budget and is meaningfully more likely to actually parse.
+    assert exc_info.value.fallback_eligible is True
 
 
 @pytest.mark.parametrize(
@@ -472,6 +509,10 @@ def test_summarize_transcript_wraps_transient_sdk_exceptions_as_retryable(monkey
         summarize.summarize_transcript(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
     assert exc_info.value.retryable is True
     assert exc_info.value.usage is None
+    # A provider-level outage, not a content problem - an immediate retry
+    # (which the fallback path would amount to) can't fix a rate limit or
+    # network blip and would only pile onto it. Not fallback_eligible.
+    assert exc_info.value.fallback_eligible is False
 
 
 @pytest.mark.parametrize("status_code,expected_retryable", [(500, True), (429, True), (400, False), (401, False), (403, False)])
@@ -482,6 +523,10 @@ def test_summarize_transcript_api_status_error_retryability_depends_on_status(mo
     with pytest.raises(summarize.SummarizationError) as exc_info:
         summarize.summarize_transcript(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
     assert exc_info.value.retryable is expected_retryable
+    # Provider-level HTTP errors are never fallback_eligible, retryable or
+    # not - a 5xx/429 needs a later attempt at the *same* call, not an
+    # immediate different-schema call right now.
+    assert exc_info.value.fallback_eligible is False
 
 
 def test_summarize_transcript_wraps_client_construction_failure(monkeypatch):
@@ -494,6 +539,7 @@ def test_summarize_transcript_wraps_client_construction_failure(monkeypatch):
         summarize.summarize_transcript(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
     # Needs a config/credential fix, not another attempt.
     assert exc_info.value.retryable is False
+    assert exc_info.value.fallback_eligible is False
 
 
 def test_summarize_transcript_disables_the_sdks_own_internal_retries(monkeypatch):
@@ -537,6 +583,9 @@ def test_summarize_transcript_raises_on_real_pydantic_validation_error(monkeypat
     # conservatively account for that rather than assuming zero cost.
     assert exc_info.value.usage is None
     assert exc_info.value.possibly_billed is True
+    # A malformed/truncated structured response is exactly the case the
+    # much-simpler fallback schema is likely to succeed at.
+    assert exc_info.value.fallback_eligible is True
 
 
 @pytest.mark.parametrize(

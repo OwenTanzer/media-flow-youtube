@@ -408,13 +408,20 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
             # make source_timestamp/source_anchor grounding hard even when
             # the model clearly understood the content - rather than give
             # up entirely, try once for a plain prose summary instead,
-            # which has no per-line citation to get wrong. Only worth
-            # attempting when the primary failure was itself retryable
-            # (a non-retryable one, e.g. a safety refusal, would very
-            # likely refuse the simpler prompt too) and only on the last
-            # attempt - every earlier attempt still gets a real shot at
-            # the full, timestamped citation format first.
-            if exc.retryable and this_attempt >= settings.summary_max_attempts_per_video:
+            # which has no per-line citation to get wrong.
+            #
+            # Gated on fallback_eligible, not just retryable: retryable
+            # also covers rate limits, connection errors, and 5xx - an
+            # immediate second call right after one of those can't fix
+            # anything and, for a rate limit specifically, only makes it
+            # worse. fallback_eligible is reserved for content/structured-
+            # output problems with this attempt's own response (see
+            # SummarizationError's docstring), where an immediate retry
+            # with a much simpler schema is actually likely to help.
+            # Still only on the video's last attempt - every earlier
+            # attempt gets a real shot at the full, timestamped citation
+            # format first.
+            if exc.fallback_eligible and this_attempt >= settings.summary_max_attempts_per_video:
                 try:
                     fallback_summary, fallback_usage = summarize_fallback(
                         model_input, model=settings.summary_model, max_output_tokens=settings.summary_max_output_tokens

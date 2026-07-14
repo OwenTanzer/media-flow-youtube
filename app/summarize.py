@@ -175,15 +175,34 @@ class SummarizationError(RuntimeError):
     Callers should conservatively charge an estimated cost against the
     run's budget in this case rather than contributing zero, since
     repeated failures like this could otherwise let real spend exceed the
-    configured cap unnoticed."""
+    configured cap unnoticed.
+
+    fallback_eligible marks a failure as a content/structured-output
+    problem with *this specific attempt's response* - unparseable/invalid
+    structured output, or a citation that failed _resolve_points()'s
+    grounding check - as opposed to a provider-level problem (rate limit,
+    connection error, 5xx) that's retryable in the sense that a *later*
+    attempt may succeed, but where an immediate second call right now
+    can't fix anything and, for a rate limit specifically, actively makes
+    it worse. Only fallback_eligible failures are candidates for
+    summary_store.summarize_eligible()'s last-attempt fallback path
+    (summarize_fallback()); every other retryable failure just waits for
+    next_retry_at like normal, even on the final attempt."""
 
     def __init__(
-        self, message: str, *, retryable: bool = True, usage: "Usage | None" = None, possibly_billed: bool = False
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        usage: "Usage | None" = None,
+        possibly_billed: bool = False,
+        fallback_eligible: bool = False,
     ):
         super().__init__(message)
         self.retryable = retryable
         self.usage = usage
         self.possibly_billed = possibly_billed
+        self.fallback_eligible = fallback_eligible
 
 
 class SummaryPoint(BaseModel):
@@ -414,9 +433,15 @@ def _resolve_points(points: list[SummaryPoint], transcript_body: str) -> list[Re
     their order)."""
 
     indexed = _index_transcript_lines(transcript_body)
-    line_index_by_second: dict[int, int] = {}
+    # Transcript timestamps are truncated to whole seconds
+    # (youtube.format_timestamp()), so more than one caption line can
+    # legitimately share the same rendered [MM:SS] - map each second to
+    # *every* matching line index, not just the first, or a valid anchor
+    # on a later same-second cue would be rejected just because an
+    # earlier cue at that same second happened to come first.
+    line_indices_by_second: dict[int, list[int]] = {}
     for i, (seconds, _text) in enumerate(indexed):
-        line_index_by_second.setdefault(seconds, i)
+        line_indices_by_second.setdefault(seconds, []).append(i)
 
     resolved: list[ResolvedPoint] = []
     for point in points:
@@ -426,22 +451,25 @@ def _resolve_points(points: list[SummaryPoint], transcript_body: str) -> list[Re
                 f"source_timestamp {point.source_timestamp!r} is not a valid [H:MM:SS]/[MM:SS] "
                 f"value for point {point.main_point!r}."
             )
-        line_index = line_index_by_second.get(seconds)
-        if line_index is None:
+        line_indices = line_indices_by_second.get(seconds)
+        if line_indices is None:
             raise ValueError(
                 f"source_timestamp {point.source_timestamp!r} ({seconds}s) is not one of the "
                 f"transcript's own line timestamps for point {point.main_point!r}."
             )
 
-        window_start = max(0, line_index - _ANCHOR_WINDOW_LINES)
-        window_end = min(len(indexed), line_index + _ANCHOR_WINDOW_LINES + 1)
-        window_text = " ".join(text for _, text in indexed[window_start:window_end])
         anchor_words = _significant_words(point.source_anchor)
-        window_words = _significant_words(window_text)
-        overlap = len(anchor_words & window_words) / len(anchor_words) if anchor_words else 0.0
-        if overlap < _ANCHOR_WORD_OVERLAP_THRESHOLD:
+        best_overlap = 0.0
+        for line_index in line_indices:
+            window_start = max(0, line_index - _ANCHOR_WINDOW_LINES)
+            window_end = min(len(indexed), line_index + _ANCHOR_WINDOW_LINES + 1)
+            window_text = " ".join(text for _, text in indexed[window_start:window_end])
+            window_words = _significant_words(window_text)
+            overlap = len(anchor_words & window_words) / len(anchor_words) if anchor_words else 0.0
+            best_overlap = max(best_overlap, overlap)
+        if best_overlap < _ANCHOR_WORD_OVERLAP_THRESHOLD:
             raise ValueError(
-                f"source_anchor {point.source_anchor!r} has only {overlap:.0%} word overlap with "
+                f"source_anchor {point.source_anchor!r} has only {best_overlap:.0%} word overlap with "
                 f"content within {_ANCHOR_WINDOW_LINES} line(s) of {point.source_timestamp!r} "
                 f"(need >= {_ANCHOR_WORD_OVERLAP_THRESHOLD:.0%}) for point {point.main_point!r}."
             )
@@ -529,7 +557,10 @@ def summarize_transcript(
         # here (the exception propagates before we get access to the raw
         # response object) - a known limitation, not a missed case.
         raise SummarizationError(
-            f"Model response failed schema validation: {exc}", retryable=True, possibly_billed=True
+            f"Model response failed schema validation: {exc}",
+            retryable=True,
+            possibly_billed=True,
+            fallback_eligible=True,
         ) from exc
 
     response_usage = Usage(input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
@@ -544,16 +575,25 @@ def summarize_transcript(
     if response.parsed_output is None:
         # A response was returned (and billed) but didn't parse against the
         # schema - plausibly a transient formatting hiccup, worth retrying.
+        # Also fallback_eligible: the fallback schema is far simpler (one
+        # free-text field, no per-point structure), so it needs much less
+        # output budget and is meaningfully more likely to actually parse.
         raise SummarizationError(
             f"Model response did not contain valid structured output (stop_reason={response.stop_reason!r}).",
             retryable=True,
             usage=response_usage,
+            fallback_eligible=True,
         )
 
     try:
         resolved_points = _resolve_points(response.parsed_output.points, transcript_body)
     except ValueError as exc:
-        raise SummarizationError(f"Model output failed validation: {exc}", retryable=True, usage=response_usage) from exc
+        # The core citation/grounding failure this whole mechanism exists
+        # for - fallback_eligible=True since a plain-prose fallback has no
+        # per-line citation to fail this same way.
+        raise SummarizationError(
+            f"Model output failed validation: {exc}", retryable=True, usage=response_usage, fallback_eligible=True
+        ) from exc
 
     selected_points, points_truncated = _select_significant_points(resolved_points, max_points)
     output = ResolvedSummary(
