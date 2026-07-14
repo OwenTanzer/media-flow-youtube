@@ -84,9 +84,16 @@ def _known_video_ids(folder_id: str, existing_queue: list[str | dict]) -> set[st
     return known
 
 
-def discover_and_enqueue(folder_id: str) -> DiscoveryReport:
-    channels = channel_store.read_channels(folder_id)
-    enabled = [channel for channel in channels if channel.enabled]
+def _enqueue_new_videos(folder_id: str, channels: list[channel_store.Channel]) -> tuple[int, int, int, list[tuple[str, str]]]:
+    """Fetches each given channel's RSS feed and enqueues any video not
+    already known (in _index.json or queue.json), scoped to exactly the
+    channels passed in. Shared core for discover_and_enqueue() (every
+    enabled channel, the normal recurring poll) and
+    backfill_new_channels() (just channels with no known videos yet - see
+    that function and backfill_new_channels.py at the repo root).
+
+    Returns (discovered_total, newly_queued, duplicates_skipped,
+    feed_failures)."""
 
     existing_queue = queue_store.read_queue(folder_id)
     known_ids = _known_video_ids(folder_id, existing_queue)
@@ -97,7 +104,7 @@ def discover_and_enqueue(folder_id: str) -> DiscoveryReport:
     feed_failures: list[tuple[str, str]] = []
     seen_this_run: set[str] = set()
 
-    for channel in enabled:
+    for channel in channels:
         try:
             videos = fetch_channel_feed(channel.channel_id)
         except (requests.RequestException, ET.ParseError) as exc:
@@ -122,11 +129,65 @@ def discover_and_enqueue(folder_id: str) -> DiscoveryReport:
     if new_entries:
         queue_store.write_queue(folder_id, existing_queue + new_entries)
 
+    return discovered_total, len(new_entries), duplicates_skipped, feed_failures
+
+
+def discover_and_enqueue(folder_id: str) -> DiscoveryReport:
+    channels = channel_store.read_channels(folder_id)
+    enabled = [channel for channel in channels if channel.enabled]
+
+    discovered_total, newly_queued, duplicates_skipped, feed_failures = _enqueue_new_videos(folder_id, enabled)
+
     return DiscoveryReport(
         channels_configured=len(channels),
         channels_enabled=len(enabled),
         discovered_total=discovered_total,
-        newly_queued=len(new_entries),
+        newly_queued=newly_queued,
+        duplicates_skipped=duplicates_skipped,
+        feed_failures=feed_failures,
+    )
+
+
+def find_unbackfilled_channels(folder_id: str) -> list[channel_store.Channel]:
+    """Enabled channels with zero videos anywhere in _index.json or
+    queue.json yet - i.e. genuinely never discovered, not merely "no new
+    uploads since the last check". A channel just added to channels.json
+    has none of its videos in either place, so it shows up here until its
+    first backfill (or the next normal discovery run, which would also
+    pick it up - see discover_and_enqueue()) runs at least once.
+
+    Used by backfill_new_channels() to scope a one-off backfill to just
+    the channels that actually need it."""
+
+    channels = channel_store.read_channels(folder_id)
+    index = drive.read_index(folder_id)
+    existing_queue = queue_store.read_queue(folder_id)
+
+    known_channel_ids = {entry.get("channel_id") for entry in index.values() if entry.get("channel_id")}
+    known_channel_ids |= {
+        entry.get("channel_id") for entry in existing_queue if isinstance(entry, dict) and entry.get("channel_id")
+    }
+    return [c for c in channels if c.enabled and c.channel_id not in known_channel_ids]
+
+
+def backfill_new_channels(folder_id: str) -> DiscoveryReport:
+    """Runs the same fetch-and-enqueue logic as discover_and_enqueue(),
+    scoped to only the channels find_unbackfilled_channels() identifies as
+    never-discovered - see backfill_new_channels.py (repo root) for the
+    standalone entrypoint this backs. That script deliberately does not
+    use app/job_lock.py's main discovery lock: this is a single feed fetch
+    plus queue append per new channel (seconds, not the potentially
+    long-running full discover+batch+summarize cycle), and there's no
+    reason it should have to wait for or contend with that lock."""
+
+    channels = find_unbackfilled_channels(folder_id)
+    discovered_total, newly_queued, duplicates_skipped, feed_failures = _enqueue_new_videos(folder_id, channels)
+
+    return DiscoveryReport(
+        channels_configured=len(channels),
+        channels_enabled=len(channels),
+        discovered_total=discovered_total,
+        newly_queued=newly_queued,
         duplicates_skipped=duplicates_skipped,
         feed_failures=feed_failures,
     )

@@ -386,6 +386,26 @@ flight, you don't have to wait out the TTL — just delete
 `_discovery_lock.json` from the Drive folder and the next run will
 acquire the lock immediately.
 
+### Backfilling a newly added channel
+
+A channel just added to `channels.json` gets its currently-visible RSS
+feed queued the same way as any other channel the next time
+`discover_and_process.py` runs (up to `DISCOVERY_LOCK_TTL_SECONDS`/the
+cron schedule away) — no separate step is strictly required. If you'd
+rather not wait, run `python backfill_new_channels.py` once: it finds
+every enabled channel with zero videos anywhere in `_index.json` or
+`queue.json` yet (i.e. never discovered at all) and queues whatever's
+currently in that channel's feed. Idempotent — a channel already
+backfilled is skipped on rerun.
+
+It deliberately does **not** use `discover_and_process.py`'s
+`_discovery_lock.json` — that lock guards a run that can legitimately
+take a long time (a large queue's batch processing plus summarization),
+and there's no reason a one-off, seconds-long backfill of a single new
+channel should have to wait for or contend with it. It takes out its own
+independent lock (`_new_channel_backfill_lock.json`) instead, only to
+stop two concurrent invocations of itself from racing each other.
+
 ### Livestreams
 
 YouTube's RSS feed lists a livestream as soon as it starts, well before
@@ -853,5 +873,6 @@ Dockerfile.vidproc  dedicated build for the vidproc Railway service (isolated fr
 batch_runner.py     standalone entrypoint for a separate Railway Cron Job service
 discover_and_process.py  standalone entrypoint: discover -> process queue -> summarize eligible transcripts
 backfill_channel_ids.py  one-off script: recover channel_id for pre-existing summaries
+backfill_new_channels.py  one-off/rerunnable script: backfill a newly-added channel's current RSS feed, decoupled from discover_and_process.py's lock
 get_refresh_token.py  one-time local script to mint the Drive OAuth refresh token
 ```

@@ -214,4 +214,101 @@ def test_discover_and_enqueue_deduplicates_against_existing_queue(monkeypatch):
 
     assert "entries" not in written
     assert report.duplicates_skipped == 1
+
+
+def test_find_unbackfilled_channels_returns_channels_with_no_known_videos(monkeypatch):
+    never_discovered = Channel("UC_new", "Brand New Channel", enabled=True)
+    already_discovered = Channel("UC_old", "Established Channel", enabled=True)
+    _stub_stores(
+        monkeypatch,
+        channels=[never_discovered, already_discovered],
+        index={"vid1": {"status": "ok", "channel_id": "UC_old"}},
+    )
+
+    assert discovery.find_unbackfilled_channels("folder-id") == [never_discovered]
+
+
+def test_find_unbackfilled_channels_checks_queue_as_well_as_index(monkeypatch):
+    """A channel discovered so recently its video hasn't been processed
+    into _index.json yet (still sitting in queue.json) must not be
+    treated as unbackfilled - that queue entry proves discovery already
+    saw it once."""
+    channel = Channel("UC_a", "Channel A", enabled=True)
+    _stub_stores(
+        monkeypatch,
+        channels=[channel],
+        queue=[{"url": "https://www.youtube.com/watch?v=queuedvidA1", "channel_id": "UC_a"}],
+    )
+
+    assert discovery.find_unbackfilled_channels("folder-id") == []
+
+
+def test_find_unbackfilled_channels_excludes_disabled_channels(monkeypatch):
+    disabled = Channel("UC_off", "Disabled", enabled=False)
+    _stub_stores(monkeypatch, channels=[disabled])
+
+    assert discovery.find_unbackfilled_channels("folder-id") == []
+
+
+def test_find_unbackfilled_channels_returns_empty_when_all_channels_seen(monkeypatch):
+    channel = Channel("UC_a", "Channel A", enabled=True)
+    _stub_stores(monkeypatch, channels=[channel], index={"vid1": {"status": "ok", "channel_id": "UC_a"}})
+
+    assert discovery.find_unbackfilled_channels("folder-id") == []
+
+
+def test_backfill_new_channels_only_fetches_unbackfilled_channels(monkeypatch):
+    never_discovered = Channel("UC_new", "Brand New Channel", enabled=True)
+    already_discovered = Channel("UC_old", "Established Channel", enabled=True)
+    written = _stub_stores(
+        monkeypatch,
+        channels=[never_discovered, already_discovered],
+        index={"vid1": {"status": "ok", "channel_id": "UC_old"}},
+    )
+    fetched = []
+
+    def _fetch(channel_id):
+        fetched.append(channel_id)
+        return [discovery.DiscoveredVideo("newvideo11", "UC_new", "2026-07-01T00:00:00+00:00")]
+
+    monkeypatch.setattr(discovery, "fetch_channel_feed", _fetch)
+
+    report = discovery.backfill_new_channels("folder-id")
+
+    assert fetched == ["UC_new"]
+    assert report.channels_configured == 1
+    assert report.newly_queued == 1
+    assert written["entries"][0]["channel_id"] == "UC_new"
+
+
+def test_backfill_new_channels_is_a_noop_when_nothing_needs_it(monkeypatch):
+    channel = Channel("UC_a", "Channel A", enabled=True)
+    written = _stub_stores(monkeypatch, channels=[channel], index={"vid1": {"status": "ok", "channel_id": "UC_a"}})
+    called = []
+    monkeypatch.setattr(discovery, "fetch_channel_feed", lambda channel_id: called.append(channel_id))
+
+    report = discovery.backfill_new_channels("folder-id")
+
+    assert not called
+    assert report.channels_configured == 0
     assert report.newly_queued == 0
+    assert "entries" not in written
+
+
+def test_backfill_new_channels_isolates_one_channels_feed_failure(monkeypatch):
+    ok_channel = Channel("UC_ok", "Fine Channel", enabled=True)
+    broken_channel = Channel("UC_broken", "Broken Channel", enabled=True)
+    written = _stub_stores(monkeypatch, channels=[ok_channel, broken_channel])
+
+    def _fetch(channel_id):
+        if channel_id == "UC_broken":
+            raise requests.RequestException("network down")
+        return [discovery.DiscoveredVideo("newvideo11", "UC_ok", None)]
+
+    monkeypatch.setattr(discovery, "fetch_channel_feed", _fetch)
+
+    report = discovery.backfill_new_channels("folder-id")
+
+    assert report.newly_queued == 1
+    assert report.feed_failures == [("UC_broken", "network down")]
+    assert written["entries"][0]["channel_id"] == "UC_ok"
