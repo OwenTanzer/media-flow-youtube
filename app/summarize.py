@@ -16,27 +16,54 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger("media_flow.summarize")
 
-# Bumped whenever SYSTEM_PROMPT (or the output schema) changes. Deliberately a
-# code constant, not an env var - drifting it independently of the prompt
-# text would corrupt the idempotency check in summary_store.needs_summarization().
-PROMPT_VERSION = "v1"
+# Bumped whenever the system prompt template (or the output schema)
+# changes. Deliberately a code constant, not an env var - drifting it
+# independently of the prompt text would corrupt the idempotency check in
+# summary_store.needs_summarization().
+PROMPT_VERSION = "v4"
 
-SYSTEM_PROMPT = """You are extracting structured, timestamped insights from a YouTube video transcript.
+# Convenience tuple for callers/tests - must be kept in sync with
+# ModelSummaryOutput.video_type's Literal values below.
+VIDEO_TYPES = ("Post-Market Update", "Thesis Piece", "Analytic Overview", "Pre-Market Brief")
 
-Identify the transcript-supported major and minor points made in the video, in the order they first appear. The number of points should reflect the video's actual substantive content - a short, thin video may have only one or two points; a long, information-dense video may have many. Do not pad the list to hit a target count, and do not omit real content to keep it short.
+# Upper bound on how many points the model may return, scaling with video
+# length but never exceeding _MAX_POINTS_CEILING - without this, a very
+# long video (a multi-hour livestream, say) has no natural ceiling on how
+# many points a model might try to produce. This is an upper bound only:
+# short videos are already naturally kept to a handful of points by the
+# prompt's own guidance below, so this rarely binds for them.
+_POINT_INTERVAL_SECONDS = 180  # roughly one point per 3 minutes of video
+_MAX_POINTS_CEILING = 20
+
+
+def _max_points_for_duration(duration_seconds: int) -> int:
+    return max(1, min(_MAX_POINTS_CEILING, duration_seconds // _POINT_INTERVAL_SECONDS))
+
+
+def _build_system_prompt(max_points: int) -> str:
+    return f"""You are extracting structured, timestamped insights from a YouTube video transcript.
+
+Identify the transcript-supported major and minor points made in the video. Include at most {max_points} points - however many major/minor points are actually present in the video's substantive content, up to that limit. A short, thin video may have only one or two points; a long, information-dense video may have many, up to {max_points}. Do not pad the list to hit a target count. If the video's substantive content exceeds {max_points} distinguishable points, select only the {max_points} most significant ones (favoring "major" points over "minor" ones) rather than trying to cram in everything - do not omit real content to keep the list short otherwise.
+
+Do NOT create points for routine housekeeping/administrative content - schedule or streaming-cadence announcements, membership/Patreon/sponsor plugs, "welcome back"/sign-off preambles, asks to like/subscribe, or similar channel-admin remarks - even if the transcript spends real time on them. Exclude this by default so the (especially limited, on longer videos) point budget goes to actual substantive content instead. The only exception: if a piece of "housekeeping" is itself substantively important to understanding the video (e.g. a schedule change that materially affects when to expect the next analysis), it may still get a point.
 
 For each point:
 - "importance" is "major" for a point central to the video's purpose, "minor" for a supporting or secondary point.
 - "main_point" is one sentence or phrase stating the point.
-- "explanation" is one to three sentences of supporting detail, using only what the transcript actually supports.
-- "timestamp_seconds" is when in the video this point is made or first substantiated, in whole seconds, taken from the transcript's own timestamps.
+- "explanation" is 2 to 4 sentences of supporting detail, using only what the transcript actually supports - favor giving real substance and specifics (numbers, reasoning, context) over being terse.
+- "timestamp_seconds" is the timestamp of the transcript line where this point is first mentioned or introduced, taken from the transcript's own timestamps.
 
-Points must be listed in non-decreasing order of timestamp_seconds, matching the order they first appear in the video.
+Many videos (livestreams especially) revisit the same topic more than once - e.g. the same asset, subject, or claim comes up early, then again later in more depth. When that happens, timestamp the point wherever you judge it's best substantiated, and write the point/explanation to reflect the fullest picture of what was said about it across all those mentions - points do not need to be in strict chronological order if a topic is revisited.
 
 Be concise and factual. State uncertainty explicitly (e.g. "the speaker suggests..." vs "the speaker states...") rather than presenting an inference as a stated fact. Do not include information not supported by the transcript text.
 
 Also provide:
-- "subject": one concise phrase naming what the video is about.
+- "video_type": classify the video as exactly one of "Post-Market Update", "Pre-Market Brief", "Thesis Piece", or "Analytic Overview".
+  - "Post-Market Update": a recap/review of a trading session or period that has already happened.
+  - "Pre-Market Brief": forward-looking commentary or a plan for a session/period that hasn't happened yet.
+  - "Thesis Piece": an in-depth case for or against a single specific idea, asset, or claim.
+  - "Analytic Overview": a broader technical/analytical walkthrough across multiple assets or topics, not tied to a single specific thesis or session (e.g. a live multi-asset chart-reading session).
+  If more than one could apply, pick whichever describes the video's primary purpose.
 - "summary": one to three sentences summarizing the video as a whole.
 """
 
@@ -123,7 +150,7 @@ class ModelSummaryOutput(BaseModel):
     default rules despite the output contract requiring actual timestamped
     insights, so without these an empty summary would be accepted as "ok"."""
 
-    subject: str = Field(min_length=1)
+    video_type: Literal["Post-Market Update", "Thesis Piece", "Analytic Overview", "Pre-Market Brief"]
     summary: str = Field(min_length=1)
     points: list[SummaryPoint] = Field(min_length=1)
 
@@ -183,11 +210,12 @@ def count_prompt_tokens(transcript_body: str, *, model: str) -> int:
     video with no durable retry state, the way an unconditional re-raise
     would."""
 
+    max_points = _max_points_for_duration(_max_transcript_seconds(transcript_body))
     try:
         client = anthropic.Anthropic(max_retries=_CLIENT_MAX_RETRIES)
         result = client.messages.count_tokens(
             model=model,
-            system=SYSTEM_PROMPT,
+            system=_build_system_prompt(max_points),
             messages=[{"role": "user", "content": transcript_body}],
             output_format=ModelSummaryOutput,
         )
@@ -224,41 +252,60 @@ def _max_transcript_seconds(transcript_body: str) -> int:
 
 
 def _validate_points(points: list[SummaryPoint], transcript_body: str) -> None:
-    """Raises ValueError if the model's points aren't trustworthy: a
-    negative or out-of-range timestamp_seconds, or points out of
-    chronological order (the prompt asks for "order they first appear" -
-    Pydantic only validates types, not this)."""
+    """Raises ValueError if a point's timestamp_seconds isn't trustworthy:
+    negative, or beyond the transcript's own timestamp range - Pydantic
+    only validates that it's an int, not that it's plausible. Points are
+    deliberately *not* required to be in chronological order: real videos
+    (livestreams especially) revisit the same topic more than once, and a
+    strict ordering requirement rejected genuinely well-formed output for
+    that content - see _select_significant_points() for the actual bound
+    that matters for long videos (a cap on point count, not their order)."""
 
     max_seconds = _max_transcript_seconds(transcript_body)
-    previous_seconds = -1
     for point in points:
         if point.timestamp_seconds < 0 or point.timestamp_seconds > max_seconds:
             raise ValueError(
                 f"timestamp_seconds={point.timestamp_seconds} is outside the transcript's own "
                 f"range [0, {max_seconds}] for point {point.main_point!r}."
             )
-        if point.timestamp_seconds < previous_seconds:
-            raise ValueError(
-                f"Points are not in non-decreasing timestamp order: {point.main_point!r} "
-                f"({point.timestamp_seconds}s) comes after a point at {previous_seconds}s."
-            )
-        previous_seconds = point.timestamp_seconds
+
+
+def _select_significant_points(points: list[SummaryPoint], max_points: int) -> tuple[list[SummaryPoint], bool]:
+    """Enforces _max_points_for_duration()'s cap as a hard backstop,
+    independent of whether the model already respected it in the prompt:
+    if the model still returns more than max_points, keep only the most
+    significant ones - "major" points before "minor" ones - rather than
+    failing/retrying, since this is a "which points to keep" selection,
+    not a correctness problem with any individual point. Returns
+    (selected_points, was_truncated); selected_points preserves the
+    model's original relative order among whichever points are kept."""
+
+    if len(points) <= max_points:
+        return points, False
+    majors = [p for p in points if p.importance == "major"]
+    minors = [p for p in points if p.importance == "minor"]
+    kept_ids = {id(p) for p in (majors + minors)[:max_points]}
+    return [p for p in points if id(p) in kept_ids], True
 
 
 def summarize_transcript(
     transcript_body: str, *, model: str, max_output_tokens: int
-) -> tuple[ModelSummaryOutput, Usage]:
+) -> tuple[ModelSummaryOutput, Usage, bool]:
     """Calls Claude to produce a ModelSummaryOutput for one transcript.
     Raises SummarizationError on any provider failure or invalid/unparseable
     output - never raises a raw SDK exception, so callers don't need to know
-    the SDK's exception hierarchy."""
+    the SDK's exception hierarchy. Returns (output, usage, points_truncated) -
+    points_truncated is True if _select_significant_points() had to drop
+    points to enforce the length-based cap."""
+
+    max_points = _max_points_for_duration(_max_transcript_seconds(transcript_body))
 
     try:
         client = anthropic.Anthropic(max_retries=_CLIENT_MAX_RETRIES)
         response = client.messages.parse(
             model=model,
             max_tokens=max_output_tokens,
-            system=SYSTEM_PROMPT,
+            system=_build_system_prompt(max_points),
             messages=[{"role": "user", "content": transcript_body}],
             output_format=ModelSummaryOutput,
         )
@@ -319,4 +366,9 @@ def summarize_transcript(
     except ValueError as exc:
         raise SummarizationError(f"Model output failed validation: {exc}", retryable=True, usage=response_usage) from exc
 
-    return response.parsed_output, response_usage
+    selected_points, points_truncated = _select_significant_points(response.parsed_output.points, max_points)
+    output = response.parsed_output
+    if points_truncated:
+        output = output.model_copy(update={"points": selected_points})
+
+    return output, response_usage, points_truncated

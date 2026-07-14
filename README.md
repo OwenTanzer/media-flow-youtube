@@ -47,6 +47,7 @@ title: "Never Gonna Give You Up"
 url: https://www.youtube.com/watch?v=dQw4w9WgXcQ
 channel: Rick Astley
 fetched_at: 2026-07-13T10:41:55+00:00
+published_at: 2026-07-10T14:00:00+00:00
 language: English (en)
 auto_generated: false
 ---
@@ -55,6 +56,17 @@ auto_generated: false
 [00:05] You know the rules and so do I
 ...
 ```
+
+`published_at` - the video's real YouTube publish time - is only present for
+videos discovered via `discover_and_process.py`'s RSS feed reader, the only
+source that sees it; a manually-added `queue.json` entry or a direct
+`/transcripts` URL has no such source and omits the field entirely rather
+than guessing (`fetched_at` can lag the real upload by anywhere from
+minutes to a full discovery interval, so it's not a substitute). It's
+carried through to `_index.json` and, for summarized videos, to the
+summary artifact's `video_published_at` - see "Transcript summarization"
+below - since sorting market/news content by when it was actually said
+(not by processing order) matters for a future consumer like a visualizer.
 
 ## Setup
 
@@ -418,44 +430,85 @@ required once it's set - all other settings have working defaults. See
   "title": "Never Gonna Give You Up",
   "author": "Rick Astley",
   "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-  "subject": "...",
+  "video_published_at": "2026-07-10T14:00:00+00:00",
+  "video_type": "Analytic Overview",
   "summary": "...",
   "points": [
     {"importance": "major", "main_point": "...", "explanation": "...", "timestamp_seconds": 12, "timestamp": "00:12"}
   ],
   "status": "ok",
   "model": "claude-haiku-4-5",
-  "prompt_version": "v1",
+  "prompt_version": "v4",
   "generated_at": "2026-07-14T12:00:00+00:00",
   "attempts": 1,
   "usage": {"input_tokens": 1234, "output_tokens": 456, "estimated_cost_usd": 0.0035}
 }
 ```
 
-`title`, `author`, `url`, the source Drive file ID, and the transcript hash
-are always populated by application code from `_index.json` and the
-archived transcript file itself - never trusted from the model's output.
-Claude only produces `subject`, `summary`, and each point's `importance`,
-`main_point`, `explanation`, and `timestamp_seconds`, constrained by a JSON
-schema (`output_config.format`) so the response is always valid JSON with
-no Markdown fences or surrounding prose - each string field and the
-`points` list itself also require at least one character/item, since an
-empty response is otherwise schema-valid despite not being a usable
-summary. The human-readable `timestamp` string is never taken from the
+`title`, `author`, `url`, `video_published_at`, the source Drive file ID,
+and the transcript hash are always populated by application code from
+`_index.json` and the archived transcript file itself - never trusted
+from the model's output. `video_published_at` is `null` unless the video
+was discovered via RSS (see "Transcript file format" above) - there's no
+other source for it.
+Claude only produces `video_type`, `summary`, and each point's
+`importance`, `main_point`, `explanation`, and `timestamp_seconds`,
+constrained by a JSON schema (`output_config.format`) so the response is
+always valid JSON with no Markdown fences or surrounding prose.
+`video_type` is one of exactly four categories - `"Post-Market Update"`,
+`"Pre-Market Brief"`, `"Thesis Piece"`, or `"Analytic Overview"` - enforced
+by the schema itself (a `Literal`, not a free-text field), so an
+unrecognized classification is rejected the same way a missing field
+would be. Every string field and the `points` list itself also require at
+least one character/item, since an empty response is otherwise
+schema-valid despite not being a usable summary. The human-readable
+`timestamp` string is never taken from the
 model either - it's derived deterministically in application code from
 `timestamp_seconds` (the same formatter transcript Markdown files use), so
 the two can never disagree. Every `timestamp_seconds` is also validated
 against the transcript's own timestamp range (rejecting a value outside
-`[0, last transcript timestamp]`) and checked for non-decreasing order
-across points - Pydantic alone only validates that they're integers, not
-that they're plausible, so this catches a model inventing an out-of-range
-or out-of-order value. A failed attempt (provider error, safety refusal,
-unparseable/invalid structured output, or failed point validation) writes
-`status: "error"` with a `message`, a `retryable` flag, and the `attempts`
-count so far instead - this includes the case where the SDK's own
+`[0, last transcript timestamp]`) - Pydantic alone only validates that
+it's an integer, not that it's plausible, so this catches a model
+inventing an out-of-range value. Points are **not** required to be in
+chronological order: real videos (livestreams especially) revisit the
+same topic more than once, and an earlier strict-ordering requirement
+rejected genuinely well-formed output for that content in testing. A
+failed attempt (provider error, safety refusal, unparseable/invalid
+structured output, or an out-of-range timestamp) writes `status: "error"`
+with a `message`, a `retryable` flag, and the `attempts` count so far
+instead - this includes the case where the SDK's own
 response-parsing step raises a schema validation error directly (a
 `pydantic.ValidationError`, not one of the SDK's own exception types),
 which would otherwise escape per-video isolation and abort the whole run.
+
+### Point count
+
+The number of points is otherwise unbounded, which would let a long,
+information-dense video (a multi-hour livestream, say) produce an
+unreasonably large list. A per-video cap - roughly one point per 3 minutes
+of video, up to a ceiling of 20 regardless of length - is built into the
+system prompt sent to the model, and enforced again as a hard backstop
+after the response comes back: if the model still returns more points
+than the cap allows, only the most significant ones are kept (`"major"`
+points before `"minor"` ones, preserving the model's original relative
+order among whichever are kept), and the artifact is flagged
+`"points_truncated": true`. This is a selection, not a validation failure
+- it never triggers a retry, since keeping fewer of the model's own points
+isn't a correctness problem with any individual one. Short videos aren't
+affected in practice: the prompt's own guidance already keeps them to a
+handful of points well under the cap.
+
+Routine housekeeping/administrative content - schedule or
+streaming-cadence announcements, membership/Patreon/sponsor plugs,
+"welcome back"/sign-off preambles, like-and-subscribe asks - is excluded
+from points by default, even when the transcript spends real time on it.
+This matters more the longer the video is: with a fixed point cap, every
+point spent on channel admin is one less available for actual substantive
+content. The exception is housekeeping that's itself substantively
+important (e.g. a schedule change that affects when to expect the next
+analysis), which can still get a point. Each point's `explanation` is
+guided to be 2-4 sentences rather than 1-3, favoring real specifics
+(numbers, reasoning, context) over terseness.
 
 ### Idempotency and retries
 

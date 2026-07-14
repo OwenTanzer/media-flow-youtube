@@ -149,12 +149,12 @@ def test_summarize_eligible_summarizes_a_newly_eligible_video(monkeypatch):
     written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
 
     output = ModelSummaryOutput(
-        subject="Subject",
+        video_type="Analytic Overview",
         summary="Summary.",
         points=[SummaryPoint(importance="major", main_point="Point", explanation="Because.", timestamp_seconds=0)],
     )
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=10, output_tokens=5))
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=10, output_tokens=5), False)
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -165,7 +165,7 @@ def test_summarize_eligible_summarizes_a_newly_eligible_video(monkeypatch):
     assert report.retried == 0
     written_artifact = written["abc123XYZde.json"]
     assert written_artifact["status"] == "ok"
-    assert written_artifact["subject"] == "Subject"
+    assert written_artifact["video_type"] == "Analytic Overview"
     assert written_artifact["author"] == "A Channel"
     assert written_artifact["usage"]["input_tokens"] == 10
     assert written_artifact["attempts"] == 1
@@ -173,6 +173,35 @@ def test_summarize_eligible_summarizes_a_newly_eligible_video(monkeypatch):
     # from the model - format_timestamp(0) == "00:00".
     assert written_artifact["points"][0]["timestamp"] == "00:00"
     assert written_artifact["points"][0]["timestamp_seconds"] == 0
+    # No published_at on this index entry (see _INDEX_ONE_VIDEO) - only
+    # known for RSS-discovered videos.
+    assert written_artifact["video_published_at"] is None
+
+
+def test_summarize_eligible_surfaces_video_published_at_from_the_index(monkeypatch):
+    """Regression test: a future visualizer needs to sort market/news
+    content by when it was actually published, not by our own processing
+    order - this must be carried from _index.json into the artifact."""
+    index_with_published_at = {
+        "abc123XYZde": {**_INDEX_ONE_VIDEO["abc123XYZde"], "published_at": "2026-07-01T00:00:00+00:00"}
+    }
+    written = _stub_drive(
+        monkeypatch, index=index_with_published_at, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN}
+    )
+    output = ModelSummaryOutput(
+        video_type="Analytic Overview",
+        summary="Summary.",
+        points=[SummaryPoint(importance="major", main_point="Point", explanation="Because.", timestamp_seconds=0)],
+    )
+    monkeypatch.setattr(
+        summary_store,
+        "summarize_transcript",
+        lambda body, model, max_output_tokens: (output, Usage(input_tokens=10, output_tokens=5), False),
+    )
+
+    summary_store.summarize_eligible("folder-id")
+
+    assert written["abc123XYZde.json"]["video_published_at"] == "2026-07-01T00:00:00+00:00"
 
 
 def test_summarize_eligible_skips_already_current_summary(monkeypatch):
@@ -232,9 +261,9 @@ def test_summarize_eligible_hash_reflects_content_beyond_the_truncation_cutoff(m
         transcripts={"A Title [abc123XYZde].md": long_markdown},
         existing_summaries=existing_summaries,
     )
-    output = ModelSummaryOutput(subject="S", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
+    output = ModelSummaryOutput(video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1))
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -370,9 +399,9 @@ def test_summarize_eligible_counts_a_retry_and_increments_attempts(monkeypatch):
         transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN},
         existing_summaries=existing_summaries,
     )
-    output = ModelSummaryOutput(subject="S", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
+    output = ModelSummaryOutput(video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1))
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -396,9 +425,9 @@ def test_summarize_eligible_stops_at_max_videos_per_run(monkeypatch):
     _stub_drive(monkeypatch, index=index, transcripts={f"vid{i}.md": TRANSCRIPT_MARKDOWN for i in range(3)})
     monkeypatch.setattr(summary_store.settings, "summary_max_videos_per_run", 1)
 
-    output = ModelSummaryOutput(subject="S", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
+    output = ModelSummaryOutput(video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1))
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -462,11 +491,11 @@ def test_summarize_eligible_stops_on_budget_when_remaining_headroom_runs_out(mon
     # comfortably under this cap on its own, but two calls' worth isn't.
     monkeypatch.setattr(summary_store.settings, "summary_max_cost_usd_per_run", 0.0009)
 
-    output = ModelSummaryOutput(subject="S", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
+    output = ModelSummaryOutput(video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
         summary_store,
         "summarize_transcript",
-        lambda body, model, max_output_tokens: (output, Usage(input_tokens=100, output_tokens=100)),
+        lambda body, model, max_output_tokens: (output, Usage(input_tokens=100, output_tokens=100), False),
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -499,9 +528,9 @@ def test_summarize_eligible_aborts_without_writing_when_token_counting_fails(mon
 
 def test_summarize_eligible_calls_on_progress_before_model_call_and_before_write(monkeypatch):
     _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
-    output = ModelSummaryOutput(subject="S", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
+    output = ModelSummaryOutput(video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1))
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     calls = []
@@ -519,9 +548,9 @@ def test_summarize_eligible_does_not_write_if_lock_is_lost_before_the_write(monk
     acquired the lock. on_progress() raising (simulating a lost lock) must
     stop this function *before* it writes, not merely be observed after."""
     written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
-    output = ModelSummaryOutput(subject="S", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
+    output = ModelSummaryOutput(video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1))
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     calls = []
@@ -669,3 +698,37 @@ def test_summarize_eligible_does_not_record_a_next_retry_at_for_non_retryable_fa
     summary_store.summarize_eligible("folder-id")
 
     assert written["abc123XYZde.json"]["next_retry_at"] is None
+
+
+def test_summarize_eligible_records_points_truncated_flag(monkeypatch):
+    """When summarize_transcript() reports it had to drop points to stay
+    under the length-based cap, the artifact should say so."""
+    written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+    output = ModelSummaryOutput(
+        video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)]
+    )
+    monkeypatch.setattr(
+        summary_store,
+        "summarize_transcript",
+        lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), True),
+    )
+
+    summary_store.summarize_eligible("folder-id")
+
+    assert written["abc123XYZde.json"]["points_truncated"] is True
+
+
+def test_summarize_eligible_omits_points_truncated_flag_when_not_truncated(monkeypatch):
+    written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+    output = ModelSummaryOutput(
+        video_type="Analytic Overview", summary="S.", points=[SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)]
+    )
+    monkeypatch.setattr(
+        summary_store,
+        "summarize_transcript",
+        lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False),
+    )
+
+    summary_store.summarize_eligible("folder-id")
+
+    assert "points_truncated" not in written["abc123XYZde.json"]

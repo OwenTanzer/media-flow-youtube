@@ -10,10 +10,17 @@ dict with a required "url" plus optional overrides:
   video was queued. Used to give a video (e.g. an in-progress livestream
   with no captions yet) a grace period of retries before "no_captions" is
   treated as terminal - see NO_CAPTIONS_GRACE_HOURS and app/batch.py.
+- "published_at": the video's real publish timestamp, as reported by
+  YouTube's own RSS feed (only known for videos discovery.py found - a
+  plain URL/ID or a manually-added entry has no such source). Carried
+  through to the transcript frontmatter and _index.json so downstream
+  consumers (e.g. a future visualizer) can sort by when a video was
+  actually published, not merely when this app happened to fetch it.
 
 Plain-string entries (including ones added manually, without
-first_seen_at) get no grace period - "no_captions" is terminal for them
-immediately, same as before this field existed."""
+first_seen_at/published_at) get no grace period and no publish date -
+"no_captions" is terminal for them immediately, same as before this field
+existed."""
 
 from __future__ import annotations
 
@@ -39,6 +46,17 @@ def entry_languages(entry: str | dict, default: list[str] | None) -> list[str] |
         if languages:
             return list(languages)
     return default
+
+
+def entry_published_at(entry: str | dict) -> str | None:
+    """Returns the raw ISO string as-is (unlike entry_first_seen_at, nothing
+    here needs to do date arithmetic on it - it's just carried through to
+    the transcript frontmatter and index entry for downstream consumers)."""
+
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("published_at")
+    return value if isinstance(value, str) else None
 
 
 def entry_first_seen_at(entry: str | dict) -> datetime | None:
@@ -86,6 +104,9 @@ def read_queue(folder_id: str) -> list[str | dict]:
             first_seen_at = item.get("first_seen_at")
             if isinstance(first_seen_at, str):
                 parsed["first_seen_at"] = first_seen_at
+            published_at = item.get("published_at")
+            if isinstance(published_at, str):
+                parsed["published_at"] = published_at
             entries.append(parsed)
         else:
             entries.append(str(item))

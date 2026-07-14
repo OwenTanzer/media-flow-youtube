@@ -59,6 +59,43 @@ def test_process_video_no_captions_skips_upload(monkeypatch):
     assert not upload_called
 
 
+def test_process_video_passes_published_at_to_markdown_and_index(monkeypatch):
+    """Regression test: a video's real publish date (only known for
+    RSS-discovered videos - see discovery.py) must reach both the
+    transcript frontmatter and the _index.json entry, since a future
+    visualizer needs to sort by when a video was actually published."""
+    _stub_transcript_and_metadata(monkeypatch, status="ok")
+    monkeypatch.setattr(pipeline.drive, "upload_text_file", lambda *a, **k: "drive-id-123")
+    seen_markdown_kwargs = {}
+    original_render = youtube.render_transcript_markdown
+
+    def _spy_render(**kwargs):
+        seen_markdown_kwargs.update(kwargs)
+        return original_render(**kwargs)
+
+    monkeypatch.setattr(pipeline.youtube, "render_transcript_markdown", _spy_render)
+    indexed = {}
+    monkeypatch.setattr(pipeline.drive, "update_index_entry", lambda folder_id, video_id, entry: indexed.update(entry))
+
+    pipeline.process_video(
+        "https://www.youtube.com/watch?v=abc123XYZde", published_at="2026-07-01T00:00:00+00:00"
+    )
+
+    assert seen_markdown_kwargs["published_at"] == "2026-07-01T00:00:00+00:00"
+    assert indexed["published_at"] == "2026-07-01T00:00:00+00:00"
+
+
+def test_process_video_published_at_defaults_to_none(monkeypatch):
+    _stub_transcript_and_metadata(monkeypatch, status="ok")
+    monkeypatch.setattr(pipeline.drive, "upload_text_file", lambda *a, **k: "drive-id-123")
+    indexed = {}
+    monkeypatch.setattr(pipeline.drive, "update_index_entry", lambda folder_id, video_id, entry: indexed.update(entry))
+
+    pipeline.process_video("https://www.youtube.com/watch?v=abc123XYZde")
+
+    assert indexed["published_at"] is None
+
+
 def test_index_failure_does_not_erase_a_successful_archive(monkeypatch):
     """Regression test for the review finding: a failed _index.json write
     must not turn an already-uploaded transcript into a reported failure."""
@@ -81,7 +118,7 @@ def test_safe_process_video_isolates_unexpected_exceptions(monkeypatch):
     """Regression test for the review finding: an unhandled exception from
     anywhere in the pipeline must become an 'error' result, not propagate."""
 
-    def _boom(url_or_id, languages=None):
+    def _boom(url_or_id, languages=None, published_at=None):
         raise RuntimeError("service account credentials are invalid")
 
     monkeypatch.setattr(pipeline, "process_video", _boom)

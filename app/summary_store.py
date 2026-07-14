@@ -269,6 +269,12 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
             "title": entry.get("title"),
             "author": _extract_channel(markdown),
             "url": entry.get("url"),
+            # Only known for RSS-discovered videos (see discovery.py) - the
+            # actual YouTube publish time, not when this app happened to
+            # fetch it. A future visualizer needs this to sort market/news
+            # content chronologically by when it was actually said, not by
+            # our own processing order.
+            "video_published_at": entry.get("published_at"),
             "model": settings.summary_model,
             "prompt_version": PROMPT_VERSION,
             "generated_at": generated_at_dt.isoformat(),
@@ -352,7 +358,7 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
             on_progress()
 
         try:
-            model_output, usage = summarize_transcript(
+            model_output, usage, points_truncated = summarize_transcript(
                 model_input, model=settings.summary_model, max_output_tokens=settings.summary_max_output_tokens
             )
         except SummarizationError as exc:
@@ -381,7 +387,7 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
 
         artifact = {
             **base_fields,
-            "subject": model_output.subject,
+            "video_type": model_output.video_type,
             "summary": model_output.summary,
             "points": [
                 {
@@ -403,6 +409,11 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
                 "estimated_cost_usd": cost,
             },
         }
+        if points_truncated:
+            # The model returned more points than _max_points_for_duration()
+            # allows for this video's length - only the most significant
+            # ones (major over minor) were kept.
+            artifact["points_truncated"] = True
 
         if on_progress is not None:
             on_progress()

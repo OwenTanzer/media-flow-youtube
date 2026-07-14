@@ -80,10 +80,12 @@ def test_count_prompt_tokens_returns_the_real_input_token_count(monkeypatch):
     count = summarize.count_prompt_tokens(SAMPLE_BODY, model="claude-haiku-4-5")
 
     assert count == 321
-    # Must include the real system prompt and output schema, not just the
-    # transcript - otherwise the count undercounts exactly like the old
-    # chars-per-token heuristic did.
-    assert seen_kwargs["system"] == summarize.SYSTEM_PROMPT
+    # Must include the real system prompt (dynamically built for this
+    # video's length) and output schema, not just the transcript -
+    # otherwise the count undercounts exactly like the old chars-per-token
+    # heuristic did.
+    max_points = summarize._max_points_for_duration(summarize._max_transcript_seconds(SAMPLE_BODY))
+    assert seen_kwargs["system"] == summarize._build_system_prompt(max_points)
     assert seen_kwargs["output_format"] is summarize.ModelSummaryOutput
 
 
@@ -163,13 +165,16 @@ def test_validate_points_rejects_negative_timestamp():
         summarize._validate_points(points, SAMPLE_BODY)
 
 
-def test_validate_points_rejects_nonchronological_order():
+def test_validate_points_accepts_nonchronological_order():
+    """Regression test: real videos (livestreams especially) revisit the
+    same topic more than once, and a strict ordering requirement rejected
+    genuinely well-formed output for that content - points only need to be
+    in-range now, not strictly ordered."""
     points = [
         summarize.SummaryPoint(importance="major", main_point="Second", explanation="E", timestamp_seconds=5),
         summarize.SummaryPoint(importance="minor", main_point="First", explanation="E", timestamp_seconds=0),
     ]
-    with pytest.raises(ValueError, match="not in non-decreasing timestamp order"):
-        summarize._validate_points(points, SAMPLE_BODY)
+    summarize._validate_points(points, SAMPLE_BODY)  # should not raise
 
 
 def test_validate_points_accepts_valid_in_range_chronological_points():
@@ -178,6 +183,45 @@ def test_validate_points_accepts_valid_in_range_chronological_points():
         summarize.SummaryPoint(importance="minor", main_point="Second", explanation="E", timestamp_seconds=5),
     ]
     summarize._validate_points(points, SAMPLE_BODY)  # should not raise
+
+
+def test_max_points_for_duration_scales_with_length_and_has_a_ceiling():
+    assert summarize._max_points_for_duration(0) == 1
+    assert summarize._max_points_for_duration(179) == 1
+    assert summarize._max_points_for_duration(180) == 1
+    assert summarize._max_points_for_duration(360) == 2
+    assert summarize._max_points_for_duration(999_999) == summarize._MAX_POINTS_CEILING
+
+
+def test_select_significant_points_keeps_majors_over_minors_when_over_the_cap():
+    major_a = summarize.SummaryPoint(importance="major", main_point="Major A", explanation="E", timestamp_seconds=0)
+    minor_a = summarize.SummaryPoint(importance="minor", main_point="Minor A", explanation="E", timestamp_seconds=1)
+    major_b = summarize.SummaryPoint(importance="major", main_point="Major B", explanation="E", timestamp_seconds=2)
+    minor_b = summarize.SummaryPoint(importance="minor", main_point="Minor B", explanation="E", timestamp_seconds=3)
+
+    selected, truncated = summarize._select_significant_points([major_a, minor_a, major_b, minor_b], max_points=2)
+
+    assert truncated is True
+    assert selected == [major_a, major_b]
+
+
+def test_select_significant_points_preserves_original_order_among_kept_points():
+    p1 = summarize.SummaryPoint(importance="major", main_point="P1", explanation="E", timestamp_seconds=0)
+    p2 = summarize.SummaryPoint(importance="minor", main_point="P2", explanation="E", timestamp_seconds=1)
+    p3 = summarize.SummaryPoint(importance="major", main_point="P3", explanation="E", timestamp_seconds=2)
+
+    selected, truncated = summarize._select_significant_points([p1, p2, p3], max_points=2)
+
+    assert truncated is True
+    # p1 and p3 are both major and kept; original relative order preserved.
+    assert selected == [p1, p3]
+
+
+def test_select_significant_points_does_not_truncate_when_under_the_cap():
+    p1 = summarize.SummaryPoint(importance="major", main_point="P1", explanation="E", timestamp_seconds=0)
+    selected, truncated = summarize._select_significant_points([p1], max_points=5)
+    assert truncated is False
+    assert selected == [p1]
 
 
 class _FakeUsage:
@@ -212,7 +256,7 @@ def _fake_client(parse_result_or_raiser, captured_init_kwargs=None):
 
 def test_summarize_transcript_success(monkeypatch):
     expected_output = summarize.ModelSummaryOutput(
-        subject="A subject",
+        video_type="Analytic Overview",
         summary="A summary.",
         points=[summarize.SummaryPoint(importance="major", main_point="Point one", explanation="Because X.", timestamp_seconds=5)],
     )
@@ -220,19 +264,22 @@ def test_summarize_transcript_success(monkeypatch):
         summarize.anthropic, "Anthropic", _fake_client(_FakeParsedMessage(expected_output, usage=_FakeUsage(123, 45)))
     )
 
-    output, usage = summarize.summarize_transcript(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
+    output, usage, points_truncated = summarize.summarize_transcript(
+        SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024
+    )
 
     assert output == expected_output
     assert usage.input_tokens == 123
     assert usage.output_tokens == 45
+    assert points_truncated is False
 
 
 def test_summarize_transcript_raises_on_invalid_points(monkeypatch):
-    """The model can return well-typed but out-of-range/out-of-order points
+    """The model can return a well-typed but out-of-range timestamp_seconds
     - Pydantic alone can't catch this, since it only validates int/str
     shape, not values against the actual transcript."""
     bad_output = summarize.ModelSummaryOutput(
-        subject="S",
+        video_type="Analytic Overview",
         summary="S.",
         points=[summarize.SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=9999)],
     )
@@ -323,7 +370,7 @@ def test_summarize_transcript_disables_the_sdks_own_internal_retries(monkeypatch
     captured = {}
     fake = _FakeParsedMessage(
         summarize.ModelSummaryOutput(
-            subject="S", summary="S.", points=[summarize.SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)]
+            video_type="Analytic Overview", summary="S.", points=[summarize.SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)]
         )
     )
     monkeypatch.setattr(summarize.anthropic, "Anthropic", _fake_client(fake, captured_init_kwargs=captured))
@@ -360,17 +407,27 @@ def test_summarize_transcript_raises_on_real_pydantic_validation_error(monkeypat
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"subject": "", "summary": "S.", "points": [{"importance": "major", "main_point": "P", "explanation": "E", "timestamp_seconds": 0}]},
-        {"subject": "S", "summary": "", "points": [{"importance": "major", "main_point": "P", "explanation": "E", "timestamp_seconds": 0}]},
-        {"subject": "S", "summary": "S.", "points": []},
+        {"video_type": "Not A Real Type", "summary": "S.", "points": [{"importance": "major", "main_point": "P", "explanation": "E", "timestamp_seconds": 0}]},
+        {"video_type": "Analytic Overview", "summary": "", "points": [{"importance": "major", "main_point": "P", "explanation": "E", "timestamp_seconds": 0}]},
+        {"video_type": "Analytic Overview", "summary": "S.", "points": []},
     ],
 )
-def test_model_summary_output_rejects_empty_content(kwargs):
-    """Regression test: an empty points list or blank subject/summary is
-    schema-valid by Pydantic's default rules despite the output contract
-    requiring actual timestamped insights."""
+def test_model_summary_output_rejects_empty_or_invalid_content(kwargs):
+    """Regression test: an empty points list, blank summary, or a
+    video_type outside the four allowed categories must be rejected -
+    an empty/mistyped response is otherwise schema-valid by Pydantic's
+    default rules despite the output contract requiring actual content."""
     with pytest.raises(summarize.pydantic.ValidationError):
         summarize.ModelSummaryOutput(**kwargs)
+
+
+def test_model_summary_output_accepts_each_valid_video_type():
+    for video_type in summarize.VIDEO_TYPES:
+        summarize.ModelSummaryOutput(
+            video_type=video_type,
+            summary="S.",
+            points=[summarize.SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)],
+        )  # should not raise
 
 
 @pytest.mark.parametrize("field_name", ["main_point", "explanation"])
