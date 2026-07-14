@@ -247,6 +247,60 @@ def test_build_proxy_config_unknown_type_raises(monkeypatch):
         youtube.build_proxy_config()
 
 
+def test_fetch_transcript_retries_transient_failure_before_succeeding(monkeypatch):
+    fake = _FakeTranscript([_FakeSnippet(0.0, "hi")])
+    outcomes = [youtube.requests.RequestException("blocked draw"), fake]
+    calls = []
+
+    def fake_api(**kwargs):
+        calls.append(None)
+        return _FakeApi(outcomes[len(calls) - 1])
+
+    monkeypatch.setattr(youtube, "YouTubeTranscriptApi", fake_api)
+    result = youtube.fetch_transcript("abc123XYZde", ["en"])
+
+    assert result.status == "ok"
+    assert len(calls) == 2
+
+
+def test_fetch_transcript_gives_up_after_max_attempts(monkeypatch):
+    monkeypatch.setattr(youtube.settings, "transcript_fetch_max_attempts", 3)
+    calls = []
+
+    def fake_api(**kwargs):
+        calls.append(None)
+        return _FakeApi(youtube.requests.RequestException("still blocked"))
+
+    monkeypatch.setattr(youtube, "YouTubeTranscriptApi", fake_api)
+    result = youtube.fetch_transcript("abc123XYZde", ["en"])
+
+    assert result.status == "blocked"
+    assert len(calls) == 3
+    assert "3 attempts" in result.message
+
+
+def test_fetch_transcript_each_retry_is_a_fresh_client_instance(monkeypatch):
+    """Regression test for the actual fix: a blocked draw must be retried
+    with a brand-new YouTubeTranscriptApi instance (a fresh connection, and
+    thus another independent draw from the rotating proxy pool) rather than
+    reusing the same client/session, which is what left the library's own
+    internal same-session retries unable to reliably rotate off a blocked IP."""
+    fake = _FakeTranscript([_FakeSnippet(0.0, "hi")])
+    outcomes = [youtube.requests.RequestException("blocked draw"), fake]
+    instances = []
+
+    def fake_api(**kwargs):
+        api = _FakeApi(outcomes[len(instances)])
+        instances.append(api)
+        return api
+
+    monkeypatch.setattr(youtube, "YouTubeTranscriptApi", fake_api)
+    youtube.fetch_transcript("abc123XYZde", ["en"])
+
+    assert len(instances) == 2
+    assert instances[0] is not instances[1]
+
+
 def test_fetch_transcript_passes_proxy_config_through(monkeypatch):
     _clear_proxy_settings(monkeypatch)
     monkeypatch.setattr(youtube.settings, "youtube_proxy_type", "generic")
