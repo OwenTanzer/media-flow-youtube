@@ -14,10 +14,10 @@ class _FakeCreds:
 
 
 @pytest.fixture(autouse=True)
-def _reset_cached_service(monkeypatch):
-    monkeypatch.setattr(drive, "_service", None)
+def _reset_cached_service():
+    drive._thread_local.service = None
     yield
-    monkeypatch.setattr(drive, "_service", None)
+    drive._thread_local.service = None
 
 
 def test_get_drive_service_builds_credentials_from_oauth_env(monkeypatch):
@@ -75,7 +75,7 @@ class _FakeExecutable:
     def __init__(self, result):
         self._result = result
 
-    def execute(self):
+    def execute(self, **kwargs):
         return self._result
 
 
@@ -180,7 +180,7 @@ def test_download_text_by_id_reads_file_content(monkeypatch):
             self._buffer = buffer
             self._request = request
 
-        def next_chunk(self):
+        def next_chunk(self, **kwargs):
             self._buffer.write(self._request)
             return None, True
 

@@ -22,8 +22,20 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 INDEX_FILENAME = "_index.json"
 
+# Applied only to read-only calls (list/get_media) below, via googleapiclient's
+# own built-in exponential-backoff retry - never to create/update/delete,
+# since a transient failure there leaves the client unsure whether the
+# write actually landed server-side before the retry fires.
+_READ_NUM_RETRIES = 3
+
 _lock = threading.RLock()
-_service = None
+# One Drive service (and its underlying httplib2.Http) per thread, not a
+# single shared global - httplib2's Http objects are explicitly documented
+# as not thread-safe (https://googleapis.github.io/google-api-python-client/docs/thread_safety.html),
+# and Streamlit runs each session's script on its own thread, so concurrent
+# sessions sharing one Http connection is the likely cause of the SSL
+# "unexpected eof"/broken-pipe failures seen in the dashboard's logs.
+_thread_local = threading.local()
 
 
 def _sanitize_filename(name: str, max_length: int = 120) -> str:
@@ -37,8 +49,8 @@ def transcript_filename(video_id: str, title: str) -> str:
 
 
 def get_drive_service():
-    global _service
-    if _service is None:
+    service = getattr(_thread_local, "service", None)
+    if service is None:
         oauth = settings.require_oauth_credentials()
         creds = Credentials(
             token=None,
@@ -51,8 +63,9 @@ def get_drive_service():
         # Refresh eagerly so a revoked/invalid refresh token fails fast here
         # instead of surfacing later as an opaque error on the first upload.
         creds.refresh(Request())
-        _service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    return _service
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        _thread_local.service = service
+    return service
 
 
 def _find_file(service, folder_id: str, filename: str) -> dict | None:
@@ -61,7 +74,7 @@ def _find_file(service, folder_id: str, filename: str) -> dict | None:
     results = (
         service.files()
         .list(q=query, spaces="drive", fields="files(id, name)", pageSize=1)
-        .execute()
+        .execute(num_retries=_READ_NUM_RETRIES)
     )
     files = results.get("files", [])
     return files[0] if files else None
@@ -88,7 +101,7 @@ def list_files(folder_id: str) -> dict[str, str]:
         results = (
             service.files()
             .list(q=query, spaces="drive", fields="nextPageToken, files(id, name)", pageSize=1000, pageToken=page_token)
-            .execute()
+            .execute(num_retries=_READ_NUM_RETRIES)
         )
         for f in results.get("files", []):
             files[f["name"]] = f["id"]
@@ -109,7 +122,7 @@ def download_text_by_id(file_id: str) -> str:
     downloader = MediaIoBaseDownload(buffer, request)
     done = False
     while not done:
-        _, done = downloader.next_chunk()
+        _, done = downloader.next_chunk(num_retries=_READ_NUM_RETRIES)
     return buffer.getvalue().decode("utf-8")
 
 
@@ -122,7 +135,11 @@ def list_file_ids(folder_id: str, filename: str) -> list[str]:
     service = get_drive_service()
     escaped = filename.replace("'", "\\'")
     query = f"name = '{escaped}' and '{folder_id}' in parents and trashed = false"
-    results = service.files().list(q=query, spaces="drive", fields="files(id, name)", pageSize=10).execute()
+    results = (
+        service.files()
+        .list(q=query, spaces="drive", fields="files(id, name)", pageSize=10)
+        .execute(num_retries=_READ_NUM_RETRIES)
+    )
     return [f["id"] for f in results.get("files", [])]
 
 
@@ -167,7 +184,7 @@ def download_text(folder_id: str, filename: str) -> str | None:
     downloader = MediaIoBaseDownload(buffer, request)
     done = False
     while not done:
-        _, done = downloader.next_chunk()
+        _, done = downloader.next_chunk(num_retries=_READ_NUM_RETRIES)
     return buffer.getvalue().decode("utf-8")
 
 
@@ -191,7 +208,11 @@ def get_or_create_folder(parent_folder_id: str, name: str) -> str:
         f"name = '{escaped}' and '{parent_folder_id}' in parents and trashed = false "
         "and mimeType = 'application/vnd.google-apps.folder'"
     )
-    results = service.files().list(q=query, spaces="drive", fields="files(id, name)", pageSize=1).execute()
+    results = (
+        service.files()
+        .list(q=query, spaces="drive", fields="files(id, name)", pageSize=1)
+        .execute(num_retries=_READ_NUM_RETRIES)
+    )
     files = results.get("files", [])
     if files:
         return files[0]["id"]
