@@ -88,6 +88,18 @@ def _record_index_entry(
         return result
 
     try:
+        if published_at is None:
+            # update_index_entry() replaces the whole stored entry, not just
+            # the fields we're setting here - a direct/manual reprocess
+            # (e.g. via /transcripts or /batch/run with an explicit URL, or
+            # a queue entry with no known publish date) has no source of
+            # its own for this, so without this fallback it would silently
+            # erase a publish date recorded by an earlier, RSS-discovered
+            # run of the same video.
+            existing_entry = drive.read_index(folder_id).get(video_id)
+            if existing_entry:
+                published_at = existing_entry.get("published_at")
+
         drive.update_index_entry(
             folder_id,
             video_id,
