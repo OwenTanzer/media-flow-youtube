@@ -87,6 +87,42 @@ _SOURCE_TIMESTAMP_RE = re.compile(r"^\[?(?:(\d+):)?(\d{1,2}):(\d{2})\]?$")
 # unrelated content elsewhere in the transcript.
 _ANCHOR_WINDOW_LINES = 2
 
+# Fraction of source_anchor's significant words that must appear in the
+# cited window for the anchor to count as grounded. Not a stricter exact-
+# substring match: live testing showed the model reliably finds the right
+# real transcript line (source_timestamp was correct 16/16 times) but
+# routinely cleans up raw, informal ASR captions into a grammatical
+# paraphrase when asked to "copy verbatim" - so a byte-exact substring
+# requirement rejected genuinely well-grounded citations, not just
+# hallucinated ones. Word overlap tolerates that paraphrasing while still
+# catching an anchor that describes unrelated content.
+#
+# 0.4 was the initial guess; a live A/B re-test against it showed several
+# genuinely well-grounded paraphrases clustered at 29-36% overlap - just
+# under the cutoff - while citations describing clearly unrelated content
+# scored far lower (0-12%). 0.25 was chosen empirically from that gap: it
+# recovers the near-miss cluster without accepting the low-overlap ones,
+# which stay rejected (and simply get retried on a later run) rather than
+# being waved through on a guess.
+_ANCHOR_WORD_OVERLAP_THRESHOLD = 0.25
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+_STOPWORDS = frozenset(
+    """
+    a an the and or but is are was were be been being to of in on for with
+    that this these those it its as at by from up down out over under
+    again then once here there when where why how all any both each few
+    more most other some such no nor not only own same so than too very
+    can will just should now we you he she they i them their what which
+    who whom
+    """.split()
+)
+
+
+def _significant_words(text: str) -> set[str]:
+    return {w for w in _WORD_RE.findall(text.lower()) if w not in _STOPWORDS}
+
 # From the Claude API pricing table, USD per million tokens (input, output).
 # Unrecognized models return None from estimate_cost_usd() rather than
 # guessing - app/config.py requires SUMMARY_MODEL to have an entry here so
@@ -341,10 +377,12 @@ def _resolve_points(points: list[SummaryPoint], transcript_body: str) -> list[Re
       - that exact value isn't one of the transcript's own real line
         timestamps (strict equality, not "in range" - the model must cite
         a real line, not merely land on a plausible-sounding number); or
-      - source_anchor doesn't appear (case/whitespace-insensitive) within
-        _ANCHOR_WINDOW_LINES lines of that timestamp, which allows a
-        little slack for an excerpt that straddles a line break without
-        permitting a citation for unrelated transcript content.
+      - fewer than _ANCHOR_WORD_OVERLAP_THRESHOLD of source_anchor's
+        significant (non-stopword) words appear within _ANCHOR_WINDOW_LINES
+        lines of that timestamp - a fuzzy check, not exact-substring
+        containment, since the model reliably finds the right real line but
+        doesn't reliably reproduce raw ASR caption text byte-for-byte even
+        when told to; see _ANCHOR_WORD_OVERLAP_THRESHOLD's own comment.
 
     Points are deliberately *not* required to be in chronological order:
     real videos (livestreams especially) revisit the same topic more than
@@ -375,13 +413,15 @@ def _resolve_points(points: list[SummaryPoint], transcript_body: str) -> list[Re
 
         window_start = max(0, line_index - _ANCHOR_WINDOW_LINES)
         window_end = min(len(indexed), line_index + _ANCHOR_WINDOW_LINES + 1)
-        window_text = " ".join(text for _, text in indexed[window_start:window_end]).lower()
-        anchor = " ".join(point.source_anchor.split()).lower()
-        if anchor not in window_text:
+        window_text = " ".join(text for _, text in indexed[window_start:window_end])
+        anchor_words = _significant_words(point.source_anchor)
+        window_words = _significant_words(window_text)
+        overlap = len(anchor_words & window_words) / len(anchor_words) if anchor_words else 0.0
+        if overlap < _ANCHOR_WORD_OVERLAP_THRESHOLD:
             raise ValueError(
-                f"source_anchor {point.source_anchor!r} was not found within "
-                f"{_ANCHOR_WINDOW_LINES} line(s) of {point.source_timestamp!r} for point "
-                f"{point.main_point!r}."
+                f"source_anchor {point.source_anchor!r} has only {overlap:.0%} word overlap with "
+                f"content within {_ANCHOR_WINDOW_LINES} line(s) of {point.source_timestamp!r} "
+                f"(need >= {_ANCHOR_WORD_OVERLAP_THRESHOLD:.0%}) for point {point.main_point!r}."
             )
 
         resolved.append(

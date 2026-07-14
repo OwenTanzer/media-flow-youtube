@@ -35,8 +35,8 @@ SAMPLE_BODY = "[00:00] hello\n[00:05] world\n"
 # couple lines away (within the window)", and "anchor nowhere nearby".
 RICH_BODY = (
     "[00:00] Welcome back to the show everyone.\n"
-    "[00:10] Palantir is testing resistance near 40 dollars today.\n"
-    "[00:20] Traders are watching the 40 dollar level closely.\n"
+    "[00:10] Palantir is testing resistance near 40 dollars currently.\n"
+    "[00:20] Traders are eyeing the 40 dollar level closely.\n"
     "[00:30] Meanwhile crude oil slipped below 70 dollars a barrel.\n"
     "[00:40] That's it for today, thanks for watching.\n"
 )
@@ -181,7 +181,7 @@ def test_max_transcript_seconds_finds_the_last_timestamp():
 def test_index_transcript_lines_returns_seconds_and_text_in_order():
     indexed = summarize._index_transcript_lines(RICH_BODY)
     assert [seconds for seconds, _ in indexed] == [0, 10, 20, 30, 40]
-    assert indexed[1][1] == "Palantir is testing resistance near 40 dollars today."
+    assert indexed[1][1] == "Palantir is testing resistance near 40 dollars currently."
 
 
 @pytest.mark.parametrize(
@@ -219,10 +219,37 @@ def test_resolve_points_accepts_anchor_within_the_window_but_not_on_the_exact_li
     assert resolved[0].timestamp_seconds == 10
 
 
+def test_resolve_points_accepts_a_paraphrased_anchor_with_enough_word_overlap():
+    """Regression test: live A/B testing showed the model reliably finds
+    the right real transcript line (source_timestamp correct 16/16 times)
+    but routinely cleans up raw ASR captions into a grammatical paraphrase
+    rather than quoting byte-for-byte, even when told not to - a strict
+    substring requirement rejected these as ungrounded even though the
+    citation was genuinely correct. Word-overlap tolerates this."""
+    points = [_point(source_timestamp="[00:10]", source_anchor="Palantir is testing the 40 dollar resistance level")]
+    resolved = summarize._resolve_points(points, RICH_BODY)
+    assert resolved[0].timestamp_seconds == 10
+
+
 def test_resolve_points_rejects_anchor_outside_the_window():
-    # [00:00] and [00:40] are 4 lines apart - outside the +-2 line window.
+    # "thanks"/"watching" only occur on [00:40], 4 lines from the cited
+    # [00:00] - outside the +-2 line window, and not incidentally present
+    # in any line within it.
     points = [_point(source_timestamp="[00:00]", source_anchor="thanks for watching")]
-    with pytest.raises(ValueError, match="was not found within"):
+    with pytest.raises(ValueError, match="word overlap"):
+        summarize._resolve_points(points, RICH_BODY)
+
+
+def test_resolve_points_rejects_an_anchor_describing_unrelated_content_in_range():
+    """A citation that lands on a real timestamp but describes content
+    from elsewhere must still be rejected - word overlap catches this the
+    same way exact-substring matching did, it just tolerates paraphrase of
+    the *correct* content rather than accepting *any* content nearby.
+    [00:40]'s content ("thanks for watching") falls outside [00:10]'s
+    +-2 line window, so citing [00:10] with that content is exactly this
+    case - a real timestamp, but the wrong one for this evidence."""
+    points = [_point(source_timestamp="[00:10]", source_anchor="thanks for watching")]
+    with pytest.raises(ValueError, match="word overlap"):
         summarize._resolve_points(points, RICH_BODY)
 
 
@@ -249,7 +276,26 @@ def test_resolve_points_rejects_a_timestamp_that_is_not_a_real_transcript_line()
 
 def test_resolve_points_rejects_anchor_text_that_does_not_appear_at_all():
     points = [_point(source_timestamp="[00:05]", source_anchor="something never said")]
-    with pytest.raises(ValueError, match="was not found within"):
+    with pytest.raises(ValueError, match="word overlap"):
+        summarize._resolve_points(points, SAMPLE_BODY)
+
+
+def test_significant_words_strips_stopwords_and_punctuation():
+    assert summarize._significant_words("The quick brown fox, and the lazy dog!") == {
+        "quick",
+        "brown",
+        "fox",
+        "lazy",
+        "dog",
+    }
+
+
+def test_resolve_points_rejects_anchor_with_only_stopwords():
+    """An anchor with no significant words at all (e.g. just filler) can
+    never be considered grounded - dividing by zero significant words
+    must not be treated as 100% overlap."""
+    points = [_point(source_timestamp="[00:05]", source_anchor="the a an")]
+    with pytest.raises(ValueError, match="word overlap"):
         summarize._resolve_points(points, SAMPLE_BODY)
 
 
