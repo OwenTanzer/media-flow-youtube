@@ -68,8 +68,8 @@ def test_main_passes_a_lock_renewing_callback_to_run_batch(monkeypatch):
     captured = {}
 
     def _fake_run_batch(**kwargs):
-        captured["on_chunk_done"] = kwargs["on_chunk_done"]
-        captured["on_chunk_done"]()  # simulate batch.py invoking it after a chunk
+        captured["on_progress"] = kwargs["on_progress"]
+        captured["on_progress"]()  # simulate batch.py invoking it after a chunk
         return []
 
     monkeypatch.setattr(discover_and_process, "run_batch", _fake_run_batch)
@@ -93,7 +93,7 @@ def test_main_aborts_if_lock_renewal_fails_mid_run(monkeypatch):
     )
 
     def _fake_run_batch(**kwargs):
-        kwargs["on_chunk_done"]()  # renewal fails - should raise and stop the run
+        kwargs["on_progress"]()  # renewal fails - should raise and stop the run
         return []
 
     monkeypatch.setattr(discover_and_process, "run_batch", _fake_run_batch)

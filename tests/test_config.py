@@ -77,3 +77,14 @@ def test_batch_cooldown_seconds_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("BATCH_COOLDOWN_SECONDS", value)
     with pytest.raises(ConfigError, match="BATCH_COOLDOWN_SECONDS"):
         _settings_with(monkeypatch)
+
+
+def test_no_captions_grace_hours_defaults_to_24(monkeypatch):
+    assert _settings_with(monkeypatch).no_captions_grace_hours == 24
+
+
+@pytest.mark.parametrize("value", ["-1", "-0.5", "nan", "inf"])
+def test_no_captions_grace_hours_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("NO_CAPTIONS_GRACE_HOURS", value)
+    with pytest.raises(ConfigError, match="NO_CAPTIONS_GRACE_HOURS"):
+        _settings_with(monkeypatch)

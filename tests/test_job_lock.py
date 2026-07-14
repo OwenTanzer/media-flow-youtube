@@ -240,7 +240,30 @@ def test_renew_lock_fails_when_lock_file_is_gone(monkeypatch):
     monkeypatch.setattr(job_lock.drive, "upload_text_file", lambda *a, **k: write_calls.append(1))
 
     assert job_lock.renew_lock("folder-id", "my-token") is False
-    assert not write_calls
+
+
+def test_renew_lock_detects_a_takeover_between_check_and_write(monkeypatch):
+    """Regression test for the review finding: renew_lock() checked
+    ownership before writing but never re-verified afterward, so a
+    takeover landing in that exact gap would let it incorrectly report
+    success. Re-read after writing (same pattern as acquire_lock()) so
+    this case is at least detected, even though the write itself briefly
+    clobbered the new owner's lease."""
+    _set_real_drive(monkeypatch)
+    calls = {"n": 0}
+
+    def _download(folder_id, filename):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Pre-write check: still ours.
+            return json.dumps({"acquired_at": datetime.now(timezone.utc).isoformat(), "token": "my-token"})
+        # Post-write confirmation: someone else took over in between.
+        return json.dumps({"acquired_at": datetime.now(timezone.utc).isoformat(), "token": "new-owners-token"})
+
+    monkeypatch.setattr(job_lock.drive, "download_text", _download)
+    monkeypatch.setattr(job_lock.drive, "upload_text_file", lambda *a, **k: None)
+
+    assert job_lock.renew_lock("folder-id", "my-token") is False
 
 
 def test_renew_lock_is_a_noop_in_dry_run(monkeypatch):

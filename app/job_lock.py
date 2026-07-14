@@ -110,7 +110,14 @@ def renew_lock(folder_id: str, token: str) -> bool:
     Returns False without writing anything if the lock no longer belongs
     to this token (lost to a concurrent run, or deleted unexpectedly) -
     callers should treat that as a signal to stop, not keep going as if
-    still holding the lock."""
+    still holding the lock.
+
+    Like acquire_lock(), the check-then-write here isn't atomic: a
+    takeover can still land in the gap between the ownership check and
+    the write. Re-reads after writing (same as acquire_lock()) so that
+    race is at least detected - a takeover in that exact window makes this
+    call correctly return False rather than incorrectly reporting success,
+    even though the write briefly clobbered the new owner's lease."""
 
     if settings.dry_run:
         return True
@@ -128,6 +135,16 @@ def renew_lock(folder_id: str, token: str) -> bool:
 
     payload = json.dumps({"acquired_at": datetime.now(timezone.utc).isoformat(), "token": token})
     drive.upload_text_file(folder_id, LOCK_FILENAME, payload, mime_type="application/json")
+
+    _, confirmed_token = _read_lock(folder_id)
+    if confirmed_token != token:
+        logger.error(
+            "Lost the lock in folder %s to a concurrent run immediately after renewing - a takeover "
+            "landed between the ownership check and the write.",
+            folder_id,
+        )
+        return False
+
     return True
 
 

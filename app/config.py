@@ -42,6 +42,8 @@ class Settings:
 
         self.discovery_lock_ttl_seconds: int = int(_env("DISCOVERY_LOCK_TTL_SECONDS", "1800"))
         self.no_captions_grace_hours: float = float(_env("NO_CAPTIONS_GRACE_HOURS", "24"))
+        if self.no_captions_grace_hours < 0 or not math.isfinite(self.no_captions_grace_hours):
+            raise ConfigError(f"NO_CAPTIONS_GRACE_HOURS must be a non-negative, finite number of hours, got {self.no_captions_grace_hours}.")
 
         self.batch_size_threshold: int = int(_env("BATCH_SIZE_THRESHOLD", "10"))
         if self.batch_size_threshold < 1:

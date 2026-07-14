@@ -214,7 +214,13 @@ def test_run_batch_checkpoints_queue_after_every_chunk(monkeypatch):
     assert checkpoints == [["b", "c", "d", "e"], ["b", "d", "e"], ["b", "d"]]
 
 
-def test_run_batch_calls_on_chunk_done_once_per_chunk(monkeypatch):
+def test_run_batch_renews_after_every_entry_and_before_each_checkpoint(monkeypatch):
+    """Regression test for the review finding: renewing only once per
+    chunk (rather than once per entry) leaves a window where a slow chunk
+    goes stale and gets taken over before the run notices, since a single
+    entry's own internal retries can themselves run for minutes. Renew
+    after every entry, and once more immediately before each checkpoint
+    write (the point of the dangerous write)."""
     monkeypatch.setattr(batch.settings, "batch_size_threshold", 2)
     monkeypatch.setattr(batch.settings, "batch_cooldown_seconds", 300)
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: ["a", "b", "c", "d", "e"])
@@ -223,18 +229,33 @@ def test_run_batch_calls_on_chunk_done_once_per_chunk(monkeypatch):
     monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
 
     calls = []
-    batch.run_batch(on_chunk_done=lambda: calls.append(1))
+    batch.run_batch(on_progress=lambda: calls.append(1))
 
-    assert len(calls) == 3  # 3 chunks: [a,b] [c,d] [e]
+    # 3 chunks of [a,b] [c,d] [e]: one call per entry (5) + one more right
+    # before each of the 3 checkpoint writes = 8.
+    assert len(calls) == 8
 
 
-def test_run_batch_does_not_call_on_chunk_done_when_unpaced(monkeypatch):
+def test_run_batch_calls_on_progress_in_the_unpaced_path_too(monkeypatch):
+    """The unpaced path (queue at or below the threshold) still calls
+    on_progress after the entry and before the final write - a single slow
+    entry can still eat meaningfully into the lock's TTL even without
+    chunking, so discover_and_process.py should get a chance to renew."""
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: ["a"])
     monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: None)
     monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
 
     calls = []
-    batch.run_batch(on_chunk_done=lambda: calls.append(1))
+    batch.run_batch(on_progress=lambda: calls.append(1))
+
+    assert len(calls) == 2  # once after the entry, once before the final write
+
+
+def test_run_batch_does_not_call_on_progress_for_explicit_url_lists(monkeypatch):
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
+
+    calls = []
+    batch.run_batch(urls=["a", "b"], on_progress=lambda: calls.append(1))
 
     assert calls == []
 

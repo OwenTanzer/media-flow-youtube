@@ -41,13 +41,18 @@ def _chunk(items: list, size: int) -> list[list]:
 def run_batch(
     urls: list[str] | None = None,
     languages: list[str] | None = None,
-    on_chunk_done: Callable[[], None] | None = None,
+    on_progress: Callable[[], None] | None = None,
 ) -> list[VideoResult]:
-    """on_chunk_done is called after each paced chunk finishes (queue path
-    only - see below). discover_and_process.py uses it to renew its Drive
-    lock lease, since a large queue's total pacing time can otherwise
-    comfortably exceed the lock's TTL and let a second invocation take
-    over mid-run."""
+    """on_progress is called after every entry is processed, and again
+    immediately before each Drive checkpoint write (queue path only - see
+    below). discover_and_process.py uses it to renew its Drive lock lease,
+    since even a single entry's own internal retries can run for minutes,
+    and a run's total pacing/processing time can comfortably exceed the
+    lock's TTL. Renewing only once per chunk would leave a window where a
+    slow chunk goes stale and gets taken over before the run notices -
+    renewing after every entry (rather than every chunk) keeps that window
+    tight, though it can't be closed to zero when a single request itself
+    runs long."""
 
     folder_id = settings.require_drive_folder_id()
     use_queue = urls is None
@@ -80,6 +85,9 @@ def run_batch(
             # its no-captions grace period) - keep it in the queue for next
             # run, preserving the original str/dict shape so overrides survive.
             remaining.append(entry)
+
+        if on_progress is not None:
+            on_progress()
 
     # A long, continuous run of requests through the rotating proxy pool
     # measurably degrades its success rate (observed empirically - see the
@@ -116,11 +124,10 @@ def run_batch(
             # otherwise a restart would reprocess everything from scratch,
             # including videos that already succeeded this run, right back
             # into the same proxy pressure this batching exists to relieve.
+            if on_progress is not None:
+                on_progress()
             untouched_tail = [e for later_chunk in chunks[i + 1 :] for e in later_chunk]
             queue_store.write_queue(folder_id, remaining + untouched_tail)
-
-            if on_chunk_done is not None:
-                on_chunk_done()
 
         return results
 
@@ -128,6 +135,8 @@ def run_batch(
         _process_one(entry)
 
     if use_queue:
+        if on_progress is not None:
+            on_progress()
         queue_store.write_queue(folder_id, remaining)
 
     return results
