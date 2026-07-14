@@ -59,10 +59,11 @@ def _stub_drive(monkeypatch, *, index, feed_map, existing_summaries=None):
     monkeypatch.setattr(backfill, "build_channel_id_map", lambda folder_id: feed_map)
     monkeypatch.setattr(backfill.drive, "read_index", lambda folder_id: index)
 
-    index_writes = {}
-    monkeypatch.setattr(
-        backfill.drive, "update_index_entry", lambda folder_id, video_id, entry: index_writes.setdefault(video_id, entry)
-    )
+    # write_index() is now called at most once, with the whole (in-place
+    # mutated) index - not once per updated video_id like the old
+    # update_index_entry() calls this replaced.
+    index_writes = []
+    monkeypatch.setattr(backfill.drive, "write_index", lambda folder_id, written: index_writes.append(written))
 
     existing_summaries = dict(existing_summaries or {})
     monkeypatch.setattr(backfill.summary_store, "read_summary", lambda folder_id, video_id: existing_summaries.get(video_id))
@@ -81,7 +82,7 @@ def test_main_backfills_a_video_found_in_the_feed(monkeypatch):
     exit_code = backfill.main()
 
     assert exit_code == 0
-    assert index_writes["vid1"]["channel_id"] == "UC_a"
+    assert index_writes[0]["vid1"]["channel_id"] == "UC_a"
 
 
 def test_main_leaves_a_video_untouched_when_not_found_in_any_feed(monkeypatch):
@@ -90,7 +91,7 @@ def test_main_leaves_a_video_untouched_when_not_found_in_any_feed(monkeypatch):
 
     backfill.main()
 
-    assert index_writes == {}
+    assert index_writes == []
 
 
 def test_main_does_not_overwrite_an_existing_channel_id(monkeypatch):
@@ -106,7 +107,7 @@ def test_main_does_not_overwrite_an_existing_channel_id(monkeypatch):
 
     backfill.main()
 
-    assert index_writes == {}
+    assert index_writes == []
 
 
 def test_main_ignores_non_ok_index_entries(monkeypatch):
@@ -115,7 +116,7 @@ def test_main_ignores_non_ok_index_entries(monkeypatch):
 
     backfill.main()
 
-    assert index_writes == {}
+    assert index_writes == []
 
 
 def test_main_updates_an_existing_summary_artifact_too(monkeypatch):

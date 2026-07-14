@@ -93,10 +93,12 @@ def main() -> int:
             continue
 
         entry["channel_id"] = channel_id
-        drive.update_index_entry(folder_id, video_id, entry)
         _patch_summary_artifact(folder_id, video_id, channel_id)
 
         updated += 1
+
+    if updated:
+        drive.write_index(folder_id, index)
 
     logger.info(
         "Backfill complete: %d updated, %d already had a channel_id, %d not found in any "
