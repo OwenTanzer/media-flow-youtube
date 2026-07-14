@@ -80,7 +80,15 @@ def read_summaries_bulk(folder_id: str, video_ids: list[str]) -> dict[str, dict]
     than a handful of videos.
 
     video_ids with no summary file yet are simply absent from the
-    returned dict, same as read_summary() returning None for them."""
+    returned dict, same as read_summary() returning None for them.
+
+    A download failure (network error, Drive 5xx, etc. - already retried
+    internally by drive.download_text_by_id()) is isolated to that one
+    video_id and logged, not allowed to escape and cost every
+    already-downloaded artifact in this same call: a single sick artifact
+    must not blank out the whole dashboard. Only the one-time folder
+    resolution and listing above are allowed to raise - if those fail,
+    nothing in this call could have succeeded anyway."""
 
     if settings.dry_run:
         return {}
@@ -93,7 +101,11 @@ def read_summaries_bulk(folder_id: str, video_ids: list[str]) -> dict[str, dict]
         file_id = files_by_name.get(_summary_filename(video_id))
         if file_id is None:
             continue
-        text = drive.download_text_by_id(file_id)
+        try:
+            text = drive.download_text_by_id(file_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to download summary artifact for %s; skipping for this load.", video_id, exc_info=True)
+            continue
         try:
             artifacts[video_id] = json.loads(text)
         except json.JSONDecodeError:

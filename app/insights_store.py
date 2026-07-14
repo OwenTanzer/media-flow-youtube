@@ -79,9 +79,15 @@ def _parse_iso(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        # A timezone-less artifact timestamp would otherwise crash
+        # feed_sort_key()'s aware-datetime comparisons in vidproc/state.py -
+        # assume UTC, same as queue_store's equivalent normalization.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _parse_point(raw: object) -> InsightPoint | None:
@@ -170,12 +176,12 @@ def load_snapshot(folder_id: str) -> InsightsSnapshot:
     index = drive.read_index(folder_id)
     ok_entries = [video_id for video_id, entry in index.items() if entry.get("status") == "ok"]
 
-    try:
-        artifacts = summary_store.read_summaries_bulk(folder_id, ok_entries)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to bulk-read summary artifacts: %s", exc)
-        load_errors.append("Summary artifacts could not be read.")
-        artifacts = {}
+    # Per-video download failures are already isolated inside
+    # read_summaries_bulk() - what can still raise here is the one-time
+    # folder resolution/listing, a genuinely broken-Drive-access case this
+    # function deliberately lets propagate (see docstring above) rather
+    # than silently discarding every artifact already fetched this call.
+    artifacts = summary_store.read_summaries_bulk(folder_id, ok_entries)
 
     videos: list[VideoInsight] = []
     pending_count = 0

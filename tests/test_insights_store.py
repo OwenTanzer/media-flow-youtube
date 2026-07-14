@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from app import insights_store
 from app.channel_store import Channel
 
@@ -138,6 +140,24 @@ def test_load_snapshot_missing_channels_json_yields_empty_list_not_a_crash(monke
 
     assert snapshot.channels == []
     assert snapshot.load_errors == ["Channel registry (channels.json) could not be read."]
+
+
+def test_load_snapshot_propagates_a_genuine_summary_read_failure(monkeypatch):
+    """Regression test: a broken-Drive-access failure (folder resolution/
+    listing, not a single video's download - see read_summaries_bulk())
+    must propagate to the caller (the Streamlit app's public failure
+    boundary), not be silently swallowed into a misleading all-pending
+    snapshot."""
+    monkeypatch.setattr(insights_store.channel_store, "read_channels", lambda folder_id: [])
+    monkeypatch.setattr(insights_store.drive, "read_index", lambda folder_id: {"vid1": {"status": "ok"}})
+
+    def _raise(folder_id, video_ids):
+        raise ConnectionError("boom")
+
+    monkeypatch.setattr(insights_store.summary_store, "read_summaries_bulk", _raise)
+
+    with pytest.raises(ConnectionError):
+        insights_store.load_snapshot("folder-id")
 
 
 def test_load_snapshot_excludes_never_summarized_video_and_counts_it_pending(monkeypatch):

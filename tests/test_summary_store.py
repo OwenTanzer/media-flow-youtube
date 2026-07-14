@@ -168,6 +168,30 @@ def test_read_summaries_bulk_lists_folder_once_and_downloads_by_id(monkeypatch):
     assert result == {"vid1": {"status": "ok", "video_id": "vid1"}, "vid2": {"status": "ok", "video_id": "vid2"}}
 
 
+def test_read_summaries_bulk_isolates_a_single_download_failure(monkeypatch):
+    """Regression test: one video's download raising (network error, Drive
+    5xx, etc.) must not discard artifacts already downloaded successfully
+    for the other videos in the same call."""
+    monkeypatch.setattr(summary_store.settings, "dry_run", False)
+    monkeypatch.setattr(summary_store.drive, "get_or_create_folder", lambda parent, name: "summaries-folder-id")
+    monkeypatch.setattr(
+        summary_store.drive,
+        "list_files",
+        lambda folder_id: {"vid1.json": "file-1", "vid2.json": "file-2"},
+    )
+
+    def _download_text_by_id(file_id):
+        if file_id == "file-1":
+            raise ConnectionError("broken pipe")
+        return json.dumps({"status": "ok", "video_id": "vid2"})
+
+    monkeypatch.setattr(summary_store.drive, "download_text_by_id", _download_text_by_id)
+
+    result = summary_store.read_summaries_bulk("folder-id", ["vid1", "vid2"])
+
+    assert result == {"vid2": {"status": "ok", "video_id": "vid2"}}
+
+
 def test_read_summaries_bulk_skips_invalid_json(monkeypatch):
     monkeypatch.setattr(summary_store.settings, "dry_run", False)
     monkeypatch.setattr(summary_store.drive, "get_or_create_folder", lambda parent, name: "summaries-folder-id")
