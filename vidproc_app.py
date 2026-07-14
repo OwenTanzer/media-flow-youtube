@@ -23,6 +23,7 @@ import streamlit as st
 
 from app.config import ConfigError, settings
 from app.insights_store import InsightsSnapshot, load_snapshot
+from vidproc.admin import ChannelAlreadyExistsError, add_channel_and_backfill, check_admin_token
 from vidproc.render import render_detail, render_empty_state, render_feed_card, render_notice
 from vidproc.state import (
     channel_filter_options,
@@ -88,6 +89,10 @@ def _init_session_state() -> None:
     # its own scope.
     st.session_state.setdefault("selected_video_id_by_group", {})  # group -> video_id
     st.session_state.setdefault("show_minor_points", True)
+    # Resets on every new Streamlit session (e.g. a hard page reload opens
+    # a fresh session) - there's no persistent auth token/cookie, so the
+    # admin token must be re-entered each session. See vidproc/admin.py.
+    st.session_state.setdefault("admin_authenticated", False)
 
 
 def render_header(snapshot: InsightsSnapshot) -> None:
@@ -168,6 +173,60 @@ def render_group(group: str, snapshot: InsightsSnapshot) -> None:
             st.rerun()
 
 
+def render_admin_panel(folder_id: str) -> None:
+    """Password(-token)-gated panel for adding a channel without editing
+    channels.json directly in Drive. Only reachable at all if
+    VIDPROC_ADMIN_TOKEN is configured - see main()'s tab list below and
+    app/config.py."""
+
+    if not st.session_state.admin_authenticated:
+        st.markdown(
+            "<div class='vidproc-meta-text'>Enter the admin token to manage channels.</div>",
+            unsafe_allow_html=True,
+        )
+        token_input = st.text_input("Admin token", type="password", key="admin-token-input")
+        if st.button("Unlock", key="admin-unlock"):
+            if check_admin_token(token_input, settings.vidproc_admin_token):
+                st.session_state.admin_authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect token.")
+        return
+
+    if st.button("Lock", key="admin-lock"):
+        st.session_state.admin_authenticated = False
+        st.rerun()
+
+    st.markdown("<div class='vidproc-meta-text'>Add a channel</div>", unsafe_allow_html=True)
+    channel_id = st.text_input("Channel ID (UC...)", key="admin-channel-id")
+    name = st.text_input("Display name", key="admin-channel-name")
+    enabled = st.checkbox("Enabled", value=True, key="admin-channel-enabled")
+    group = st.text_input("Group (optional)", key="admin-channel-group")
+    languages_raw = st.text_input("Languages, comma-separated (optional)", key="admin-channel-languages")
+
+    if st.button("Add channel", key="admin-add-channel"):
+        languages = languages_raw.split(",") if languages_raw.strip() else None
+        try:
+            report = add_channel_and_backfill(
+                folder_id,
+                channel_id=channel_id,
+                name=name,
+                enabled=enabled,
+                group=group,
+                languages=languages,
+            )
+        except (ChannelAlreadyExistsError, ValueError) as exc:
+            st.error(str(exc))
+        except Exception:  # noqa: BLE001
+            # Same public-boundary principle as main()'s snapshot load below -
+            # log the real exception server-side, show only a generic message.
+            logger.exception("Failed to add channel via admin panel")
+            st.error("Something went wrong adding the channel - check the server logs.")
+        else:
+            st.success(f"Channel added - {report.discovered_total} video(s) seen, {report.newly_queued} newly queued.")
+            _load_snapshot_cached.clear()
+
+
 def main() -> None:
     try:
         folder_id = settings.require_drive_folder_id()
@@ -196,10 +255,14 @@ def main() -> None:
     render_header(snapshot)
 
     groups = groups_for_channels(snapshot.channels)
-    tabs = st.tabs(groups)
+    show_admin = bool(settings.vidproc_admin_token)
+    tabs = st.tabs([*groups, "Admin"] if show_admin else groups)
     for tab, group in zip(tabs, groups):
         with tab:
             render_group(group, snapshot)
+    if show_admin:
+        with tabs[-1]:
+            render_admin_panel(folder_id)
 
 
 if __name__ == "__main__":

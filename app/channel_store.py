@@ -31,6 +31,27 @@ class Channel:
     group: str | None = None
 
 
+def _channel_to_dict(channel: Channel) -> dict:
+    entry: dict = {"channel_id": channel.channel_id, "name": channel.name, "enabled": channel.enabled}
+    if channel.languages:
+        entry["languages"] = channel.languages
+    if channel.group:
+        entry["group"] = channel.group
+    return entry
+
+
+def write_channels(folder_id: str, channels: list[Channel]) -> None:
+    """Overwrites channels.json with exactly this list, in the same
+    {"version": 1, "channels": [...]} shape read_channels() parses.
+    Unlocked read-modify-write, same as every other Drive-backed store in
+    this app (queue_store, summary_store) - channels.json changes rarely
+    enough that this hasn't needed the same advisory-lock treatment as
+    the high-frequency discovery/batch writers."""
+
+    payload = json.dumps({"version": 1, "channels": [_channel_to_dict(c) for c in channels]}, indent=2)
+    drive.upload_text_file(folder_id, CHANNELS_FILENAME, payload, mime_type="application/json")
+
+
 def read_channels(folder_id: str) -> list[Channel]:
     if settings.dry_run:
         return []
