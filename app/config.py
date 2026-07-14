@@ -53,13 +53,19 @@ class Settings:
                 "processing nothing and overwriting queue.json with an empty list."
             )
 
-        self.batch_cooldown_seconds: float = float(_env("BATCH_COOLDOWN_SECONDS", "300"))
+        self.batch_cooldown_seconds: float = float(_env("BATCH_COOLDOWN_SECONDS", "0"))
         if self.batch_cooldown_seconds < 0 or not math.isfinite(self.batch_cooldown_seconds):
             raise ConfigError(f"BATCH_COOLDOWN_SECONDS must be a non-negative, finite number of seconds, got {self.batch_cooldown_seconds}.")
 
         self.oauth_client_id: str | None = _env("GOOGLE_OAUTH_CLIENT_ID")
         self.oauth_client_secret: str | None = _env("GOOGLE_OAUTH_CLIENT_SECRET")
         self.oauth_refresh_token: str | None = _env("GOOGLE_OAUTH_REFRESH_TOKEN")
+
+        self.transcript_fetch_max_attempts: int = int(_env("TRANSCRIPT_FETCH_MAX_ATTEMPTS", "3"))
+        if self.transcript_fetch_max_attempts < 1:
+            raise ConfigError(
+                f"TRANSCRIPT_FETCH_MAX_ATTEMPTS must be a positive integer, got {self.transcript_fetch_max_attempts}."
+            )
 
         self.youtube_proxy_type: str | None = _env("YOUTUBE_PROXY_TYPE")
         self.webshare_proxy_username: str | None = _env("WEBSHARE_PROXY_USERNAME")

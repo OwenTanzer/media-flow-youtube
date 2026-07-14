@@ -207,6 +207,11 @@ def test_build_proxy_config_webshare(monkeypatch):
     assert isinstance(config, youtube.WebshareProxyConfig)
     assert config.proxy_username == "wsuser"
     assert config.proxy_password == "wspass"
+    # fetch_transcript() is the single retry authority now (a fresh client
+    # instance per attempt) - the library's own internal same-session
+    # retries-when-blocked must be disabled, or TRANSCRIPT_FETCH_MAX_ATTEMPTS
+    # attempts could each fan out into up to 10 more requests internally.
+    assert config.retries_when_blocked == 0
 
 
 def test_build_proxy_config_webshare_missing_credentials_raises(monkeypatch):
@@ -245,6 +250,83 @@ def test_build_proxy_config_unknown_type_raises(monkeypatch):
 
     with pytest.raises(youtube.ConfigError, match="socks5-magic"):
         youtube.build_proxy_config()
+
+
+def test_fetch_transcript_retries_transient_failure_before_succeeding(monkeypatch):
+    fake = _FakeTranscript([_FakeSnippet(0.0, "hi")])
+    outcomes = [youtube.requests.RequestException("blocked draw"), fake]
+    calls = []
+
+    def fake_api(**kwargs):
+        calls.append(None)
+        return _FakeApi(outcomes[len(calls) - 1])
+
+    monkeypatch.setattr(youtube, "YouTubeTranscriptApi", fake_api)
+    result = youtube.fetch_transcript("abc123XYZde", ["en"])
+
+    assert result.status == "ok"
+    assert len(calls) == 2
+
+
+def test_fetch_transcript_gives_up_after_max_attempts_still_blocked(monkeypatch):
+    """An exhausted RequestBlocked/IpBlocked must stay classified as
+    "blocked", not folded into a generic "error" - accurate status is what
+    lets us tell whether the new retry strategy is actually fixing YouTube
+    429s versus just exchanging them for proxy instability."""
+    monkeypatch.setattr(youtube.settings, "transcript_fetch_max_attempts", 3)
+    calls = []
+
+    def fake_api(**kwargs):
+        calls.append(None)
+        return _FakeApi(IpBlocked("abc123XYZde"))
+
+    monkeypatch.setattr(youtube, "YouTubeTranscriptApi", fake_api)
+    result = youtube.fetch_transcript("abc123XYZde", ["en"])
+
+    assert result.status == "blocked"
+    assert len(calls) == 3
+    assert "3 attempts" in result.message
+
+
+def test_fetch_transcript_gives_up_after_max_attempts_still_erroring(monkeypatch):
+    """A transport-level failure (DNS/TLS/dropped connection/proxy error,
+    not an explicit YouTube block) must be classified as "error", distinct
+    from "blocked", even after exhausting all retry attempts."""
+    monkeypatch.setattr(youtube.settings, "transcript_fetch_max_attempts", 3)
+    calls = []
+
+    def fake_api(**kwargs):
+        calls.append(None)
+        return _FakeApi(youtube.requests.exceptions.ConnectionError("connection reset"))
+
+    monkeypatch.setattr(youtube, "YouTubeTranscriptApi", fake_api)
+    result = youtube.fetch_transcript("abc123XYZde", ["en"])
+
+    assert result.status == "error"
+    assert len(calls) == 3
+    assert "3 attempts" in result.message
+
+
+def test_fetch_transcript_each_retry_is_a_fresh_client_instance(monkeypatch):
+    """Regression test for the actual fix: a blocked draw must be retried
+    with a brand-new YouTubeTranscriptApi instance (a fresh connection, and
+    thus another independent draw from the rotating proxy pool) rather than
+    reusing the same client/session, which is what left the library's own
+    internal same-session retries unable to reliably rotate off a blocked IP."""
+    fake = _FakeTranscript([_FakeSnippet(0.0, "hi")])
+    outcomes = [youtube.requests.RequestException("blocked draw"), fake]
+    instances = []
+
+    def fake_api(**kwargs):
+        api = _FakeApi(outcomes[len(instances)])
+        instances.append(api)
+        return api
+
+    monkeypatch.setattr(youtube, "YouTubeTranscriptApi", fake_api)
+    youtube.fetch_transcript("abc123XYZde", ["en"])
+
+    assert len(instances) == 2
+    assert instances[0] is not instances[1]
 
 
 def test_fetch_transcript_passes_proxy_config_through(monkeypatch):

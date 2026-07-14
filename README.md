@@ -183,35 +183,58 @@ hitting an IP-echo endpoint through the proxy repeatedly and confirming
 the IP actually changes each time, rather than staying fixed on one
 sticky IP.
 
-**A continuous run of many requests degrades the pool's success rate
-over the run's duration** - observed empirically: an unpaced run through
-~150 videos saw the failure rate climb well past 50% by the end (mostly
-Google's own anti-bot 429 wall, plus assorted connection errors), while
-small bursts of 8-10 requests stayed clean. This isn't fixed by pacing
-*within* a burst (0s/5s/10s delays between individual requests all
-performed about the same in testing) - it's a function of real elapsed
-time between bursts. A 5-minute gap after a degraded run fully restored
-the clean rate back to baseline; a 20-second gap only partially helped.
-`run_batch()` (see `app/batch.py`) accounts for this: above
-`BATCH_SIZE_THRESHOLD` queued entries (default `10`), it processes in
-chunks of that size with a `BATCH_COOLDOWN_SECONDS` (default `300`)
-cooldown between chunks, rather than burning through a large backlog in
-one continuous burst. Both must be positive/non-negative - the app
-refuses to start with an invalid value, since a threshold `<= 0` would
-otherwise chunk the queue into zero batches and silently overwrite
-`queue.json` with an empty list. This only applies to the queue-driven
-path (`discover_and_process.py`/`batch_runner.py`) - an explicit URL list
-(e.g. a live `POST /batch/run` request) is never paced, since a large one
-would otherwise hold the HTTP connection open for the full cooldown
-duration. `queue.json` is checkpointed after every chunk rather than only
-once at the end, so a crash partway through a long run doesn't lose
-already-completed progress or force a full reprocess next time. Because a
-large queue's total cooldown time can exceed
-`DISCOVERY_LOCK_TTL_SECONDS`, `discover_and_process.py` renews its lock
-lease after every chunk (`job_lock.renew_lock()`) so a healthy long run
-doesn't look crashed to a concurrent invocation; if the lease is ever
-found to belong to someone else mid-run, the run aborts immediately
-rather than continuing to write against a lock it no longer holds.
+**A single rotating-proxy draw has a fixed chance of landing on an
+already-flagged exit IP - and this doesn't improve by waiting.** An
+earlier investigation into a large live run's rising failure rate
+initially assumed the pool was being "worn out" by sustained request
+volume and needed a cooldown to recover. Controlled follow-up testing
+disproved that: a fresh, completely unpaced single request against a
+video that had just failed in production succeeded at roughly the same
+~80-85% rate whether tested immediately, mid-run, or after a 5-minute
+gap - and independent draws against Webshare's own IP-echo endpoint
+showed the rotating pool handing out distinct, healthy IPs throughout,
+even while the "degraded" run was still failing. So the actual
+per-request failure rate looks like a fairly constant property of the
+pool at any given moment (some fraction of exit IPs are already flagged
+by YouTube), not something that accumulates with our own volume or is
+fixed by resting.
+
+What actually fixes it: `fetch_transcript()` (see `app/youtube.py`)
+retries a blocked or network-flaky attempt up to
+`TRANSCRIPT_FETCH_MAX_ATTEMPTS` times (default `3`), each attempt using a
+brand-new `YouTubeTranscriptApi` instance - a fresh connection, and thus
+another independent draw from the rotating pool - rather than relying on
+the library's own internal same-session retry (which testing showed
+doesn't reliably escape a blocked IP) or giving up after a single bad
+draw. At a ~80% single-shot success rate, 2-3 independent draws pushes
+effective success into the high 90s%; this was confirmed directly by
+retrying videos that had actually failed in a live production run, most
+of which succeeded on the very next fresh attempt.
+
+`run_batch()` (see `app/batch.py`) still processes queued entries in
+chunks of `BATCH_SIZE_THRESHOLD` (default `10`), checkpointing
+`queue.json` after every chunk so a crash partway through a long run
+doesn't lose already-completed progress - that's now chunking's only
+job. `BATCH_COOLDOWN_SECONDS` (default `0`) no longer defaults to a real
+pause between chunks, since checkpointing doesn't require sleeping and
+the pool-recovery rationale for the old 300s default didn't hold up;
+only raise it if independent evidence shows a nonzero delay helps,
+since a large backlog with both a nonzero cooldown and per-video retries
+can idle for a long time otherwise. Both settings must be
+positive/non-negative - the app refuses to start with an invalid value,
+since a threshold `<= 0` would otherwise chunk the queue into zero
+batches and silently overwrite `queue.json` with an empty list.
+Chunking only applies to the
+queue-driven path (`discover_and_process.py`/`batch_runner.py`) - an
+explicit URL list (e.g. a live `POST /batch/run` request) is never
+paced, since a large one would otherwise hold the HTTP connection open
+for the full cooldown duration. Because a large queue's total cooldown
+time can exceed `DISCOVERY_LOCK_TTL_SECONDS`, `discover_and_process.py`
+renews its lock lease after every chunk (`job_lock.renew_lock()`) so a
+healthy long run doesn't look crashed to a concurrent invocation; if the
+lease is ever found to belong to someone else mid-run, the run aborts
+immediately rather than continuing to write against a lock it no longer
+holds.
 
 ## Usage
 
