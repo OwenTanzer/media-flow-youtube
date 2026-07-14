@@ -132,6 +132,53 @@ def test_run_batch_does_not_crash_on_a_timezone_naive_first_seen_at(monkeypatch)
     assert len(results) == 1
 
 
+def test_run_batch_does_not_pace_when_at_or_below_threshold(monkeypatch):
+    monkeypatch.setattr(batch.settings, "batch_size_threshold", 5)
+    monkeypatch.setattr(batch.settings, "batch_cooldown_seconds", 300)
+    monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: ["a", "b", "c", "d", "e"])
+    monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: None)
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
+    sleep_calls = []
+    monkeypatch.setattr(batch.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    results = batch.run_batch()
+
+    assert len(results) == 5
+    assert sleep_calls == []
+
+
+def test_run_batch_paces_in_cooled_down_chunks_when_above_threshold(monkeypatch):
+    """Regression test: a continuous run of many requests measurably
+    degrades the rotating proxy pool's success rate (see README). Above
+    the threshold, process in chunks with a real cooldown between them."""
+    monkeypatch.setattr(batch.settings, "batch_size_threshold", 2)
+    monkeypatch.setattr(batch.settings, "batch_cooldown_seconds", 300)
+    monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: ["a", "b", "c", "d", "e"])
+    monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: None)
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
+    sleep_calls = []
+    monkeypatch.setattr(batch.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    results = batch.run_batch()
+
+    # 5 entries chunked into [a,b] [c,d] [e] - a cooldown before chunk 2 and chunk 3, none before chunk 1.
+    assert len(results) == 5
+    assert sleep_calls == [300, 300]
+
+
+def test_run_batch_paces_explicit_url_lists_too(monkeypatch):
+    monkeypatch.setattr(batch.settings, "batch_size_threshold", 1)
+    monkeypatch.setattr(batch.settings, "batch_cooldown_seconds", 300)
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
+    sleep_calls = []
+    monkeypatch.setattr(batch.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    results = batch.run_batch(urls=["a", "b", "c"])
+
+    assert len(results) == 3
+    assert sleep_calls == [300, 300]
+
+
 def test_run_batch_empty_queue_is_a_noop(monkeypatch):
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: [])
     write_calls = []

@@ -172,6 +172,32 @@ No redeploy of code is required. As with all secrets in this project,
 set proxy credentials only in Railway's environment variables (or a
 local, gitignored `.env`) - never commit them.
 
+**Note on `WEBSHARE_PROXY_USERNAME`:** use the *bare* username from your
+Webshare dashboard, not a sticky-session variant (e.g. one with a
+`-<country>-<n>` suffix already appended). `youtube-transcript-api`
+appends its own `-rotate` suffix to whatever username you provide, so a
+username that already has a session suffix baked in produces an invalid
+combined string and proxy auth fails. A bare username lets it correctly
+draw a fresh IP from the rotating pool on every request - verified by
+hitting an IP-echo endpoint through the proxy repeatedly and confirming
+the IP actually changes each time, rather than staying fixed on one
+sticky IP.
+
+**A continuous run of many requests degrades the pool's success rate
+over the run's duration** - observed empirically: an unpaced run through
+~150 videos saw the failure rate climb well past 50% by the end (mostly
+Google's own anti-bot 429 wall, plus assorted connection errors), while
+small bursts of 8-10 requests stayed clean. This isn't fixed by pacing
+*within* a burst (0s/5s/10s delays between individual requests all
+performed about the same in testing) - it's a function of real elapsed
+time between bursts. A 5-minute gap after a degraded run fully restored
+the clean rate back to baseline; a 20-second gap only partially helped.
+`run_batch()` (see `app/batch.py`) accounts for this: above
+`BATCH_SIZE_THRESHOLD` queued entries (default `10`), it processes in
+chunks of that size with a `BATCH_COOLDOWN_SECONDS` (default `300`)
+cooldown between chunks, rather than burning through a large backlog in
+one continuous burst.
+
 ## Usage
 
 ```bash

@@ -42,6 +42,9 @@ class Settings:
         self.discovery_lock_ttl_seconds: int = int(_env("DISCOVERY_LOCK_TTL_SECONDS", "1800"))
         self.no_captions_grace_hours: float = float(_env("NO_CAPTIONS_GRACE_HOURS", "24"))
 
+        self.batch_size_threshold: int = int(_env("BATCH_SIZE_THRESHOLD", "10"))
+        self.batch_cooldown_seconds: float = float(_env("BATCH_COOLDOWN_SECONDS", "300"))
+
         self.oauth_client_id: str | None = _env("GOOGLE_OAUTH_CLIENT_ID")
         self.oauth_client_secret: str | None = _env("GOOGLE_OAUTH_CLIENT_SECRET")
         self.oauth_refresh_token: str | None = _env("GOOGLE_OAUTH_REFRESH_TOKEN")
