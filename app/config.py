@@ -70,6 +70,36 @@ class Settings:
         self.youtube_proxy_http_url: str | None = _env("YOUTUBE_PROXY_HTTP_URL")
         self.youtube_proxy_https_url: str | None = _env("YOUTUBE_PROXY_HTTPS_URL")
 
+        self.summary_model: str = _env("SUMMARY_MODEL", "claude-haiku-4-5")
+
+        self.summary_max_output_tokens: int = int(_env("SUMMARY_MAX_OUTPUT_TOKENS", "4096"))
+        if self.summary_max_output_tokens < 1:
+            raise ConfigError(f"SUMMARY_MAX_OUTPUT_TOKENS must be a positive integer, got {self.summary_max_output_tokens}.")
+
+        self.summary_max_transcript_chars: int = int(_env("SUMMARY_MAX_TRANSCRIPT_CHARS", "400000"))
+        if self.summary_max_transcript_chars < 1:
+            raise ConfigError(
+                f"SUMMARY_MAX_TRANSCRIPT_CHARS must be a positive integer, got {self.summary_max_transcript_chars}."
+            )
+
+        self.summary_max_videos_per_run: int = int(_env("SUMMARY_MAX_VIDEOS_PER_RUN", "20"))
+        if self.summary_max_videos_per_run < 1:
+            raise ConfigError(
+                f"SUMMARY_MAX_VIDEOS_PER_RUN must be a positive integer, got {self.summary_max_videos_per_run}."
+            )
+
+        self.summary_max_total_tokens_per_run: int = int(_env("SUMMARY_MAX_TOTAL_TOKENS_PER_RUN", "500000"))
+        if self.summary_max_total_tokens_per_run < 1:
+            raise ConfigError(
+                f"SUMMARY_MAX_TOTAL_TOKENS_PER_RUN must be a positive integer, got {self.summary_max_total_tokens_per_run}."
+            )
+
+        self.summary_max_cost_usd_per_run: float = float(_env("SUMMARY_MAX_COST_USD_PER_RUN", "2.0"))
+        if self.summary_max_cost_usd_per_run < 0 or not math.isfinite(self.summary_max_cost_usd_per_run):
+            raise ConfigError(
+                f"SUMMARY_MAX_COST_USD_PER_RUN must be a non-negative, finite number, got {self.summary_max_cost_usd_per_run}."
+            )
+
     def require_oauth_credentials(self) -> OAuthCredentials:
         missing = [
             name

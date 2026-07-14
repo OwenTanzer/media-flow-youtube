@@ -88,3 +88,31 @@ def test_no_captions_grace_hours_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("NO_CAPTIONS_GRACE_HOURS", value)
     with pytest.raises(ConfigError, match="NO_CAPTIONS_GRACE_HOURS"):
         _settings_with(monkeypatch)
+
+
+def test_summary_settings_defaults(monkeypatch):
+    settings = _settings_with(monkeypatch)
+    assert settings.summary_model == "claude-haiku-4-5"
+    assert settings.summary_max_output_tokens == 4096
+    assert settings.summary_max_transcript_chars == 400000
+    assert settings.summary_max_videos_per_run == 20
+    assert settings.summary_max_total_tokens_per_run == 500000
+    assert settings.summary_max_cost_usd_per_run == 2.0
+
+
+@pytest.mark.parametrize(
+    "env_var",
+    ["SUMMARY_MAX_OUTPUT_TOKENS", "SUMMARY_MAX_TRANSCRIPT_CHARS", "SUMMARY_MAX_VIDEOS_PER_RUN", "SUMMARY_MAX_TOTAL_TOKENS_PER_RUN"],
+)
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_summary_positive_int_settings_reject_non_positive_values(monkeypatch, env_var, value):
+    monkeypatch.setenv(env_var, value)
+    with pytest.raises(ConfigError, match=env_var):
+        _settings_with(monkeypatch)
+
+
+@pytest.mark.parametrize("value", ["-1", "-0.5", "nan", "inf"])
+def test_summary_max_cost_usd_per_run_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("SUMMARY_MAX_COST_USD_PER_RUN", value)
+    with pytest.raises(ConfigError, match="SUMMARY_MAX_COST_USD_PER_RUN"):
+        _settings_with(monkeypatch)

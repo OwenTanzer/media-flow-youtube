@@ -23,8 +23,11 @@ single small service on Railway.
   where to find it.
 - `discover_and_process.py` — optionally, poll a set of YouTube channels
   (configured in `channels.json`, also in Drive) for new uploads via
-  their public RSS feeds, queue the ones not seen before, and process the
-  queue, all in one scheduled run. See "Scheduled channel discovery" below.
+  their public RSS feeds, queue the ones not seen before, process the
+  queue, and then turn each successful transcript into a structured,
+  timestamped Claude-generated summary (`summaries/<video_id>.json`), all
+  in one scheduled run. See "Scheduled channel discovery" and "Transcript
+  summarization" below.
 - Missing/disabled captions, unavailable videos, and IP blocks are all
   caught and reported as a `status` field — the service never crashes on
   a single bad video.
@@ -361,6 +364,96 @@ dropped, same as any other video. Videos added manually to `queue.json`
 (no `first_seen_at`) get no grace period - "no_captions" is terminal for
 them immediately, exactly as before this existed.
 
+## Transcript summarization (optional)
+
+The final stage of `discover_and_process.py` turns every successfully
+archived transcript (`status: "ok"` in `_index.json`) into a structured,
+timestamped JSON insight artifact via Claude - `summaries/<video_id>.json`
+in the same Drive folder. It never touches `no_captions`/`blocked`/etc.
+entries, and a failure summarizing one video never blocks transcript
+discovery or archiving, since it runs strictly after both of those
+complete.
+
+### Setup
+
+Set `ANTHROPIC_API_KEY` (resolved automatically by the Anthropic SDK - not
+touched by this app's own config or logs) wherever `discover_and_process.py`
+runs. Nothing else is required - all other settings have working defaults.
+See [`.env.example`](.env.example) for `SUMMARY_MODEL` (default
+`claude-haiku-4-5`) and the cost/length controls below.
+
+### Output format
+
+```json
+{
+  "video_id": "dQw4w9WgXcQ",
+  "source_drive_file_id": "1AbC...",
+  "source_transcript_hash": "sha256:...",
+  "title": "Never Gonna Give You Up",
+  "author": "Rick Astley",
+  "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+  "subject": "...",
+  "summary": "...",
+  "points": [
+    {"importance": "major", "main_point": "...", "explanation": "...", "timestamp_seconds": 12, "timestamp": "00:12"}
+  ],
+  "status": "ok",
+  "model": "claude-haiku-4-5",
+  "prompt_version": "v1",
+  "generated_at": "2026-07-14T12:00:00+00:00",
+  "usage": {"input_tokens": 1234, "output_tokens": 456, "estimated_cost_usd": 0.0035}
+}
+```
+
+`title`, `author`, `url`, the source Drive file ID, and the transcript hash
+are always populated by application code from `_index.json` and the
+archived transcript file itself - never trusted from the model's output.
+Only `subject`, `summary`, and `points` come from Claude, constrained by a
+JSON schema (`output_config.format`) so the response is always valid JSON
+with no Markdown fences or surrounding prose. A failed attempt (provider
+error, safety refusal, or unparseable output) writes `status: "error"` with
+a `message` instead - durably recorded and automatically retried on the
+next run, since anything other than `status: "ok"` stays eligible.
+
+### Idempotency
+
+A video is skipped only when a summary already exists with `status: "ok"`
+and its `source_transcript_hash`, `model`, and `prompt_version` all still
+match. The hash covers only the transcript body (captions), not the
+Markdown file's frontmatter - so a transcript re-fetched with identical
+captions doesn't trigger a wasteful re-summary just because `fetched_at`
+changed. Changing `SUMMARY_MODEL`, or a future prompt revision (which bumps
+the `PROMPT_VERSION` constant in `app/summarize.py`), deliberately
+re-summarizes everything.
+
+### Transcript length policy
+
+If a transcript's body exceeds `SUMMARY_MAX_TRANSCRIPT_CHARS` (default
+`400000`, comfortably covering a multi-hour video), it's truncated to that
+length before being sent to the model, and the resulting artifact is
+flagged `"transcript_truncated": true`. Points and timestamps within the
+retained (beginning) portion stay accurate; content past the cutoff simply
+isn't covered. This is a deliberate v1 simplification - explicit,
+visible truncation rather than multi-pass chunking-and-merging across
+several model calls.
+
+### Cost controls
+
+`SUMMARY_MAX_VIDEOS_PER_RUN`, `SUMMARY_MAX_TOTAL_TOKENS_PER_RUN`, and
+`SUMMARY_MAX_COST_USD_PER_RUN` each independently bound one run - hitting
+any one of them stops summarization for that run (logged as "stopped early
+on a per-run budget"), leaving the rest for the next scheduled run rather
+than failing or running unbounded.
+
+### Concurrency
+
+Runs inside the same serialized `discover_and_process.py` job as discovery
+and queue processing, for the same reason batching does (see the
+concurrency invariant above): `_index.json` isn't safe for a second,
+independent writer. The advisory lock is renewed after every video
+summarized, same as during queue processing, so a run spending a while on
+model calls doesn't look crashed to a concurrent invocation.
+
 ## Project layout
 
 ```
@@ -374,10 +467,12 @@ app/
   channel_store.py  channels.json read helper (the discovery source registry)
   discovery.py      RSS feed fetch/parse + discover_and_enqueue(): queues unseen uploads
   job_lock.py       Drive-based advisory lock preventing overlapping discovery runs
+  summarize.py      Claude model call: transcript -> structured, schema-validated summary
+  summary_store.py  summaries/<video_id>.json read/write, idempotency, and summarize_eligible()
   scheduler.py       optional in-process APScheduler wiring
   config.py         environment variable loading/validation
   models.py         request/response schemas
 batch_runner.py     standalone entrypoint for a separate Railway Cron Job service
-discover_and_process.py  standalone entrypoint: discover channel uploads, then process the queue
+discover_and_process.py  standalone entrypoint: discover -> process queue -> summarize eligible transcripts
 get_refresh_token.py  one-time local script to mint the Drive OAuth refresh token
 ```
