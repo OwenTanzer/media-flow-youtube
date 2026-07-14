@@ -22,6 +22,7 @@ from .summarize import (
     count_prompt_tokens,
     estimate_cost_usd,
     strip_frontmatter,
+    summarize_fallback,
     summarize_transcript,
     transcript_hash,
 )
@@ -30,6 +31,12 @@ from .youtube import format_timestamp
 logger = logging.getLogger("media_flow.summary_store")
 
 SUMMARIES_FOLDER_NAME = "summaries"
+
+# Prefixed onto a fallback summary's text (see summarize_eligible()'s
+# last-attempt handling) so it's visually distinguishable from a normal,
+# per-point-cited summary anywhere the text is displayed, not just via
+# the "fallback_summary" field below.
+FALLBACK_SUMMARY_SYMBOL = "⚠️"  # warning sign (U+26A0 U+FE0F)
 
 _CHANNEL_RE = re.compile(r"^channel: (.+)$", re.MULTILINE)
 
@@ -180,6 +187,21 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
       changes when only the environment does) - and since summarization is
       an optional stage, an unconfigured deployment should skip it
       cleanly rather than fail discover_and_process.py's whole run.
+
+    A third path handles a video that fails on its *last* allowed attempt
+    (this_attempt >= settings.summary_max_attempts_per_video) with a
+    retryable error: rather than let it sit permanently as status:
+    "error", one extra call is made via summarize_fallback() for a plain
+    prose summary with no per-line citations to get wrong - some speakers
+    (meandering, conversational, non-linear delivery) make the normal
+    source_timestamp/source_anchor grounding hard even when the model
+    understood the content fine. A successful fallback writes status:
+    "ok" with "fallback_summary": true, an empty points list, and the
+    summary text prefixed with FALLBACK_SUMMARY_SYMBOL so it's visually
+    distinguishable wherever it's displayed, not just via that field. If
+    the fallback call itself fails, the video falls through to the normal
+    status: "error" artifact exactly as before - this is a best-effort
+    extra attempt, not a guarantee every video eventually gets a summary.
 
     on_progress is called (a) right before the model call, so a long-running
     lock lease (see discover_and_process.py) is renewed going into a
@@ -362,7 +384,6 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
                 model_input, model=settings.summary_model, max_output_tokens=settings.summary_max_output_tokens
             )
         except SummarizationError as exc:
-            failed += 1
             failures.append((video_id, str(exc)))
             if exc.usage is not None:
                 # The API still returned (and billed) a response even
@@ -379,6 +400,68 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
                 # could let real spend exceed the cap with nothing to show
                 # for it in our own tracked totals.
                 _count_usage(input_tokens_estimate, settings.summary_max_output_tokens)
+
+            # Last resort: this video has now used up its normal per-point
+            # citation attempts and would otherwise sit permanently as
+            # status: "error" until something upstream changes. Some
+            # speakers (meandering, conversational, non-linear delivery)
+            # make source_timestamp/source_anchor grounding hard even when
+            # the model clearly understood the content - rather than give
+            # up entirely, try once for a plain prose summary instead,
+            # which has no per-line citation to get wrong.
+            #
+            # Gated on fallback_eligible, not just retryable: retryable
+            # also covers rate limits, connection errors, and 5xx - an
+            # immediate second call right after one of those can't fix
+            # anything and, for a rate limit specifically, only makes it
+            # worse. fallback_eligible is reserved for content/structured-
+            # output problems with this attempt's own response (see
+            # SummarizationError's docstring), where an immediate retry
+            # with a much simpler schema is actually likely to help.
+            # Still only on the video's last attempt - every earlier
+            # attempt gets a real shot at the full, timestamped citation
+            # format first.
+            if exc.fallback_eligible and this_attempt >= settings.summary_max_attempts_per_video:
+                try:
+                    fallback_summary, fallback_usage = summarize_fallback(
+                        model_input, model=settings.summary_model, max_output_tokens=settings.summary_max_output_tokens
+                    )
+                except SummarizationError as fallback_exc:
+                    if fallback_exc.usage is not None:
+                        _count_usage(fallback_exc.usage.input_tokens, fallback_exc.usage.output_tokens)
+                    elif fallback_exc.possibly_billed:
+                        _count_usage(input_tokens_estimate, settings.summary_max_output_tokens)
+                    failed += 1
+                    _write_failure_artifact(exc)
+                    continue
+
+                _count_usage(fallback_usage.input_tokens, fallback_usage.output_tokens)
+                fallback_cost = estimate_cost_usd(
+                    settings.summary_model, fallback_usage.input_tokens, fallback_usage.output_tokens
+                )
+                if on_progress is not None:
+                    on_progress()
+                write_summary(
+                    folder_id,
+                    video_id,
+                    {
+                        **base_fields,
+                        "video_type": None,
+                        "summary": f"{FALLBACK_SUMMARY_SYMBOL} {fallback_summary}",
+                        "points": [],
+                        "status": "ok",
+                        "fallback_summary": True,
+                        "usage": {
+                            "input_tokens": fallback_usage.input_tokens,
+                            "output_tokens": fallback_usage.output_tokens,
+                            "estimated_cost_usd": fallback_cost,
+                        },
+                    },
+                )
+                summarized += 1
+                continue
+
+            failed += 1
             _write_failure_artifact(exc)
             continue
 
