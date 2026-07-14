@@ -134,6 +134,37 @@ def delete_file(folder_id: str, filename: str) -> None:
         service.files().delete(fileId=existing["id"]).execute()
 
 
+def get_or_create_folder(parent_folder_id: str, name: str) -> str:
+    """Returns the Drive folder ID for a subfolder with this name directly
+    under parent_folder_id, creating it if it doesn't exist yet. Generic
+    helper - not specific to any one caller."""
+
+    service = get_drive_service()
+    escaped = name.replace("'", "\\'")
+    query = (
+        f"name = '{escaped}' and '{parent_folder_id}' in parents and trashed = false "
+        "and mimeType = 'application/vnd.google-apps.folder'"
+    )
+    results = service.files().list(q=query, spaces="drive", fields="files(id, name)", pageSize=1).execute()
+    files = results.get("files", [])
+    if files:
+        return files[0]["id"]
+
+    created = (
+        service.files()
+        .create(
+            body={
+                "name": name,
+                "parents": [parent_folder_id],
+                "mimeType": "application/vnd.google-apps.folder",
+            },
+            fields="id",
+        )
+        .execute()
+    )
+    return created["id"]
+
+
 def read_index(folder_id: str) -> dict:
     if settings.dry_run:
         return {}

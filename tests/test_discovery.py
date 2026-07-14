@@ -89,12 +89,32 @@ def test_discover_and_enqueue_queues_newly_discovered_video(monkeypatch):
     report = discovery.discover_and_enqueue("folder-id")
 
     assert written["entries"] == [
-        {"url": "https://www.youtube.com/watch?v=newvideo11", "first_seen_at": FIXED_NOW.isoformat()}
+        {
+            "url": "https://www.youtube.com/watch?v=newvideo11",
+            "first_seen_at": FIXED_NOW.isoformat(),
+            "published_at": "2026-07-01T00:00:00+00:00",
+        }
     ]
     assert report.newly_queued == 1
     assert report.discovered_total == 1
     assert report.duplicates_skipped == 0
     assert report.feed_failures == []
+
+
+def test_discover_and_enqueue_omits_published_at_when_feed_has_none(monkeypatch):
+    """A video whose feed entry has no <published> element (DiscoveredVideo.published
+    is None) shouldn't get a fabricated published_at key."""
+    channel = Channel("UC_a", "Channel A", enabled=True)
+    written = _stub_stores(monkeypatch, channels=[channel])
+    monkeypatch.setattr(
+        discovery,
+        "fetch_channel_feed",
+        lambda channel_id: [discovery.DiscoveredVideo("newvideo11", "UC_a", None)],
+    )
+
+    discovery.discover_and_enqueue("folder-id")
+
+    assert "published_at" not in written["entries"][0]
 
 
 def test_discover_and_enqueue_skips_already_indexed_video(monkeypatch):

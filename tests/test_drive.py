@@ -69,3 +69,57 @@ def test_get_drive_service_caches_the_built_service(monkeypatch):
     drive.get_drive_service()
 
     assert len(build_calls) == 1
+
+
+class _FakeExecutable:
+    def __init__(self, result):
+        self._result = result
+
+    def execute(self):
+        return self._result
+
+
+class _FakeFilesResource:
+    def __init__(self, list_result, create_result):
+        self._list_result = list_result
+        self._create_result = create_result
+        self.create_calls = []
+
+    def list(self, **kwargs):
+        return _FakeExecutable(self._list_result)
+
+    def create(self, **kwargs):
+        self.create_calls.append(kwargs)
+        return _FakeExecutable(self._create_result)
+
+
+class _FakeService:
+    def __init__(self, list_result, create_result=None):
+        self._files = _FakeFilesResource(list_result, create_result)
+
+    def files(self):
+        return self._files
+
+
+def test_get_or_create_folder_returns_existing_folder_id(monkeypatch):
+    fake_service = _FakeService({"files": [{"id": "existing-folder-id", "name": "summaries"}]})
+    monkeypatch.setattr(drive, "get_drive_service", lambda: fake_service)
+
+    folder_id = drive.get_or_create_folder("parent-id", "summaries")
+
+    assert folder_id == "existing-folder-id"
+    assert fake_service.files().create_calls == []
+
+
+def test_get_or_create_folder_creates_when_missing(monkeypatch):
+    fake_service = _FakeService({"files": []}, create_result={"id": "new-folder-id"})
+    monkeypatch.setattr(drive, "get_drive_service", lambda: fake_service)
+
+    folder_id = drive.get_or_create_folder("parent-id", "summaries")
+
+    assert folder_id == "new-folder-id"
+    assert len(fake_service.files().create_calls) == 1
+    body = fake_service.files().create_calls[0]["body"]
+    assert body["name"] == "summaries"
+    assert body["parents"] == ["parent-id"]
+    assert body["mimeType"] == "application/vnd.google-apps.folder"

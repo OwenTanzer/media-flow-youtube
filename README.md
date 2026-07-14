@@ -23,8 +23,11 @@ single small service on Railway.
   where to find it.
 - `discover_and_process.py` — optionally, poll a set of YouTube channels
   (configured in `channels.json`, also in Drive) for new uploads via
-  their public RSS feeds, queue the ones not seen before, and process the
-  queue, all in one scheduled run. See "Scheduled channel discovery" below.
+  their public RSS feeds, queue the ones not seen before, process the
+  queue, and then turn each successful transcript into a structured,
+  timestamped Claude-generated summary (`summaries/<video_id>.json`), all
+  in one scheduled run. See "Scheduled channel discovery" and "Transcript
+  summarization" below.
 - Missing/disabled captions, unavailable videos, and IP blocks are all
   caught and reported as a `status` field — the service never crashes on
   a single bad video.
@@ -44,6 +47,7 @@ title: "Never Gonna Give You Up"
 url: https://www.youtube.com/watch?v=dQw4w9WgXcQ
 channel: Rick Astley
 fetched_at: 2026-07-13T10:41:55+00:00
+published_at: 2026-07-10T14:00:00+00:00
 language: English (en)
 auto_generated: false
 ---
@@ -52,6 +56,17 @@ auto_generated: false
 [00:05] You know the rules and so do I
 ...
 ```
+
+`published_at` - the video's real YouTube publish time - is only present for
+videos discovered via `discover_and_process.py`'s RSS feed reader, the only
+source that sees it; a manually-added `queue.json` entry or a direct
+`/transcripts` URL has no such source and omits the field entirely rather
+than guessing (`fetched_at` can lag the real upload by anywhere from
+minutes to a full discovery interval, so it's not a substitute). It's
+carried through to `_index.json` and, for summarized videos, to the
+summary artifact's `video_published_at` - see "Transcript summarization"
+below - since sorting market/news content by when it was actually said
+(not by processing order) matters for a future consumer like a visualizer.
 
 ## Setup
 
@@ -384,6 +399,253 @@ dropped, same as any other video. Videos added manually to `queue.json`
 (no `first_seen_at`) get no grace period - "no_captions" is terminal for
 them immediately, exactly as before this existed.
 
+## Transcript summarization (optional)
+
+The final stage of `discover_and_process.py` turns every successfully
+archived transcript (`status: "ok"` in `_index.json`) into a structured,
+timestamped JSON insight artifact via Claude - `summaries/<video_id>.json`
+in the same Drive folder. It never touches `no_captions`/`blocked`/etc.
+entries, and a failure summarizing one video never blocks transcript
+discovery or archiving, since it runs strictly after both of those
+complete.
+
+### Setup
+
+Set `ANTHROPIC_API_KEY` (resolved automatically by the Anthropic SDK - not
+touched by this app's own config or logs) wherever `discover_and_process.py`
+runs. This stage is genuinely optional: if the key isn't set, it's skipped
+cleanly (logged, not an error) rather than failing the whole run - discovery
+and transcript archiving are unaffected either way. Nothing else is
+required once it's set - all other settings have working defaults. See
+[`.env.example`](.env.example) for `SUMMARY_MODEL` (default
+`claude-haiku-4-5`) and the cost/length controls below.
+
+### Output format
+
+```json
+{
+  "video_id": "dQw4w9WgXcQ",
+  "source_drive_file_id": "1AbC...",
+  "source_transcript_hash": "sha256:...",
+  "title": "Never Gonna Give You Up",
+  "author": "Rick Astley",
+  "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+  "video_published_at": "2026-07-10T14:00:00+00:00",
+  "video_type": "Analytic Overview",
+  "summary": "...",
+  "points": [
+    {"importance": "major", "main_point": "...", "explanation": "...", "timestamp_seconds": 12, "timestamp": "00:12"}
+  ],
+  "status": "ok",
+  "model": "claude-haiku-4-5",
+  "prompt_version": "v4",
+  "generated_at": "2026-07-14T12:00:00+00:00",
+  "attempts": 1,
+  "usage": {"input_tokens": 1234, "output_tokens": 456, "estimated_cost_usd": 0.0035}
+}
+```
+
+`title`, `author`, `url`, `video_published_at`, the source Drive file ID,
+and the transcript hash are always populated by application code from
+`_index.json` and the archived transcript file itself - never trusted
+from the model's output. `video_published_at` is `null` unless the video
+was discovered via RSS (see "Transcript file format" above) - there's no
+other source for it.
+Claude only produces `video_type`, `summary`, and each point's
+`importance`, `main_point`, `explanation`, and `timestamp_seconds`,
+constrained by a JSON schema (`output_config.format`) so the response is
+always valid JSON with no Markdown fences or surrounding prose.
+`video_type` is one of exactly four categories - `"Post-Market Update"`,
+`"Pre-Market Brief"`, `"Thesis Piece"`, or `"Analytic Overview"` - enforced
+by the schema itself (a `Literal`, not a free-text field), so an
+unrecognized classification is rejected the same way a missing field
+would be. Every string field and the `points` list itself also require at
+least one character/item, since an empty response is otherwise
+schema-valid despite not being a usable summary. The human-readable
+`timestamp` string is never taken from the
+model either - it's derived deterministically in application code from
+`timestamp_seconds` (the same formatter transcript Markdown files use), so
+the two can never disagree. Every `timestamp_seconds` is also validated
+against the transcript's own timestamp range (rejecting a value outside
+`[0, last transcript timestamp]`) - Pydantic alone only validates that
+it's an integer, not that it's plausible, so this catches a model
+inventing an out-of-range value. Points are **not** required to be in
+chronological order: real videos (livestreams especially) revisit the
+same topic more than once, and an earlier strict-ordering requirement
+rejected genuinely well-formed output for that content in testing. A
+failed attempt (provider error, safety refusal, unparseable/invalid
+structured output, or an out-of-range timestamp) writes `status: "error"`
+with a `message`, a `retryable` flag, and the `attempts` count so far
+instead - this includes the case where the SDK's own
+response-parsing step raises a schema validation error directly (a
+`pydantic.ValidationError`, not one of the SDK's own exception types),
+which would otherwise escape per-video isolation and abort the whole run.
+
+### Point count
+
+The number of points is otherwise unbounded, which would let a long,
+information-dense video (a multi-hour livestream, say) produce an
+unreasonably large list. A per-video cap - roughly one point per 3 minutes
+of video, up to a ceiling of 20 regardless of length - is built into the
+system prompt sent to the model, and enforced again as a hard backstop
+after the response comes back: if the model still returns more points
+than the cap allows, only the most significant ones are kept (`"major"`
+points before `"minor"` ones, preserving the model's original relative
+order among whichever are kept), and the artifact is flagged
+`"points_truncated": true`. This is a selection, not a validation failure
+- it never triggers a retry, since keeping fewer of the model's own points
+isn't a correctness problem with any individual one. Short videos aren't
+affected in practice: the prompt's own guidance already keeps them to a
+handful of points well under the cap.
+
+Routine housekeeping/administrative content - schedule or
+streaming-cadence announcements, membership/Patreon/sponsor plugs,
+"welcome back"/sign-off preambles, like-and-subscribe asks - is excluded
+from points by default, even when the transcript spends real time on it.
+This matters more the longer the video is: with a fixed point cap, every
+point spent on channel admin is one less available for actual substantive
+content. The exception is housekeeping that's itself substantively
+important (e.g. a schedule change that affects when to expect the next
+analysis), which can still get a point. Each point's `explanation` is
+guided to be 2-4 sentences rather than 1-3, favoring real specifics
+(numbers, reasoning, context) over terseness.
+
+### Idempotency and retries
+
+A video is skipped only when a summary already exists with `status: "ok"`
+and its `source_transcript_hash`, `model`, and `prompt_version` all still
+match. The hash covers the **complete** transcript body (captions), not the
+Markdown file's frontmatter and not just the portion actually sent to the
+model when truncated (see below) - so a transcript re-fetched with
+identical captions doesn't trigger a wasteful re-summary just because
+`fetched_at` changed, but a real change anywhere in the transcript is never
+invisible. Changing `SUMMARY_MODEL`, or a future prompt revision (which
+bumps the `PROMPT_VERSION` constant in `app/summarize.py`), deliberately
+re-summarizes everything, resetting the attempt count below since it's a
+new unit of work.
+
+A failure isn't retried unconditionally forever. Each failure is classified
+`retryable` or not: rate limits, connection errors, transient malformed
+output, and failed point validation are retryable; a safety refusal is
+not, since it's deterministic for the same input and retrying just burns
+budget for a guaranteed repeat. A retryable failure keeps being retried on
+subsequent runs (`attempts` incrementing each time) until it succeeds or
+hits `SUMMARY_MAX_ATTEMPTS_PER_VIDEO` (default `3`), at which point it
+stops being retried until something changes (the transcript hash, model,
+or prompt version). A run's `SummaryReport` (logged by
+`discover_and_process.py`) includes a `retried` count - videos this run
+that had a prior non-`ok` attempt for the same transcript/model/prompt -
+separate from the `failed` count of this run's own outcomes.
+
+A retryable failure also records `next_retry_at`
+(`generated_at` + `SUMMARY_RETRY_BACKOFF_SECONDS`, default `900`) and isn't
+eligible again until that time passes - without this, a transient failure
+would otherwise be retried again on the very next invocation regardless of
+how recently it just failed. A non-retryable failure has no
+`next_retry_at` at all, since it isn't retried regardless of elapsed time.
+
+A genuine, still-broken auth/credential problem is handled differently
+from a per-video failure, deliberately - two ways:
+
+- If `ANTHROPIC_API_KEY` isn't set at all, the whole summarization stage
+  is skipped cleanly before touching any video or making any API call
+  (see Setup above) - this stage is optional, and an unconfigured
+  deployment shouldn't fail discover_and_process.py's entire run over it.
+- If the key is set but invalid/expired/lacking access, that's detected as
+  a side effect of the real pre-flight token count (see Cost controls
+  below) *before* a given video's attempt count is touched or anything is
+  written for it, and aborts the whole run immediately instead of writing
+  a `status: "error"` artifact. This matters because a credential problem
+  isn't a property of any one video's content - if it were recorded as a
+  non-retryable per-video failure the normal way, fixing the credential
+  afterward wouldn't un-poison it, since nothing about that video's own
+  transcript hash, model, or prompt version changed.
+
+A transient failure on that same pre-flight token count (a rate limit,
+connection error, or 5xx - as opposed to a genuine credential problem) is
+*not* treated this way: it's recorded as an ordinary per-video failure
+like any other, since aborting the whole run over a momentary blip would
+otherwise skip every remaining video in the backlog with no durable retry
+state to show for it.
+
+### Transcript length policy
+
+If a transcript's complete body exceeds `SUMMARY_MAX_TRANSCRIPT_CHARS`
+(default `400000`, comfortably covering a multi-hour video), only the first
+`SUMMARY_MAX_TRANSCRIPT_CHARS` of it is sent to the model, and the
+resulting artifact is flagged `"transcript_truncated": true`. Points and
+timestamps within the retained (beginning) portion stay accurate; content
+past the cutoff simply isn't covered - and the idempotency hash above still
+covers the complete, untruncated body, so a change past the cutoff still
+triggers re-summarization rather than looking unchanged. This is a
+deliberate v1 simplification - explicit, visible truncation rather than
+multi-pass chunking-and-merging across several model calls.
+
+### Cost controls
+
+`SUMMARY_MAX_VIDEOS_PER_RUN`, `SUMMARY_MAX_TOTAL_TOKENS_PER_RUN`, and
+`SUMMARY_MAX_COST_USD_PER_RUN` each independently bound one run. Before
+each call, its worst-case cost/tokens are reserved against these caps -
+not just checked against totals from already-completed calls - so a
+single call starting just under a cap can't push the run well past it.
+The input side of that reservation is a real pre-flight count via
+Anthropic's token-counting endpoint (covering the system prompt and
+output schema overhead, not just the transcript itself), not a
+chars-per-token guess - a heuristic like that both undercounts (excludes
+the prompt/schema) and isn't a true upper bound either way. The output
+side still treats `SUMMARY_MAX_OUTPUT_TOKENS` as fully consumed, the real
+worst case. Two distinct outcomes follow from this reservation:
+
+- If a video's own worst-case cost/tokens exceed the **entire** configured
+  cap by itself (even from a completely fresh run), it's skipped - logged
+  as exceeding the per-run budget alone - rather than treated as "stopped
+  on budget," which would otherwise leave it first in line and
+  permanently block every other eligible video behind it, every run.
+- If the run's cumulative totals so far don't leave enough *remaining*
+  headroom for this video's worst case, the run stops here (logged as
+  "stopped early on a per-run budget"), leaving it and the rest of the
+  backlog for the next scheduled run.
+
+`SUMMARY_MODEL` must have a pricing entry in `app/summarize.py`'s
+`PRICING_PER_MTOK_USD` - the app refuses to start otherwise, since an
+unrecognized model would make cost estimation silently return `None` and
+disable `SUMMARY_MAX_COST_USD_PER_RUN` entirely. A failure that still
+received a billed response from the API (a safety refusal, or output that
+failed to parse/validate) has its usage counted against these caps too,
+even though it's recorded as `status: "error"`. The one case where real
+usage isn't accessible at all - the SDK's own schema-validation step
+raising before we get access to the raw response - is conservatively
+charged this call's own reserved worst-case estimate instead of
+contributing zero, since a response plausibly still happened and was
+billed; only a failure before any response was ever returned at all (a
+connection error, for instance) contributes no usage, since none is known
+to have been billed.
+
+### Concurrency
+
+Runs inside the same serialized `discover_and_process.py` job as discovery
+and queue processing, for the same reason batching does (see the
+concurrency invariant above): `_index.json` isn't safe for a second,
+independent writer. The advisory lock is renewed twice per video: once
+before the (possibly slow) model call, so a long-running lease doesn't go
+stale purely from provider latency, and once again immediately before the
+resulting artifact is written to Drive - the second renewal is what
+actually matters, since it's the last chance to detect that a concurrent
+run has taken over the lock before this run would otherwise write under a
+lease it no longer holds.
+
+Every Anthropic API call (the model call and the token-counting pre-flight
+check) disables the SDK's own automatic retry/backoff
+(`Anthropic(max_retries=0)`). Left at its default, a single call could
+silently retry internally for up to ~30 minutes (2 retries, each up to a
+10-minute timeout) - comfortably long enough to run past
+`DISCOVERY_LOCK_TTL_SECONDS`'s default 30-minute window with no chance to
+renew the lock in between. The app's own outer retry loop
+(`SUMMARY_MAX_ATTEMPTS_PER_VIDEO`, across scheduled runs, with the lock
+renewed before each attempt) is the sole retry authority instead - the
+same fix already applied to the Webshare proxy's internal retries in
+`app/youtube.py`.
+
 ## Project layout
 
 ```
@@ -397,10 +659,12 @@ app/
   channel_store.py  channels.json read helper (the discovery source registry)
   discovery.py      RSS feed fetch/parse + discover_and_enqueue(): queues unseen uploads
   job_lock.py       Drive-based advisory lock preventing overlapping discovery runs
+  summarize.py      Claude model call: transcript -> structured, schema-validated summary
+  summary_store.py  summaries/<video_id>.json read/write, idempotency, and summarize_eligible()
   scheduler.py       optional in-process APScheduler wiring
   config.py         environment variable loading/validation
   models.py         request/response schemas
 batch_runner.py     standalone entrypoint for a separate Railway Cron Job service
-discover_and_process.py  standalone entrypoint: discover channel uploads, then process the queue
+discover_and_process.py  standalone entrypoint: discover -> process queue -> summarize eligible transcripts
 get_refresh_token.py  one-time local script to mint the Drive OAuth refresh token
 ```

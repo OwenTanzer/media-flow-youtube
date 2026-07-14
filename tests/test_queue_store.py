@@ -55,3 +55,42 @@ def test_read_queue_ignores_non_string_first_seen_at(monkeypatch):
     entries = queue_store.read_queue("folder-id")
 
     assert entries == [{"url": "https://youtu.be/x"}]
+
+
+def test_entry_published_at_returns_the_raw_string():
+    entry = {"url": "https://youtu.be/x", "published_at": "2026-07-01T12:00:00+00:00"}
+    assert queue_store.entry_published_at(entry) == "2026-07-01T12:00:00+00:00"
+
+
+def test_entry_published_at_returns_none_for_plain_string_entry():
+    assert queue_store.entry_published_at("https://youtu.be/x") is None
+
+
+def test_entry_published_at_returns_none_when_field_missing():
+    assert queue_store.entry_published_at({"url": "https://youtu.be/x"}) is None
+
+
+def test_read_queue_preserves_published_at(monkeypatch):
+    monkeypatch.setattr(queue_store.settings, "dry_run", False)
+    monkeypatch.setattr(
+        queue_store.drive,
+        "download_text",
+        lambda folder_id, filename: '[{"url": "https://youtu.be/x", "published_at": "2026-07-01T12:00:00+00:00"}]',
+    )
+
+    entries = queue_store.read_queue("folder-id")
+
+    assert entries == [{"url": "https://youtu.be/x", "published_at": "2026-07-01T12:00:00+00:00"}]
+
+
+def test_read_queue_ignores_non_string_published_at(monkeypatch):
+    monkeypatch.setattr(queue_store.settings, "dry_run", False)
+    monkeypatch.setattr(
+        queue_store.drive,
+        "download_text",
+        lambda folder_id, filename: '[{"url": "https://youtu.be/x", "published_at": 12345}]',
+    )
+
+    entries = queue_store.read_queue("folder-id")
+
+    assert entries == [{"url": "https://youtu.be/x"}]

@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 
 import pytest
 import yaml
@@ -171,6 +172,43 @@ def test_render_transcript_markdown_title_round_trips_through_json_too():
     title = 'a "quoted" \\ backslash and emoji 🎬'
     dumped = json.dumps(title)
     assert json.loads(dumped) == title
+
+
+def _render_kwargs(**overrides):
+    kwargs = dict(
+        video_id="abc123XYZde",
+        url="https://www.youtube.com/watch?v=abc123XYZde",
+        title="A Title",
+        author="A Channel",
+        fetched_at="2026-07-13T12:00:00+00:00",
+        language="English",
+        language_code="en",
+        is_generated=True,
+        lines=[(0.0, "hello")],
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_render_transcript_markdown_includes_published_at_when_given():
+    md = youtube.render_transcript_markdown(**_render_kwargs(published_at="2026-07-01T00:00:00+00:00"))
+    assert "published_at: 2026-07-01T00:00:00+00:00" in md
+    frontmatter_text = md.split("---")[1]
+    parsed = yaml.safe_load(frontmatter_text)
+    # YAML auto-parses an unquoted ISO8601-looking scalar into a real
+    # datetime (same as fetched_at already does) - still valid frontmatter,
+    # just not a string once loaded.
+    assert parsed["published_at"] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+
+def test_render_transcript_markdown_omits_published_at_when_not_given():
+    """Manually-queued/direct-URL videos have no known publish date (only
+    discover_and_process.py's RSS feed reader sees one) - the key should be
+    entirely absent rather than a fabricated null."""
+    md = youtube.render_transcript_markdown(**_render_kwargs())
+    frontmatter_text = md.split("---")[1]
+    parsed = yaml.safe_load(frontmatter_text)
+    assert "published_at" not in parsed
 
 
 def _clear_proxy_settings(monkeypatch):

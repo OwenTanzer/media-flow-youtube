@@ -237,7 +237,7 @@ def fetch_transcript(video_id: str, languages: list[str]) -> TranscriptResult:
     )
 
 
-def _format_timestamp(seconds: float) -> str:
+def format_timestamp(seconds: float) -> str:
     total = int(seconds)
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
@@ -257,6 +257,7 @@ def render_transcript_markdown(
     language_code: str | None,
     is_generated: bool | None,
     lines: list[tuple[float, str]],
+    published_at: str | None = None,
 ) -> str:
     # JSON string escaping is a valid subset of YAML double-quoted scalar
     # escaping, so json.dumps() gives us a safe quoted YAML value for any
@@ -270,10 +271,20 @@ def render_transcript_markdown(
         f"url: {url}",
         f"channel: {json.dumps(author or 'unknown')}",
         f"fetched_at: {fetched_at}",
+    ]
+    if published_at:
+        # Only known for videos discovered via discover_and_process.py's RSS
+        # feed reader, which is the only source that sees YouTube's own
+        # publish timestamp for a video - manually-queued/direct-URL videos
+        # have no such source, so this is omitted for them rather than
+        # guessed at (e.g. from fetched_at, which can lag the real upload by
+        # anywhere from minutes to the full discovery interval).
+        frontmatter.append(f"published_at: {published_at}")
+    frontmatter += [
         f"language: {json.dumps(language_display)}",
         f"auto_generated: {bool(is_generated)}",
         "---",
         "",
     ]
-    body = [f"[{_format_timestamp(start)}] {text}" for start, text in lines]
+    body = [f"[{format_timestamp(start)}] {text}" for start, text in lines]
     return "\n".join(frontmatter) + "\n".join(body) + "\n"

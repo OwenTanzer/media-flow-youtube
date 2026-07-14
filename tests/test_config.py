@@ -103,3 +103,62 @@ def test_transcript_fetch_max_attempts_rejects_non_positive_values(monkeypatch, 
     monkeypatch.setenv("TRANSCRIPT_FETCH_MAX_ATTEMPTS", value)
     with pytest.raises(ConfigError, match="TRANSCRIPT_FETCH_MAX_ATTEMPTS"):
         _settings_with(monkeypatch)
+
+
+def test_summary_settings_defaults(monkeypatch):
+    settings = _settings_with(monkeypatch)
+    assert settings.summary_model == "claude-haiku-4-5"
+    assert settings.summary_max_output_tokens == 4096
+    assert settings.summary_max_transcript_chars == 400000
+    assert settings.summary_max_videos_per_run == 20
+    assert settings.summary_max_total_tokens_per_run == 500000
+    assert settings.summary_max_cost_usd_per_run == 2.0
+
+
+@pytest.mark.parametrize(
+    "env_var",
+    ["SUMMARY_MAX_OUTPUT_TOKENS", "SUMMARY_MAX_TRANSCRIPT_CHARS", "SUMMARY_MAX_VIDEOS_PER_RUN", "SUMMARY_MAX_TOTAL_TOKENS_PER_RUN"],
+)
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_summary_positive_int_settings_reject_non_positive_values(monkeypatch, env_var, value):
+    monkeypatch.setenv(env_var, value)
+    with pytest.raises(ConfigError, match=env_var):
+        _settings_with(monkeypatch)
+
+
+@pytest.mark.parametrize("value", ["-1", "-0.5", "nan", "inf"])
+def test_summary_max_cost_usd_per_run_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("SUMMARY_MAX_COST_USD_PER_RUN", value)
+    with pytest.raises(ConfigError, match="SUMMARY_MAX_COST_USD_PER_RUN"):
+        _settings_with(monkeypatch)
+
+
+def test_summary_model_with_unknown_pricing_raises(monkeypatch):
+    """Regression test for the review finding: estimate_cost_usd() silently
+    returns None for an unrecognized model, so SUMMARY_MAX_COST_USD_PER_RUN
+    would stop enforcing any real limit without anyone noticing."""
+    monkeypatch.setenv("SUMMARY_MODEL", "some-future-model-not-in-pricing-table")
+    with pytest.raises(ConfigError, match="SUMMARY_MODEL"):
+        _settings_with(monkeypatch)
+
+
+def test_summary_max_attempts_per_video_defaults_to_three(monkeypatch):
+    assert _settings_with(monkeypatch).summary_max_attempts_per_video == 3
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_summary_max_attempts_per_video_rejects_non_positive_values(monkeypatch, value):
+    monkeypatch.setenv("SUMMARY_MAX_ATTEMPTS_PER_VIDEO", value)
+    with pytest.raises(ConfigError, match="SUMMARY_MAX_ATTEMPTS_PER_VIDEO"):
+        _settings_with(monkeypatch)
+
+
+def test_summary_retry_backoff_seconds_defaults_to_900(monkeypatch):
+    assert _settings_with(monkeypatch).summary_retry_backoff_seconds == 900
+
+
+@pytest.mark.parametrize("value", ["-1", "-0.5", "nan", "inf"])
+def test_summary_retry_backoff_seconds_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("SUMMARY_RETRY_BACKOFF_SECONDS", value)
+    with pytest.raises(ConfigError, match="SUMMARY_RETRY_BACKOFF_SECONDS"):
+        _settings_with(monkeypatch)

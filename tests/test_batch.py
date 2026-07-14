@@ -13,7 +13,7 @@ def test_run_batch_with_explicit_urls_never_touches_the_queue(monkeypatch):
     queue_writes = []
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: queue_reads.append(folder_id))
     monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: queue_writes.append(urls))
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result("vid", "ok", url))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: _result("vid", "ok", url))
 
     results = batch.run_batch(urls=["https://www.youtube.com/watch?v=vid"])
 
@@ -34,7 +34,7 @@ def test_run_batch_from_queue_keeps_only_transient_failures(monkeypatch):
         "c": _result("c", "blocked"),  # transient - should stay queued
         "d": _result("d", "error"),  # transient - should stay queued
     }
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: outcomes[url])
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: outcomes[url])
 
     results = batch.run_batch()
 
@@ -50,7 +50,7 @@ def test_run_batch_passes_dict_entry_languages_to_safe_process_video(monkeypatch
 
     seen = {}
 
-    def _fake(url, languages=None):
+    def _fake(url, languages=None, published_at=None):
         seen["url"] = url
         seen["languages"] = languages
         return _result("x", "ok", url)
@@ -63,12 +63,49 @@ def test_run_batch_passes_dict_entry_languages_to_safe_process_video(monkeypatch
     assert seen["languages"] == ["es"]
 
 
+def test_run_batch_passes_dict_entry_published_at_to_safe_process_video(monkeypatch):
+    monkeypatch.setattr(
+        batch.queue_store,
+        "read_queue",
+        lambda folder_id: [{"url": "https://youtu.be/x", "published_at": "2026-07-01T00:00:00+00:00"}],
+    )
+    monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: None)
+
+    seen = {}
+
+    def _fake(url, languages=None, published_at=None):
+        seen["published_at"] = published_at
+        return _result("x", "ok", url)
+
+    monkeypatch.setattr(batch, "safe_process_video", _fake)
+
+    batch.run_batch()
+
+    assert seen["published_at"] == "2026-07-01T00:00:00+00:00"
+
+
+def test_run_batch_passes_none_published_at_for_explicit_url_lists(monkeypatch):
+    """An explicit URL list (e.g. a live POST /batch/run request) has no
+    queue entry to read a publish date from."""
+    seen = {}
+
+    def _fake(url, languages=None, published_at=None):
+        seen["published_at"] = published_at
+        return _result("x", "ok", url)
+
+    monkeypatch.setattr(batch, "safe_process_video", _fake)
+
+    batch.run_batch(urls=["https://youtu.be/x"])
+
+    assert seen["published_at"] is None
+
+
 def test_run_batch_requeues_transient_failure_as_the_same_dict_entry(monkeypatch):
     entry = {"url": "https://youtu.be/x", "languages": ["es"]}
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: [entry])
     written = {}
     monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: written.setdefault("urls", urls))
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result("x", "blocked", url))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: _result("x", "blocked", url))
 
     batch.run_batch()
 
@@ -84,7 +121,7 @@ def test_run_batch_retries_no_captions_within_grace_period(monkeypatch):
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: [entry])
     written = {}
     monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: written.setdefault("urls", urls))
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result("x", "no_captions", url))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: _result("x", "no_captions", url))
 
     batch.run_batch()
 
@@ -97,7 +134,7 @@ def test_run_batch_drops_no_captions_past_grace_period(monkeypatch):
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: [entry])
     written = {}
     monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: written.setdefault("urls", urls))
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result("x", "no_captions", url))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: _result("x", "no_captions", url))
 
     batch.run_batch()
 
@@ -111,7 +148,7 @@ def test_run_batch_drops_no_captions_immediately_when_entry_has_no_first_seen_at
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: ["https://youtu.be/x"])
     written = {}
     monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: written.setdefault("urls", urls))
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result("x", "no_captions", url))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: _result("x", "no_captions", url))
 
     batch.run_batch()
 
@@ -125,7 +162,7 @@ def test_run_batch_does_not_crash_on_a_timezone_naive_first_seen_at(monkeypatch)
     entry = {"url": "https://youtu.be/x", "first_seen_at": "2026-07-14T12:00:00"}
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: [entry])
     monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: None)
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result("x", "no_captions", url))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: _result("x", "no_captions", url))
 
     results = batch.run_batch()  # must not raise
 
@@ -137,7 +174,7 @@ def test_run_batch_does_not_pace_when_at_or_below_threshold(monkeypatch):
     monkeypatch.setattr(batch.settings, "batch_cooldown_seconds", 300)
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: ["a", "b", "c", "d", "e"])
     monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: None)
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: _result(url, "ok", url))
     sleep_calls = []
     monkeypatch.setattr(batch.time, "sleep", lambda seconds: sleep_calls.append(seconds))
 
@@ -155,7 +192,7 @@ def test_run_batch_paces_in_cooled_down_chunks_when_above_threshold(monkeypatch)
     monkeypatch.setattr(batch.settings, "batch_cooldown_seconds", 300)
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: ["a", "b", "c", "d", "e"])
     monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: None)
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: _result(url, "ok", url))
     sleep_calls = []
     monkeypatch.setattr(batch.time, "sleep", lambda seconds: sleep_calls.append(seconds))
 
@@ -173,7 +210,7 @@ def test_run_batch_does_not_pace_explicit_url_lists(monkeypatch):
     queue path, which is only ever driven by standalone scripts."""
     monkeypatch.setattr(batch.settings, "batch_size_threshold", 1)
     monkeypatch.setattr(batch.settings, "batch_cooldown_seconds", 300)
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: _result(url, "ok", url))
     sleep_calls = []
     monkeypatch.setattr(batch.time, "sleep", lambda seconds: sleep_calls.append(seconds))
 
@@ -201,7 +238,7 @@ def test_run_batch_checkpoints_queue_after_every_chunk(monkeypatch):
         "d": _result("d", "blocked"),  # transient - stays queued
         "e": _result("e", "ok"),
     }
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: outcomes[url])
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: outcomes[url])
 
     checkpoints = []
     monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: checkpoints.append(list(urls)))
@@ -226,7 +263,7 @@ def test_run_batch_renews_after_every_entry_and_before_each_checkpoint(monkeypat
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: ["a", "b", "c", "d", "e"])
     monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: None)
     monkeypatch.setattr(batch.time, "sleep", lambda seconds: None)
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: _result(url, "ok", url))
 
     calls = []
     batch.run_batch(on_progress=lambda: calls.append(1))
@@ -243,7 +280,7 @@ def test_run_batch_calls_on_progress_in_the_unpaced_path_too(monkeypatch):
     chunking, so discover_and_process.py should get a chance to renew."""
     monkeypatch.setattr(batch.queue_store, "read_queue", lambda folder_id: ["a"])
     monkeypatch.setattr(batch.queue_store, "write_queue", lambda folder_id, urls: None)
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: _result(url, "ok", url))
 
     calls = []
     batch.run_batch(on_progress=lambda: calls.append(1))
@@ -252,7 +289,7 @@ def test_run_batch_calls_on_progress_in_the_unpaced_path_too(monkeypatch):
 
 
 def test_run_batch_does_not_call_on_progress_for_explicit_url_lists(monkeypatch):
-    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None: _result(url, "ok", url))
+    monkeypatch.setattr(batch, "safe_process_video", lambda url, languages=None, published_at=None: _result(url, "ok", url))
 
     calls = []
     batch.run_batch(urls=["a", "b"], on_progress=lambda: calls.append(1))
