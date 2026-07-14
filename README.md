@@ -668,10 +668,19 @@ gate), since it's meant to be a publicly viewable dashboard.
 ### Run locally
 
 ```bash
-pip install -r requirements.txt   # includes streamlit
+pip install -r requirements-vidproc.txt   # separate from requirements.txt - see below
 export DRIVE_FOLDER_ID=... GOOGLE_OAUTH_CLIENT_ID=... GOOGLE_OAUTH_CLIENT_SECRET=... GOOGLE_OAUTH_REFRESH_TOKEN=...
 streamlit run vidproc_app.py
 ```
+
+Uses its own `requirements-vidproc.txt`, not the main `requirements.txt` -
+streamlit's Starlette-based server needs a newer `starlette` than
+`fastapi==0.115.6` (in `requirements.txt`) allows in the same environment;
+installing both together resolves to a `starlette` too old for streamlit
+and it fails at import time. `vidproc_app.py`'s own import chain never
+touches fastapi/starlette/uvicorn/APScheduler, so there's no reason to
+force them into the same resolution. The deployed service
+(`Dockerfile.vidproc`) keeps the same isolation for the same reason.
 
 Reuses the same `DRIVE_FOLDER_ID` and Google OAuth credentials as the rest
 of the app (read-only) - no separate setup. If those aren't set, or Drive
@@ -712,7 +721,13 @@ hidden.
 Runs as its own Railway service using `railway.vidproc.toml`, following
 the same multi-service-per-repo pattern already used for
 `railway.discover-and-process.toml` - each Railway service in the project
-picks a different `railway.*.toml` as its config file.
+picks a different `railway.*.toml` as its config file. Unlike the other
+two services, this one builds from a dedicated `Dockerfile.vidproc`
+(`builder = "DOCKERFILE"`) instead of Railway's default Nixpacks
+auto-detection, installing only `requirements-vidproc.txt` - Nixpacks
+would otherwise auto-install the repo-root `requirements.txt`
+(fastapi/uvicorn/starlette) into the same environment as streamlit,
+which conflicts (see "Insight dashboard" → "Run locally" above).
 
 **Note on the deployment target:** issue #8 originally asked for
 `moopertonic.net/vidproc` (an apex-domain path, via a Cloudflare Worker
@@ -796,6 +811,8 @@ vidproc/
   styling.py         CSS/color constants for the dashboard's visual framework
   state.py           pure group/channel-filter/sort logic, no Streamlit import
   render.py          feed-card and detail-view rendering
+requirements-vidproc.txt  separate, minimal dependency set for the dashboard - see "Insight dashboard" above
+Dockerfile.vidproc  dedicated build for the vidproc Railway service (isolated from requirements.txt)
 batch_runner.py     standalone entrypoint for a separate Railway Cron Job service
 discover_and_process.py  standalone entrypoint: discover -> process queue -> summarize eligible transcripts
 backfill_channel_ids.py  one-off script: recover channel_id for pre-existing summaries

@@ -1,0 +1,22 @@
+# Dependencies for vidproc_app.py (the Streamlit dashboard, issue #8) -
+# deliberately separate from requirements.txt, not merged into it.
+#
+# streamlit's Starlette-based server needs a newer starlette than
+# fastapi==0.115.6 (in requirements.txt) allows in the same environment -
+# installing both from one requirements file resolves to a starlette
+# version too old for streamlit, which then fails at import time
+# (ImportError: cannot import name 'DEFAULT_EXCLUDED_CONTENT_TYPES' from
+# 'starlette.middleware.gzip'). vidproc_app.py's own import chain (via
+# app/insights_store.py, app/channel_store.py, app/drive.py,
+# app/summary_store.py, app/youtube.py) never touches fastapi/starlette/
+# uvicorn/APScheduler at all, so there's no reason to force them into the
+# same resolution - this file and the Dockerfile.vidproc build that uses
+# it keep the two services' dependency sets fully isolated.
+streamlit==1.59.2
+youtube-transcript-api==1.2.4
+google-api-python-client==2.157.0
+google-auth==2.37.0
+google-auth-httplib2==0.2.0
+requests==2.32.3
+pydantic==2.10.4
+anthropic==0.116.0
