@@ -68,8 +68,12 @@ def test_batch_size_threshold_rejects_non_positive_values(monkeypatch, value):
         _settings_with(monkeypatch)
 
 
-def test_batch_cooldown_seconds_defaults_to_300(monkeypatch):
-    assert _settings_with(monkeypatch).batch_cooldown_seconds == 300
+def test_batch_cooldown_seconds_defaults_to_zero(monkeypatch):
+    """Regression test: an earlier default of 300s assumed a cooldown was
+    needed to let a degraded proxy pool recover. Controlled testing
+    disproved that (see README's egress proxy section), so chunking's only
+    remaining job is checkpointing - which doesn't require sleeping."""
+    assert _settings_with(monkeypatch).batch_cooldown_seconds == 0
 
 
 @pytest.mark.parametrize("value", ["-1", "-0.5", "nan", "inf"])
@@ -87,6 +91,17 @@ def test_no_captions_grace_hours_defaults_to_24(monkeypatch):
 def test_no_captions_grace_hours_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("NO_CAPTIONS_GRACE_HOURS", value)
     with pytest.raises(ConfigError, match="NO_CAPTIONS_GRACE_HOURS"):
+        _settings_with(monkeypatch)
+
+
+def test_transcript_fetch_max_attempts_defaults_to_three(monkeypatch):
+    assert _settings_with(monkeypatch).transcript_fetch_max_attempts == 3
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_transcript_fetch_max_attempts_rejects_non_positive_values(monkeypatch, value):
+    monkeypatch.setenv("TRANSCRIPT_FETCH_MAX_ATTEMPTS", value)
+    with pytest.raises(ConfigError, match="TRANSCRIPT_FETCH_MAX_ATTEMPTS"):
         _settings_with(monkeypatch)
 
 
