@@ -168,6 +168,48 @@ def test_read_summaries_bulk_lists_folder_once_and_downloads_by_id(monkeypatch):
     assert result == {"vid1": {"status": "ok", "video_id": "vid1"}, "vid2": {"status": "ok", "video_id": "vid2"}}
 
 
+def test_read_summaries_bulk_downloads_concurrently_within_the_worker_cap(monkeypatch):
+    """Regression test: downloads must actually overlap in time (not just
+    aggregate correctly one-at-a-time), and never exceed
+    BULK_READ_MAX_WORKERS concurrent downloads at once - the whole point
+    of pooling this is to cut wall-clock time on a large archive without
+    unbounded simultaneous Drive connections."""
+    import threading
+    import time
+
+    monkeypatch.setattr(summary_store.settings, "dry_run", False)
+    monkeypatch.setattr(summary_store, "BULK_READ_MAX_WORKERS", 3)
+    monkeypatch.setattr(summary_store.drive, "get_or_create_folder", lambda parent, name: "summaries-folder-id")
+    video_ids = [f"vid{i}" for i in range(10)]
+    monkeypatch.setattr(
+        summary_store.drive,
+        "list_files",
+        lambda folder_id: {f"{vid}.json": f"file-{vid}" for vid in video_ids},
+    )
+
+    lock = threading.Lock()
+    concurrent_count = 0
+    max_concurrent_seen = 0
+
+    def _download_text_by_id(file_id):
+        nonlocal concurrent_count, max_concurrent_seen
+        with lock:
+            concurrent_count += 1
+            max_concurrent_seen = max(max_concurrent_seen, concurrent_count)
+        time.sleep(0.05)
+        with lock:
+            concurrent_count -= 1
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(summary_store.drive, "download_text_by_id", _download_text_by_id)
+
+    result = summary_store.read_summaries_bulk("folder-id", video_ids)
+
+    assert len(result) == 10
+    assert max_concurrent_seen > 1, "downloads never overlapped - not actually concurrent"
+    assert max_concurrent_seen <= 3, f"exceeded the configured worker cap: saw {max_concurrent_seen} at once"
+
+
 def test_read_summaries_bulk_isolates_a_single_download_failure(monkeypatch):
     """Regression test: one video's download raising (network error, Drive
     5xx, etc.) must not discard artifacts already downloaded successfully

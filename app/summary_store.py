@@ -11,6 +11,7 @@ import logging
 import os
 import re
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -31,6 +32,15 @@ from .youtube import format_timestamp
 logger = logging.getLogger("media_flow.summary_store")
 
 SUMMARIES_FOLDER_NAME = "summaries"
+
+# Bounded, not unlimited - drive.get_drive_service() builds one Drive
+# service (and does an OAuth refresh) per thread the first time it's
+# used on that thread, so an unbounded pool would mean an unbounded
+# number of simultaneous OAuth refreshes/connections on a large archive.
+# ThreadPoolExecutor reuses the same fixed set of worker threads across
+# calls, so each worker's Drive service is built once and reused for
+# every download it handles, not rebuilt per file.
+BULK_READ_MAX_WORKERS = int(os.environ.get("SUMMARY_BULK_READ_MAX_WORKERS", "8"))
 
 # Prefixed onto a fallback summary's text (see summarize_eligible()'s
 # last-attempt handling) so it's visually distinguishable from a normal,
@@ -82,6 +92,13 @@ def read_summaries_bulk(folder_id: str, video_ids: list[str]) -> dict[str, dict]
     video_ids with no summary file yet are simply absent from the
     returned dict, same as read_summary() returning None for them.
 
+    Downloads run concurrently (bounded by BULK_READ_MAX_WORKERS) - this
+    was the dominant cost once there were more than a handful of videos,
+    since each download is its own Drive round trip and they don't depend
+    on each other. Safe now that drive.get_drive_service() is thread-local
+    (see drive.py) - each worker thread gets its own Drive service/http
+    connection instead of sharing one across threads.
+
     A download failure (network error, Drive 5xx, etc. - already retried
     internally by drive.download_text_by_id()) is isolated to that one
     video_id and logged, not allowed to escape and cost every
@@ -96,20 +113,32 @@ def read_summaries_bulk(folder_id: str, video_ids: list[str]) -> dict[str, dict]
     summaries_folder_id = drive.get_or_create_folder(folder_id, SUMMARIES_FOLDER_NAME)
     files_by_name = drive.list_files(summaries_folder_id)
 
-    artifacts: dict[str, dict] = {}
-    for video_id in video_ids:
-        file_id = files_by_name.get(_summary_filename(video_id))
-        if file_id is None:
-            continue
+    to_fetch = [
+        (video_id, files_by_name[_summary_filename(video_id)])
+        for video_id in video_ids
+        if _summary_filename(video_id) in files_by_name
+    ]
+    if not to_fetch:
+        return {}
+
+    def _fetch(item: tuple[str, str]) -> tuple[str, dict | None]:
+        video_id, file_id = item
         try:
             text = drive.download_text_by_id(file_id)
         except Exception:  # noqa: BLE001
             logger.warning("Failed to download summary artifact for %s; skipping for this load.", video_id, exc_info=True)
-            continue
+            return video_id, None
         try:
-            artifacts[video_id] = json.loads(text)
+            return video_id, json.loads(text)
         except json.JSONDecodeError:
             logger.warning("Summary artifact for %s was not valid JSON; treating as absent.", video_id)
+            return video_id, None
+
+    artifacts: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=min(BULK_READ_MAX_WORKERS, len(to_fetch))) as pool:
+        for video_id, artifact in pool.map(_fetch, to_fetch):
+            if artifact is not None:
+                artifacts[video_id] = artifact
     return artifacts
 
 
