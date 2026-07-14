@@ -94,3 +94,42 @@ def test_read_queue_ignores_non_string_published_at(monkeypatch):
     entries = queue_store.read_queue("folder-id")
 
     assert entries == [{"url": "https://youtu.be/x"}]
+
+
+def test_entry_channel_id_returns_the_raw_string():
+    entry = {"url": "https://youtu.be/x", "channel_id": "UC_a"}
+    assert queue_store.entry_channel_id(entry) == "UC_a"
+
+
+def test_entry_channel_id_returns_none_for_plain_string_entry():
+    assert queue_store.entry_channel_id("https://youtu.be/x") is None
+
+
+def test_entry_channel_id_returns_none_when_field_missing():
+    assert queue_store.entry_channel_id({"url": "https://youtu.be/x"}) is None
+
+
+def test_read_queue_preserves_channel_id(monkeypatch):
+    monkeypatch.setattr(queue_store.settings, "dry_run", False)
+    monkeypatch.setattr(
+        queue_store.drive,
+        "download_text",
+        lambda folder_id, filename: '[{"url": "https://youtu.be/x", "channel_id": "UC_a"}]',
+    )
+
+    entries = queue_store.read_queue("folder-id")
+
+    assert entries == [{"url": "https://youtu.be/x", "channel_id": "UC_a"}]
+
+
+def test_read_queue_ignores_non_string_channel_id(monkeypatch):
+    monkeypatch.setattr(queue_store.settings, "dry_run", False)
+    monkeypatch.setattr(
+        queue_store.drive,
+        "download_text",
+        lambda folder_id, filename: '[{"url": "https://youtu.be/x", "channel_id": 12345}]',
+    )
+
+    entries = queue_store.read_queue("folder-id")
+
+    assert entries == [{"url": "https://youtu.be/x"}]

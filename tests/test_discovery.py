@@ -92,6 +92,7 @@ def test_discover_and_enqueue_queues_newly_discovered_video(monkeypatch):
         {
             "url": "https://www.youtube.com/watch?v=newvideo11",
             "first_seen_at": FIXED_NOW.isoformat(),
+            "channel_id": "UC_a",
             "published_at": "2026-07-01T00:00:00+00:00",
         }
     ]
@@ -115,6 +116,7 @@ def test_discover_and_enqueue_omits_published_at_when_feed_has_none(monkeypatch)
     discovery.discover_and_enqueue("folder-id")
 
     assert "published_at" not in written["entries"][0]
+    assert written["entries"][0]["channel_id"] == "UC_a"
 
 
 def test_discover_and_enqueue_skips_already_indexed_video(monkeypatch):
@@ -152,7 +154,11 @@ def test_discover_and_enqueue_isolates_one_channels_feed_failure(monkeypatch):
     report = discovery.discover_and_enqueue("folder-id")
 
     assert written["entries"] == [
-        {"url": "https://www.youtube.com/watch?v=goodvideo1", "first_seen_at": FIXED_NOW.isoformat()}
+        {
+            "url": "https://www.youtube.com/watch?v=goodvideo1",
+            "first_seen_at": FIXED_NOW.isoformat(),
+            "channel_id": "UC_good",
+        }
     ]
     assert report.newly_queued == 1
     assert len(report.feed_failures) == 1
@@ -172,6 +178,7 @@ def test_discover_and_enqueue_applies_channel_language_override(monkeypatch):
         {
             "url": "https://www.youtube.com/watch?v=newvideo22",
             "first_seen_at": FIXED_NOW.isoformat(),
+            "channel_id": "UC_a",
             "languages": ["es", "pt"],
         }
     ]

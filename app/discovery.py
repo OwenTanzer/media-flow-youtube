@@ -112,7 +112,7 @@ def discover_and_enqueue(folder_id: str) -> DiscoveryReport:
                 continue
             seen_this_run.add(video.video_id)
             url = youtube.canonical_url(video.video_id)
-            entry: dict = {"url": url, "first_seen_at": _utcnow().isoformat()}
+            entry: dict = {"url": url, "first_seen_at": _utcnow().isoformat(), "channel_id": channel.channel_id}
             if video.published:
                 entry["published_at"] = video.published
             if channel.languages:

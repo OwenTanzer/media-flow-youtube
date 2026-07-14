@@ -317,7 +317,8 @@ its own via each channel's public RSS feed.
     {
       "channel_id": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
       "name": "Google for Developers",
-      "enabled": true
+      "enabled": true,
+      "group": "Google"
     },
     {
       "channel_id": "UCsomeSpanishChannelId",
@@ -334,6 +335,10 @@ its own via each channel's public RSS feed.
 - `enabled: false` skips a channel without deleting its entry.
 - `languages` is optional; when set, it overrides `TRANSCRIPT_LANGUAGES`
   for videos discovered from that channel only.
+- `group` is optional and drives the top-level tabs in the Streamlit
+  dashboard (see "Insight dashboard" below) - it defaults to `"Finance"`
+  when absent, so only channels that should appear under a different
+  group (currently just `"Google"`) need to set it explicitly.
 
 No deployment is needed to add, remove, enable, or disable a channel —
 just edit `channels.json` in Drive, same as `queue.json`.
@@ -431,6 +436,7 @@ required once it's set - all other settings have working defaults. See
   "author": "Rick Astley",
   "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
   "video_published_at": "2026-07-10T14:00:00+00:00",
+  "channel_id": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
   "video_type": "Analytic Overview",
   "summary": "...",
   "points": [
@@ -445,12 +451,16 @@ required once it's set - all other settings have working defaults. See
 }
 ```
 
-`title`, `author`, `url`, `video_published_at`, the source Drive file ID,
-and the transcript hash are always populated by application code from
-`_index.json` and the archived transcript file itself - never trusted
-from the model's output. `video_published_at` is `null` unless the video
-was discovered via RSS (see "Transcript file format" above) - there's no
-other source for it.
+`title`, `author`, `url`, `video_published_at`, `channel_id`, the source
+Drive file ID, and the transcript hash are always populated by application
+code from `_index.json` and the archived transcript file itself - never
+trusted from the model's output. `video_published_at` and `channel_id` are
+both `null` unless the video was discovered via RSS (see "Transcript file
+format" above) - there's no other source for either. `channel_id` is the
+stable `channels.json` ID, not the free-text `author` name embedded in the
+transcript - a downstream consumer that needs to reliably match a summary
+back to its channel registry entry (e.g. the Streamlit dashboard, issue #8)
+should join on `channel_id`, not `author`.
 This is the normal shape - see "Idempotency and retries" below for the
 one exception (a fallback plain-prose summary, with `points: []` and
 `video_type: null`, used only after a video exhausts its retry budget).
@@ -683,6 +693,137 @@ renewed before each attempt) is the sole retry authority instead - the
 same fix already applied to the Webshare proxy's internal retries in
 `app/youtube.py`.
 
+## Insight dashboard (optional)
+
+`vidproc_app.py` is a read-only Streamlit dashboard over the summary
+archive - browse collected videos by group (Finance/Google, driven by each
+channel's `group` field in `channels.json`) and channel, then open one to
+read its generated summary and timestamped points. It's deliberately
+**public and unauthenticated** (unlike the FastAPI service's `X-API-Key`
+gate), since it's meant to be a publicly viewable dashboard.
+
+### Run locally
+
+```bash
+pip install -r requirements-vidproc.txt   # separate from requirements.txt - see below
+export DRIVE_FOLDER_ID=... GOOGLE_OAUTH_CLIENT_ID=... GOOGLE_OAUTH_CLIENT_SECRET=... GOOGLE_OAUTH_REFRESH_TOKEN=...
+streamlit run vidproc_app.py
+```
+
+Uses its own `requirements-vidproc.txt`, not the main `requirements.txt` -
+streamlit's Starlette-based server needs a newer `starlette` than
+`fastapi==0.115.6` (in `requirements.txt`) allows in the same environment;
+installing both together resolves to a `starlette` too old for streamlit
+and it fails at import time. `vidproc_app.py`'s own import chain never
+touches fastapi/starlette/uvicorn/APScheduler, so there's no reason to
+force them into the same resolution. The deployed service
+(`Dockerfile.vidproc`) keeps the same isolation for the same reason.
+
+Reuses the same `DRIVE_FOLDER_ID` and Google OAuth credentials as the rest
+of the app (read-only) - no separate setup. If those aren't set, or Drive
+access fails, the app renders a generic "temporarily unavailable" page
+rather than an error page, a stack trace, or any credential/Drive detail -
+this is the public-facing failure state, not a bug.
+
+### How it reads data
+
+Everything is assembled read-only from the same three Drive-hosted
+sources the pipeline already writes - `channels.json`, `_index.json`, and
+each video's `summaries/<video_id>.json` - via `app/insights_store.py`. No
+new Drive capability was needed: `_index.json` already enumerates every
+video ever attempted, so the dashboard never lists a Drive folder
+directly. A video only appears once it has a `status: "ok"` summary
+artifact; a video that's never been summarized, or whose summarization
+recorded `status: "error"`, is counted in a small "N pending" note in the
+header rather than shown as a broken feed item.
+
+Channel grouping is resolved via `channel_id` (see "Transcript
+summarization" above) - a video whose `channel_id` doesn't match any
+currently configured channel (predates that field, or its channel was
+later removed from the registry) falls back to the **Finance** group and
+appears there under an **"Unassigned / Other"** pseudo-channel in the
+channel filter, rather than a separate top-level tab, so group tabs stay
+purely driven by `channels.json` membership. Run
+`python backfill_channel_ids.py` once to backfill `channel_id` onto
+already-archived summaries from before that field existed (see the script
+for details/limitations).
+
+Minor insight points are shown alongside major ones by default (major
+points bold, minor visually de-emphasized) with a "Show minor points"
+toggle in the detail view to hide them - no point is ever permanently
+hidden.
+
+### Deploying the insight dashboard
+
+Runs as its own Railway service using `railway.vidproc.toml`, following
+the same multi-service-per-repo pattern already used for
+`railway.discover-and-process.toml` - each Railway service in the project
+picks a different `railway.*.toml` as its config file. Unlike the other
+two services, this one builds from a dedicated `Dockerfile.vidproc`
+(`builder = "DOCKERFILE"`) instead of Railway's default Nixpacks
+auto-detection, installing only `requirements-vidproc.txt` - Nixpacks
+would otherwise auto-install the repo-root `requirements.txt`
+(fastapi/uvicorn/starlette) into the same environment as streamlit,
+which conflicts (see "Insight dashboard" → "Run locally" above).
+
+**Note on the deployment target:** issue #8 originally asked for
+`moopertonic.net/vidproc` (an apex-domain path, via a Cloudflare Worker
+path-proxy). This deploys as a **subdomain**, `vidproc.moopertonic.net`,
+instead - the same pattern already used in production for
+`oil.moopertonic.net` (`OwenTanzer/oil-futures`, a Cloudflare-proxied
+CNAME straight to a Railway custom domain, no Worker). Simpler, and
+consistent with existing infrastructure.
+
+1. **Railway service.** In the existing Railway project, add a new
+   service pointed at this repo/branch, with `railway.vidproc.toml` as its
+   config file. Set its environment variables: `DRIVE_FOLDER_ID`,
+   `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` /
+   `GOOGLE_OAUTH_REFRESH_TOKEN` (the same read-only Drive credentials as
+   the main service), and optionally `VIDPROC_CACHE_TTL_SECONDS`.
+   **Do not set `API_KEY`** - this service has no gate. Deploy, and
+   confirm it boots correctly on its default `*.up.railway.app` domain
+   before touching DNS.
+
+2. **Custom domain.** In the new service's Railway settings → Networking →
+   Custom Domain, add `vidproc.moopertonic.net`. Railway generates a
+   target CNAME value specific to this binding.
+
+3. **Cloudflare DNS.** In the `moopertonic.net` zone, add a CNAME record:
+   Name `vidproc`, Target the value from step 2, Proxy status **Proxied**
+   - mirroring `oil.moopertonic.net`'s existing record (check its actual
+   TTL/proxy settings in the live zone first, to genuinely match it rather
+   than assume).
+
+4. Wait for DNS propagation and Railway's automatic TLS issuance, then
+   confirm `https://vidproc.moopertonic.net` serves the app correctly.
+
+**Rollback:** remove the Cloudflare CNAME record for `vidproc`, and remove
+(or leave unbound) the custom domain in the Railway service's settings.
+Neither step touches `railway.toml`, the main FastAPI service, or any
+other DNS record in the zone - this is an entirely separate service plus
+one additive DNS record, isolated by construction.
+
+**Deployed smoke test** (manual checklist - run once against
+`vidproc.moopertonic.net` after DNS/TLS settle):
+
+1. Direct navigation loads the header, tabs, and a populated (or cleanly
+   empty) feed.
+2. Hard refresh reloads correctly, no stale/broken state.
+3. Switching group tabs updates the feed and resets the channel filter to
+   "All channels" for the new group.
+4. Selecting individual channels vs. "All channels" narrows the feed
+   correctly, interactively (no full page reload).
+5. Opening a headline shows points in timestamp order; "Back to feed"
+   returns to the same group/channel scope.
+6. A point's timestamp link opens the source video anchored near the
+   right time.
+7. The Drive-transcript link (where present) opens a valid, view-only
+   link.
+8. The unavailable-service state is verified **locally** (temporarily
+   unset `DRIVE_FOLDER_ID` and confirm the clean, generic message with no
+   credential/stack-trace detail) - not tested against live prod, since
+   prod shouldn't be intentionally broken.
+
 ## Project layout
 
 ```
@@ -698,10 +839,19 @@ app/
   job_lock.py       Drive-based advisory lock preventing overlapping discovery runs
   summarize.py      Claude model call: transcript -> structured, schema-validated summary
   summary_store.py  summaries/<video_id>.json read/write, idempotency, and summarize_eligible()
+  insights_store.py  read-only data layer for the Streamlit dashboard: load_snapshot()
   scheduler.py       optional in-process APScheduler wiring
   config.py         environment variable loading/validation
   models.py         request/response schemas
+vidproc_app.py      Streamlit dashboard entrypoint (streamlit run vidproc_app.py)
+vidproc/
+  styling.py         CSS/color constants for the dashboard's visual framework
+  state.py           pure group/channel-filter/sort logic, no Streamlit import
+  render.py          feed-card and detail-view rendering
+requirements-vidproc.txt  separate, minimal dependency set for the dashboard - see "Insight dashboard" above
+Dockerfile.vidproc  dedicated build for the vidproc Railway service (isolated from requirements.txt)
 batch_runner.py     standalone entrypoint for a separate Railway Cron Job service
 discover_and_process.py  standalone entrypoint: discover -> process queue -> summarize eligible transcripts
+backfill_channel_ids.py  one-off script: recover channel_id for pre-existing summaries
 get_refresh_token.py  one-time local script to mint the Drive OAuth refresh token
 ```

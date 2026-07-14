@@ -14,10 +14,10 @@ class _FakeCreds:
 
 
 @pytest.fixture(autouse=True)
-def _reset_cached_service(monkeypatch):
-    monkeypatch.setattr(drive, "_service", None)
+def _reset_cached_service():
+    drive._thread_local.service = None
     yield
-    monkeypatch.setattr(drive, "_service", None)
+    drive._thread_local.service = None
 
 
 def test_get_drive_service_builds_credentials_from_oauth_env(monkeypatch):
@@ -75,7 +75,7 @@ class _FakeExecutable:
     def __init__(self, result):
         self._result = result
 
-    def execute(self):
+    def execute(self, **kwargs):
         return self._result
 
 
@@ -123,3 +123,78 @@ def test_get_or_create_folder_creates_when_missing(monkeypatch):
     assert body["name"] == "summaries"
     assert body["parents"] == ["parent-id"]
     assert body["mimeType"] == "application/vnd.google-apps.folder"
+
+
+class _FakePaginatedFilesResource:
+    """Serves list() across two pages, so list_files() is exercised for
+    pagination rather than just the single-page case."""
+
+    def __init__(self, pages):
+        self._pages = pages
+        self.list_calls = []
+
+    def list(self, **kwargs):
+        self.list_calls.append(kwargs)
+        page_token = kwargs.get("pageToken")
+        index = 0 if page_token is None else self._pages_by_token[page_token]
+        return _FakeExecutable(self._pages[index])
+
+
+class _FakePaginatedService:
+    def __init__(self, pages):
+        self._files = _FakePaginatedFilesResource(pages)
+
+    def files(self):
+        return self._files
+
+
+def test_list_files_returns_name_to_id_mapping_across_pages(monkeypatch):
+    pages = [
+        {"nextPageToken": "page-2", "files": [{"id": "id-1", "name": "vid1.json"}]},
+        {"files": [{"id": "id-2", "name": "vid2.json"}]},
+    ]
+    resource = _FakePaginatedFilesResource(pages)
+    resource._pages_by_token = {"page-2": 1}
+    fake_service = _FakePaginatedService(pages)
+    fake_service._files = resource
+    monkeypatch.setattr(drive, "get_drive_service", lambda: fake_service)
+
+    result = drive.list_files("folder-id")
+
+    assert result == {"vid1.json": "id-1", "vid2.json": "id-2"}
+    assert len(resource.list_calls) == 2
+    assert resource.list_calls[0]["pageToken"] is None
+    assert resource.list_calls[1]["pageToken"] == "page-2"
+
+
+def test_list_files_returns_empty_dict_for_empty_folder(monkeypatch):
+    fake_service = _FakeService({"files": []})
+    monkeypatch.setattr(drive, "get_drive_service", lambda: fake_service)
+
+    assert drive.list_files("folder-id") == {}
+
+
+def test_download_text_by_id_reads_file_content(monkeypatch):
+    class _FakeDownloader:
+        def __init__(self, buffer, request):
+            self._buffer = buffer
+            self._request = request
+
+        def next_chunk(self, **kwargs):
+            self._buffer.write(self._request)
+            return None, True
+
+    class _FakeFilesResourceForDownload:
+        def get_media(self, fileId):
+            return f"content-for-{fileId}".encode()
+
+    class _FakeServiceForDownload:
+        def files(self):
+            return _FakeFilesResourceForDownload()
+
+    monkeypatch.setattr(drive, "get_drive_service", lambda: _FakeServiceForDownload())
+    monkeypatch.setattr(drive, "MediaIoBaseDownload", _FakeDownloader)
+
+    text = drive.download_text_by_id("file-id-1")
+
+    assert text == "content-for-file-id-1"

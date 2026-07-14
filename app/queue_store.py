@@ -16,6 +16,12 @@ dict with a required "url" plus optional overrides:
   through to the transcript frontmatter and _index.json so downstream
   consumers (e.g. a future visualizer) can sort by when a video was
   actually published, not merely when this app happened to fetch it.
+- "channel_id": the stable channels.json channel_id that discovery.py
+  found this video from (only known for RSS-discovered videos, same as
+  published_at). Carried through to _index.json and, for summarized
+  videos, the summary artifact, so a consumer can join a video back to
+  its channel's registry entry (and thus its group) reliably, instead of
+  matching on the free-text channel name embedded in the transcript.
 
 Plain-string entries (including ones added manually, without
 first_seen_at/published_at) get no grace period and no publish date -
@@ -56,6 +62,13 @@ def entry_published_at(entry: str | dict) -> str | None:
     if not isinstance(entry, dict):
         return None
     value = entry.get("published_at")
+    return value if isinstance(value, str) else None
+
+
+def entry_channel_id(entry: str | dict) -> str | None:
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("channel_id")
     return value if isinstance(value, str) else None
 
 
@@ -107,6 +120,9 @@ def read_queue(folder_id: str) -> list[str | dict]:
             published_at = item.get("published_at")
             if isinstance(published_at, str):
                 parsed["published_at"] = published_at
+            channel_id = item.get("channel_id")
+            if isinstance(channel_id, str):
+                parsed["channel_id"] = channel_id
             entries.append(parsed)
         else:
             entries.append(str(item))

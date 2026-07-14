@@ -23,6 +23,12 @@ class Channel:
     name: str
     enabled: bool = True
     languages: list[str] | None = None
+    # The dashboard's top-level classification (issue #8) - e.g. "Finance"
+    # or "Google". Left as None (rather than defaulted here) when absent
+    # from the registry, so a caller can distinguish "explicitly set" from
+    # "unset, needs a fallback" - the fallback itself belongs at the point
+    # group is consumed, not here.
+    group: str | None = None
 
 
 def read_channels(folder_id: str) -> list[Channel]:
@@ -50,12 +56,14 @@ def read_channels(folder_id: str) -> list[Channel]:
             logger.warning("Skipping malformed channels.json entry: %r", entry)
             continue
         languages = entry.get("languages")
+        group = entry.get("group")
         channels.append(
             Channel(
                 channel_id=entry["channel_id"],
                 name=str(entry.get("name") or entry["channel_id"]),
                 enabled=bool(entry.get("enabled", True)),
                 languages=[str(code) for code in languages] if isinstance(languages, list) and languages else None,
+                group=group if isinstance(group, str) and group.strip() else None,
             )
         )
     return channels
