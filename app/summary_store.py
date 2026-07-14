@@ -10,7 +10,9 @@ import json
 import logging
 import os
 import re
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -31,6 +33,25 @@ from .youtube import format_timestamp
 logger = logging.getLogger("media_flow.summary_store")
 
 SUMMARIES_FOLDER_NAME = "summaries"
+
+# A single process-wide pool, not one created and torn down per
+# read_summaries_bulk() call - a per-call `with ThreadPoolExecutor(...)`
+# shuts its threads down on exit, which would rebuild every worker's
+# thread-local Drive client (and redo its OAuth refresh) on every single
+# snapshot load, defeating the point of thread-local reuse in drive.py.
+# Built lazily (not at import) so tests can monkeypatch
+# settings.summary_bulk_read_max_workers before first use.
+_bulk_read_executor: ThreadPoolExecutor | None = None
+_bulk_read_executor_lock = threading.Lock()
+
+
+def _get_bulk_read_executor() -> ThreadPoolExecutor:
+    global _bulk_read_executor
+    if _bulk_read_executor is None:
+        with _bulk_read_executor_lock:
+            if _bulk_read_executor is None:
+                _bulk_read_executor = ThreadPoolExecutor(max_workers=settings.summary_bulk_read_max_workers)
+    return _bulk_read_executor
 
 # Prefixed onto a fallback summary's text (see summarize_eligible()'s
 # last-attempt handling) so it's visually distinguishable from a normal,
@@ -64,10 +85,14 @@ def read_summary(folder_id: str, video_id: str) -> dict | None:
     if text is None:
         return None
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
         logger.warning("Summary artifact for %s was not valid JSON; treating as absent.", video_id)
         return None
+    if not isinstance(parsed, dict):
+        logger.warning("Summary artifact for %s was valid JSON but not an object; treating as absent.", video_id)
+        return None
+    return parsed
 
 
 def read_summaries_bulk(folder_id: str, video_ids: list[str]) -> dict[str, dict]:
@@ -81,6 +106,14 @@ def read_summaries_bulk(folder_id: str, video_ids: list[str]) -> dict[str, dict]
 
     video_ids with no summary file yet are simply absent from the
     returned dict, same as read_summary() returning None for them.
+
+    Downloads run concurrently on a process-wide pool bounded by
+    settings.summary_bulk_read_max_workers - this was the dominant cost
+    once there were more than a handful of videos, since each download is
+    its own Drive round trip and they don't depend on each other. Safe now
+    that drive.get_drive_service() is thread-local (see drive.py) - each
+    worker thread gets its own Drive service/http connection, built once
+    and reused across every snapshot load, not just within one call.
 
     A download failure (network error, Drive 5xx, etc. - already retried
     internally by drive.download_text_by_id()) is isolated to that one
@@ -96,20 +129,40 @@ def read_summaries_bulk(folder_id: str, video_ids: list[str]) -> dict[str, dict]
     summaries_folder_id = drive.get_or_create_folder(folder_id, SUMMARIES_FOLDER_NAME)
     files_by_name = drive.list_files(summaries_folder_id)
 
-    artifacts: dict[str, dict] = {}
-    for video_id in video_ids:
-        file_id = files_by_name.get(_summary_filename(video_id))
-        if file_id is None:
-            continue
+    to_fetch = [
+        (video_id, files_by_name[_summary_filename(video_id)])
+        for video_id in video_ids
+        if _summary_filename(video_id) in files_by_name
+    ]
+    if not to_fetch:
+        return {}
+
+    def _fetch(item: tuple[str, str]) -> tuple[str, dict | None]:
+        video_id, file_id = item
         try:
             text = drive.download_text_by_id(file_id)
         except Exception:  # noqa: BLE001
             logger.warning("Failed to download summary artifact for %s; skipping for this load.", video_id, exc_info=True)
-            continue
+            return video_id, None
         try:
-            artifacts[video_id] = json.loads(text)
+            parsed = json.loads(text)
         except json.JSONDecodeError:
             logger.warning("Summary artifact for %s was not valid JSON; treating as absent.", video_id)
+            return video_id, None
+        if not isinstance(parsed, dict):
+            # Valid JSON (e.g. a list, string, or number) that isn't an
+            # object - _build_video_insight()/artifact.get(...) downstream
+            # assumes a dict, and this must be isolated exactly like a
+            # JSON-decode failure, not allowed to crash the whole snapshot.
+            logger.warning("Summary artifact for %s was valid JSON but not an object; treating as absent.", video_id)
+            return video_id, None
+        return video_id, parsed
+
+    artifacts: dict[str, dict] = {}
+    pool = _get_bulk_read_executor()
+    for video_id, artifact in pool.map(_fetch, to_fetch):
+        if artifact is not None:
+            artifacts[video_id] = artifact
     return artifacts
 
 
