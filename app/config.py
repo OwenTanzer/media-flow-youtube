@@ -129,6 +129,15 @@ class Settings:
                 f"got {self.summary_retry_backoff_seconds}."
             )
 
+        self.summary_bulk_read_max_workers: int = int(_env("SUMMARY_BULK_READ_MAX_WORKERS", "8"))
+        if not 1 <= self.summary_bulk_read_max_workers <= 32:
+            raise ConfigError(
+                f"SUMMARY_BULK_READ_MAX_WORKERS must be an integer from 1 to 32, "
+                f"got {self.summary_bulk_read_max_workers}. 0 or a negative value makes "
+                "ThreadPoolExecutor raise when the dashboard loads a snapshot; 32 is a "
+                "sanity cap on simultaneous Drive connections/OAuth-refreshed clients."
+            )
+
     def require_oauth_credentials(self) -> OAuthCredentials:
         missing = [
             name

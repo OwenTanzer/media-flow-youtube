@@ -133,6 +133,30 @@ def test_summary_max_cost_usd_per_run_rejects_invalid_values(monkeypatch, value)
         _settings_with(monkeypatch)
 
 
+def test_summary_bulk_read_max_workers_defaults_to_eight(monkeypatch):
+    assert _settings_with(monkeypatch).summary_bulk_read_max_workers == 8
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "33", "100"])
+def test_summary_bulk_read_max_workers_rejects_out_of_range_values(monkeypatch, value):
+    """Regression test for the review finding: 0 or negative survives
+    import but makes ThreadPoolExecutor raise when the dashboard loads a
+    snapshot; an unreasonably large value would open that many
+    simultaneous Drive connections/OAuth-refreshed clients at once."""
+    monkeypatch.setenv("SUMMARY_BULK_READ_MAX_WORKERS", value)
+    with pytest.raises(ConfigError, match="SUMMARY_BULK_READ_MAX_WORKERS"):
+        _settings_with(monkeypatch)
+
+
+def test_summary_bulk_read_max_workers_rejects_malformed_value(monkeypatch):
+    """Same behavior as every other int-parsed setting in this module
+    (e.g. SUMMARY_MAX_OUTPUT_TOKENS) - a non-integer fails at import via
+    int()'s own ValueError, before the range check below ever runs."""
+    monkeypatch.setenv("SUMMARY_BULK_READ_MAX_WORKERS", "not-a-number")
+    with pytest.raises(ValueError):
+        _settings_with(monkeypatch)
+
+
 def test_summary_model_with_unknown_pricing_raises(monkeypatch):
     """Regression test for the review finding: estimate_cost_usd() silently
     returns None for an unrecognized model, so SUMMARY_MAX_COST_USD_PER_RUN

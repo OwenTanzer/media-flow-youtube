@@ -6,6 +6,20 @@ import pytest
 from app import summary_store
 from app.summarize import ResolvedPoint, ResolvedSummary, SummarizationError, Usage
 
+
+@pytest.fixture(autouse=True)
+def _reset_bulk_read_executor():
+    """The bulk-read thread pool is a process-wide singleton, lazily built
+    from settings.summary_bulk_read_max_workers on first use (see
+    summary_store._get_bulk_read_executor()) - reset it around every test
+    so one test's monkeypatched worker count can't leak into another's,
+    and so a shutdown() below never runs against a stale pool."""
+    yield
+    executor = summary_store._bulk_read_executor
+    summary_store._bulk_read_executor = None
+    if executor is not None:
+        executor.shutdown(wait=True)
+
 TRANSCRIPT_MARKDOWN = """---
 video_id: abc123XYZde
 title: "A Title"
@@ -105,6 +119,14 @@ def test_extract_channel_returns_none_when_absent():
     assert summary_store._extract_channel("no frontmatter here") is None
 
 
+def test_read_summary_returns_none_for_valid_json_that_is_not_an_object(monkeypatch):
+    monkeypatch.setattr(summary_store.settings, "dry_run", False)
+    monkeypatch.setattr(summary_store.drive, "get_or_create_folder", lambda parent, name: "summaries-folder-id")
+    monkeypatch.setattr(summary_store.drive, "download_text", lambda folder_id, filename: "[1, 2, 3]")
+
+    assert summary_store.read_summary("folder-id", "vid1") is None
+
+
 def _stub_drive(monkeypatch, *, index, transcripts, existing_summaries=None):
     monkeypatch.setattr(summary_store.settings, "dry_run", False)
     # summarize_eligible() now checks this directly (not via Settings, per
@@ -171,14 +193,14 @@ def test_read_summaries_bulk_lists_folder_once_and_downloads_by_id(monkeypatch):
 def test_read_summaries_bulk_downloads_concurrently_within_the_worker_cap(monkeypatch):
     """Regression test: downloads must actually overlap in time (not just
     aggregate correctly one-at-a-time), and never exceed
-    BULK_READ_MAX_WORKERS concurrent downloads at once - the whole point
-    of pooling this is to cut wall-clock time on a large archive without
-    unbounded simultaneous Drive connections."""
+    settings.summary_bulk_read_max_workers concurrent downloads at once -
+    the whole point of pooling this is to cut wall-clock time on a large
+    archive without unbounded simultaneous Drive connections."""
     import threading
     import time
 
     monkeypatch.setattr(summary_store.settings, "dry_run", False)
-    monkeypatch.setattr(summary_store, "BULK_READ_MAX_WORKERS", 3)
+    monkeypatch.setattr(summary_store.settings, "summary_bulk_read_max_workers", 3)
     monkeypatch.setattr(summary_store.drive, "get_or_create_folder", lambda parent, name: "summaries-folder-id")
     video_ids = [f"vid{i}" for i in range(10)]
     monkeypatch.setattr(
@@ -239,6 +261,22 @@ def test_read_summaries_bulk_skips_invalid_json(monkeypatch):
     monkeypatch.setattr(summary_store.drive, "get_or_create_folder", lambda parent, name: "summaries-folder-id")
     monkeypatch.setattr(summary_store.drive, "list_files", lambda folder_id: {"vid1.json": "file-1"})
     monkeypatch.setattr(summary_store.drive, "download_text_by_id", lambda file_id: "not json")
+
+    result = summary_store.read_summaries_bulk("folder-id", ["vid1"])
+
+    assert result == {}
+
+
+@pytest.mark.parametrize("wrong_shaped_json", ["[]", '["a", "b"]', '"just a string"', "42"])
+def test_read_summaries_bulk_skips_valid_json_that_is_not_an_object(monkeypatch, wrong_shaped_json):
+    """Regression test: json.loads() on a valid-but-wrong-shaped artifact
+    (a list, string, or number) previously reached load_snapshot(), which
+    calls artifact.get(...) and would crash the entire snapshot - the
+    isolation guarantee only covered JSONDecodeError, not this."""
+    monkeypatch.setattr(summary_store.settings, "dry_run", False)
+    monkeypatch.setattr(summary_store.drive, "get_or_create_folder", lambda parent, name: "summaries-folder-id")
+    monkeypatch.setattr(summary_store.drive, "list_files", lambda folder_id: {"vid1.json": "file-1"})
+    monkeypatch.setattr(summary_store.drive, "download_text_by_id", lambda file_id: wrong_shaped_json)
 
     result = summary_store.read_summaries_bulk("folder-id", ["vid1"])
 
