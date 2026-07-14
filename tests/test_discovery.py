@@ -1,10 +1,13 @@
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 
 import pytest
 import requests
 
 from app import discovery
 from app.channel_store import Channel
+
+FIXED_NOW = datetime(2026, 7, 13, 12, 0, 0, tzinfo=timezone.utc)
 
 SAMPLE_FEED = """<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom">
@@ -66,6 +69,7 @@ def _stub_stores(monkeypatch, *, channels, index=None, queue=None):
     monkeypatch.setattr(discovery.channel_store, "read_channels", lambda folder_id: channels)
     monkeypatch.setattr(discovery.drive, "read_index", lambda folder_id: index or {})
     monkeypatch.setattr(discovery.queue_store, "read_queue", lambda folder_id: queue or [])
+    monkeypatch.setattr(discovery, "_utcnow", lambda: FIXED_NOW)
     written = {}
     monkeypatch.setattr(
         discovery.queue_store, "write_queue", lambda folder_id, entries: written.setdefault("entries", entries)
@@ -84,7 +88,9 @@ def test_discover_and_enqueue_queues_newly_discovered_video(monkeypatch):
 
     report = discovery.discover_and_enqueue("folder-id")
 
-    assert written["entries"] == ["https://www.youtube.com/watch?v=newvideo11"]
+    assert written["entries"] == [
+        {"url": "https://www.youtube.com/watch?v=newvideo11", "first_seen_at": FIXED_NOW.isoformat()}
+    ]
     assert report.newly_queued == 1
     assert report.discovered_total == 1
     assert report.duplicates_skipped == 0
@@ -125,7 +131,9 @@ def test_discover_and_enqueue_isolates_one_channels_feed_failure(monkeypatch):
 
     report = discovery.discover_and_enqueue("folder-id")
 
-    assert written["entries"] == ["https://www.youtube.com/watch?v=goodvideo1"]
+    assert written["entries"] == [
+        {"url": "https://www.youtube.com/watch?v=goodvideo1", "first_seen_at": FIXED_NOW.isoformat()}
+    ]
     assert report.newly_queued == 1
     assert len(report.feed_failures) == 1
     assert report.feed_failures[0][0] == "UC_bad"
@@ -140,7 +148,13 @@ def test_discover_and_enqueue_applies_channel_language_override(monkeypatch):
 
     discovery.discover_and_enqueue("folder-id")
 
-    assert written["entries"] == [{"url": "https://www.youtube.com/watch?v=newvideo22", "languages": ["es", "pt"]}]
+    assert written["entries"] == [
+        {
+            "url": "https://www.youtube.com/watch?v=newvideo22",
+            "first_seen_at": FIXED_NOW.isoformat(),
+            "languages": ["es", "pt"],
+        }
+    ]
 
 
 def test_discover_and_enqueue_skips_disabled_channels(monkeypatch):

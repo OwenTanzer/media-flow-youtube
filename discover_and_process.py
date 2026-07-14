@@ -56,7 +56,18 @@ def main() -> int:
         for channel_id, message in report.feed_failures:
             logger.warning("  feed failure - channel %s: %s", channel_id, message)
 
-        results = run_batch()
+        def _renew_lock() -> None:
+            # A large queue's cooldowns alone can comfortably exceed
+            # DISCOVERY_LOCK_TTL_SECONDS, so keep the lease fresh after every
+            # entry (not just every chunk - a single entry's own internal
+            # retries can themselves run for minutes) rather than letting a
+            # healthy run look crashed. If the lock no longer belongs to us
+            # (lost to a concurrent run), stop working immediately instead of
+            # continuing to write against a lease we no longer hold.
+            if not job_lock.renew_lock(folder_id, lock_token):
+                raise RuntimeError("Lost the discovery lock mid-run; aborting to avoid racing a new owner.")
+
+        results = run_batch(on_progress=_renew_lock)
         ok = sum(1 for r in results if r.status == "ok")
         logger.info("Processing complete: %d fetched, %d skipped/errored, %d total.", ok, len(results) - ok, len(results))
         for r in results:

@@ -19,6 +19,13 @@ lock. Two mitigations narrow (without fully eliminating) that window:
   call just wrote. If a concurrent writer created a second file with the
   same name (Drive's duplicate-filename hazard) or overwrote this one,
   both callers back off rather than proceeding as if each holds the lock.
+
+A long batch run (see BATCH_SIZE_THRESHOLD/BATCH_COOLDOWN_SECONDS in
+app/batch.py) can legitimately take far longer than ttl_seconds purely
+from its own cooldowns - without renewal, acquire_lock()'s stale-lock
+takeover would eventually treat a perfectly healthy run as crashed and
+let a second invocation start concurrently. renew_lock() lets a
+long-running caller refresh its own lease periodically to prevent that.
 """
 
 from __future__ import annotations
@@ -93,6 +100,52 @@ def acquire_lock(folder_id: str, ttl_seconds: int) -> str | None:
         return None
 
     return token
+
+
+def renew_lock(folder_id: str, token: str) -> bool:
+    """Rewrites the lock with a fresh acquired_at timestamp, keeping the
+    same token, so a long-running batch (see BATCH_SIZE_THRESHOLD/
+    BATCH_COOLDOWN_SECONDS in app/batch.py) doesn't have its own lease
+    time out from ttl_seconds while it's still legitimately working.
+    Returns False without writing anything if the lock no longer belongs
+    to this token (lost to a concurrent run, or deleted unexpectedly) -
+    callers should treat that as a signal to stop, not keep going as if
+    still holding the lock.
+
+    Like acquire_lock(), the check-then-write here isn't atomic: a
+    takeover can still land in the gap between the ownership check and
+    the write. Re-reads after writing (same as acquire_lock()) so that
+    race is at least detected - a takeover in that exact window makes this
+    call correctly return False rather than incorrectly reporting success,
+    even though the write briefly clobbered the new owner's lease."""
+
+    if settings.dry_run:
+        return True
+
+    _, current_token = _read_lock(folder_id)
+    if current_token != token:
+        logger.error(
+            "Cannot renew the lock in folder %s: it no longer belongs to this run "
+            "(expected token %r, found %r). Another run may already be in progress.",
+            folder_id,
+            token,
+            current_token,
+        )
+        return False
+
+    payload = json.dumps({"acquired_at": datetime.now(timezone.utc).isoformat(), "token": token})
+    drive.upload_text_file(folder_id, LOCK_FILENAME, payload, mime_type="application/json")
+
+    _, confirmed_token = _read_lock(folder_id)
+    if confirmed_token != token:
+        logger.error(
+            "Lost the lock in folder %s to a concurrent run immediately after renewing - a takeover "
+            "landed between the ownership check and the write.",
+            folder_id,
+        )
+        return False
+
+    return True
 
 
 def release_lock(folder_id: str, token: str) -> None:

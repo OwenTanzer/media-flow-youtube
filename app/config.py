@@ -1,3 +1,4 @@
+import math
 import os
 from dataclasses import dataclass
 
@@ -40,6 +41,21 @@ class Settings:
         self.schedule_cron: str | None = _env("SCHEDULE_CRON")
 
         self.discovery_lock_ttl_seconds: int = int(_env("DISCOVERY_LOCK_TTL_SECONDS", "1800"))
+        self.no_captions_grace_hours: float = float(_env("NO_CAPTIONS_GRACE_HOURS", "24"))
+        if self.no_captions_grace_hours < 0 or not math.isfinite(self.no_captions_grace_hours):
+            raise ConfigError(f"NO_CAPTIONS_GRACE_HOURS must be a non-negative, finite number of hours, got {self.no_captions_grace_hours}.")
+
+        self.batch_size_threshold: int = int(_env("BATCH_SIZE_THRESHOLD", "10"))
+        if self.batch_size_threshold < 1:
+            raise ConfigError(
+                f"BATCH_SIZE_THRESHOLD must be a positive integer, got {self.batch_size_threshold}. "
+                "A value <= 0 makes run_batch() chunk the queue into zero batches, silently "
+                "processing nothing and overwriting queue.json with an empty list."
+            )
+
+        self.batch_cooldown_seconds: float = float(_env("BATCH_COOLDOWN_SECONDS", "300"))
+        if self.batch_cooldown_seconds < 0 or not math.isfinite(self.batch_cooldown_seconds):
+            raise ConfigError(f"BATCH_COOLDOWN_SECONDS must be a non-negative, finite number of seconds, got {self.batch_cooldown_seconds}.")
 
         self.oauth_client_id: str | None = _env("GOOGLE_OAUTH_CLIENT_ID")
         self.oauth_client_secret: str | None = _env("GOOGLE_OAUTH_CLIENT_SECRET")

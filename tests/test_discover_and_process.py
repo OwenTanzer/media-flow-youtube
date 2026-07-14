@@ -1,3 +1,5 @@
+import pytest
+
 import discover_and_process
 from app.discovery import DiscoveryReport
 
@@ -30,7 +32,7 @@ def test_main_runs_discovery_then_batch_and_releases_lock_when_acquired(monkeypa
         "discover_and_enqueue",
         lambda folder_id: order.append("discover") or DiscoveryReport(0, 0, 0, 0, 0, []),
     )
-    monkeypatch.setattr(discover_and_process, "run_batch", lambda: order.append("run_batch") or [])
+    monkeypatch.setattr(discover_and_process, "run_batch", lambda **kwargs: order.append("run_batch") or [])
     release_tokens = []
     monkeypatch.setattr(
         discover_and_process.job_lock,
@@ -43,3 +45,61 @@ def test_main_runs_discovery_then_batch_and_releases_lock_when_acquired(monkeypa
     assert exit_code == 0
     assert order == ["discover", "run_batch", "release"]
     assert release_tokens == ["the-token"]
+
+
+def test_main_passes_a_lock_renewing_callback_to_run_batch(monkeypatch):
+    """Regression test for the review finding: a large queue's cooldowns
+    alone can exceed DISCOVERY_LOCK_TTL_SECONDS. main() must give
+    run_batch() a way to keep the lease fresh during a long run."""
+    monkeypatch.setattr(discover_and_process.settings, "drive_folder_id", "folder-id")
+    monkeypatch.setattr(discover_and_process.job_lock, "acquire_lock", lambda folder_id, ttl_seconds: "the-token")
+    monkeypatch.setattr(
+        discover_and_process, "discover_and_enqueue", lambda folder_id: DiscoveryReport(0, 0, 0, 0, 0, [])
+    )
+    monkeypatch.setattr(discover_and_process.job_lock, "release_lock", lambda folder_id, token: None)
+
+    renew_calls = []
+    monkeypatch.setattr(
+        discover_and_process.job_lock,
+        "renew_lock",
+        lambda folder_id, token: renew_calls.append((folder_id, token)) or True,
+    )
+
+    captured = {}
+
+    def _fake_run_batch(**kwargs):
+        captured["on_progress"] = kwargs["on_progress"]
+        captured["on_progress"]()  # simulate batch.py invoking it after a chunk
+        return []
+
+    monkeypatch.setattr(discover_and_process, "run_batch", _fake_run_batch)
+
+    discover_and_process.main()
+
+    assert renew_calls == [("folder-id", "the-token")]
+
+
+def test_main_aborts_if_lock_renewal_fails_mid_run(monkeypatch):
+    monkeypatch.setattr(discover_and_process.settings, "drive_folder_id", "folder-id")
+    monkeypatch.setattr(discover_and_process.job_lock, "acquire_lock", lambda folder_id, ttl_seconds: "the-token")
+    monkeypatch.setattr(
+        discover_and_process, "discover_and_enqueue", lambda folder_id: DiscoveryReport(0, 0, 0, 0, 0, [])
+    )
+    monkeypatch.setattr(discover_and_process.job_lock, "renew_lock", lambda folder_id, token: False)
+
+    release_calls = []
+    monkeypatch.setattr(
+        discover_and_process.job_lock, "release_lock", lambda folder_id, token: release_calls.append(token)
+    )
+
+    def _fake_run_batch(**kwargs):
+        kwargs["on_progress"]()  # renewal fails - should raise and stop the run
+        return []
+
+    monkeypatch.setattr(discover_and_process, "run_batch", _fake_run_batch)
+
+    with pytest.raises(RuntimeError, match="Lost the discovery lock"):
+        discover_and_process.main()
+
+    # The lock must still be released (best-effort) even though the run aborted.
+    assert release_calls == ["the-token"]

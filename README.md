@@ -172,6 +172,47 @@ No redeploy of code is required. As with all secrets in this project,
 set proxy credentials only in Railway's environment variables (or a
 local, gitignored `.env`) - never commit them.
 
+**Note on `WEBSHARE_PROXY_USERNAME`:** use the *bare* username from your
+Webshare dashboard, not a sticky-session variant (e.g. one with a
+`-<country>-<n>` suffix already appended). `youtube-transcript-api`
+appends its own `-rotate` suffix to whatever username you provide, so a
+username that already has a session suffix baked in produces an invalid
+combined string and proxy auth fails. A bare username lets it correctly
+draw a fresh IP from the rotating pool on every request - verified by
+hitting an IP-echo endpoint through the proxy repeatedly and confirming
+the IP actually changes each time, rather than staying fixed on one
+sticky IP.
+
+**A continuous run of many requests degrades the pool's success rate
+over the run's duration** - observed empirically: an unpaced run through
+~150 videos saw the failure rate climb well past 50% by the end (mostly
+Google's own anti-bot 429 wall, plus assorted connection errors), while
+small bursts of 8-10 requests stayed clean. This isn't fixed by pacing
+*within* a burst (0s/5s/10s delays between individual requests all
+performed about the same in testing) - it's a function of real elapsed
+time between bursts. A 5-minute gap after a degraded run fully restored
+the clean rate back to baseline; a 20-second gap only partially helped.
+`run_batch()` (see `app/batch.py`) accounts for this: above
+`BATCH_SIZE_THRESHOLD` queued entries (default `10`), it processes in
+chunks of that size with a `BATCH_COOLDOWN_SECONDS` (default `300`)
+cooldown between chunks, rather than burning through a large backlog in
+one continuous burst. Both must be positive/non-negative - the app
+refuses to start with an invalid value, since a threshold `<= 0` would
+otherwise chunk the queue into zero batches and silently overwrite
+`queue.json` with an empty list. This only applies to the queue-driven
+path (`discover_and_process.py`/`batch_runner.py`) - an explicit URL list
+(e.g. a live `POST /batch/run` request) is never paced, since a large one
+would otherwise hold the HTTP connection open for the full cooldown
+duration. `queue.json` is checkpointed after every chunk rather than only
+once at the end, so a crash partway through a long run doesn't lose
+already-completed progress or force a full reprocess next time. Because a
+large queue's total cooldown time can exceed
+`DISCOVERY_LOCK_TTL_SECONDS`, `discover_and_process.py` renews its lock
+lease after every chunk (`job_lock.renew_lock()`) so a healthy long run
+doesn't look crashed to a concurrent invocation; if the lease is ever
+found to belong to someone else mid-run, the run aborts immediately
+rather than continuing to write against a lock it no longer holds.
+
 ## Usage
 
 ```bash
@@ -302,6 +343,24 @@ flight, you don't have to wait out the TTL — just delete
 `_discovery_lock.json` from the Drive folder and the next run will
 acquire the lock immediately.
 
+### Livestreams
+
+YouTube's RSS feed lists a livestream as soon as it starts, well before
+it ends or captions exist for it. Without special handling, discovery
+would try to fetch its transcript immediately, get "no_captions", and -
+since that's normally a terminal status - drop the video for good,
+losing it even after the stream ends and captions become available.
+
+To avoid that, every video discovery queues carries a `first_seen_at`
+timestamp, and a "no_captions" result for such a video is retried on
+every subsequent run rather than treated as final, until it's older than
+`NO_CAPTIONS_GRACE_HOURS` (default `24`) - long enough to cover even a
+multi-hour livestream plus YouTube's post-stream caption-processing
+delay. Past that window, it's treated as genuinely caption-less and
+dropped, same as any other video. Videos added manually to `queue.json`
+(no `first_seen_at`) get no grace period - "no_captions" is terminal for
+them immediately, exactly as before this existed.
+
 ## Project layout
 
 ```
@@ -311,7 +370,7 @@ app/
   batch.py          run_batch(): queue-driven or explicit-list batch runs
   youtube.py        URL parsing, transcript fetch, oEmbed title lookup, Markdown rendering
   drive.py          Drive upload/read + generic Drive file helpers
-  queue_store.py    queue.json read/write helpers (plain URLs or {"url","languages"} entries)
+  queue_store.py    queue.json read/write helpers (plain URLs or {"url","languages","first_seen_at"} entries)
   channel_store.py  channels.json read helper (the discovery source registry)
   discovery.py      RSS feed fetch/parse + discover_and_enqueue(): queues unseen uploads
   job_lock.py       Drive-based advisory lock preventing overlapping discovery runs
