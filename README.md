@@ -341,7 +341,11 @@ its own via each channel's public RSS feed.
   group (currently just `"Google"`) need to set it explicitly.
 
 No deployment is needed to add, remove, enable, or disable a channel —
-just edit `channels.json` in Drive, same as `queue.json`.
+just edit `channels.json` in Drive, same as `queue.json`. Alternatively,
+if `VIDPROC_ADMIN_TOKEN` is set (see "Insight dashboard" below), the
+dashboard's token-gated **Admin** tab can add a channel through a form
+and immediately backfill its current RSS feed, without touching Drive
+directly.
 
 ### 2. Deploy `discover_and_process.py` as a Railway Cron Job
 
@@ -747,7 +751,7 @@ this is the public-facing failure state, not a bug.
 
 ### How it reads data
 
-Everything is assembled read-only from the same three Drive-hosted
+The feed itself is assembled read-only from the same three Drive-hosted
 sources the pipeline already writes - `channels.json`, `_index.json`, and
 each video's `summaries/<video_id>.json` - via `app/insights_store.py`. No
 new Drive capability was needed: `_index.json` already enumerates every
@@ -756,6 +760,34 @@ directly. A video only appears once it has a `status: "ok"` summary
 artifact; a video that's never been summarized, or whose summarization
 recorded `status: "error"`, is counted in a small "N pending" note in the
 header rather than shown as a broken feed item.
+
+The one exception is the optional Admin tab below, which writes to
+`channels.json`.
+
+### Admin panel (optional)
+
+Set `VIDPROC_ADMIN_TOKEN` to enable an **Admin** tab alongside the
+group tabs, with a form to register a new channel (channel ID, display
+name, enabled, group, languages) without editing `channels.json`
+directly. Unset (the default), the tab doesn't appear at all.
+
+This is a shared-secret bearer token compared with a constant-time
+check (`secrets.compare_digest`), not a real user/password auth system -
+appropriate for a single-operator tool, but the entry form has no
+rate-limiting or lockout, so generate a long random value rather than a
+memorable password:
+
+```
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Unlocking sets a per-session flag only (`st.session_state`, no cookie or
+persistent token) - a hard page reload opens a fresh Streamlit session
+and requires the token again. Adding a channel writes it via
+`app/channel_store.py`'s `write_channels()`, then immediately runs
+`app/discovery.py`'s `backfill_new_channels()` (see "Backfilling a newly
+added channel" above) so its current RSS feed is queued right away
+instead of waiting for the next `discover_and_process.py` cron cycle.
 
 Channel grouping is resolved via `channel_id` (see "Transcript
 summarization" above) - a video whose `channel_id` doesn't match any
