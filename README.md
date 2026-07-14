@@ -656,6 +656,66 @@ renewed before each attempt) is the sole retry authority instead - the
 same fix already applied to the Webshare proxy's internal retries in
 `app/youtube.py`.
 
+## Insight dashboard (optional)
+
+`vidproc_app.py` is a read-only Streamlit dashboard over the summary
+archive - browse collected videos by group (Finance/Google, driven by each
+channel's `group` field in `channels.json`) and channel, then open one to
+read its generated summary and timestamped points. It's deliberately
+**public and unauthenticated** (unlike the FastAPI service's `X-API-Key`
+gate), since it's meant to be a publicly viewable dashboard.
+
+### Run locally
+
+```bash
+pip install -r requirements.txt   # includes streamlit
+export DRIVE_FOLDER_ID=... GOOGLE_OAUTH_CLIENT_ID=... GOOGLE_OAUTH_CLIENT_SECRET=... GOOGLE_OAUTH_REFRESH_TOKEN=...
+streamlit run vidproc_app.py
+```
+
+Reuses the same `DRIVE_FOLDER_ID` and Google OAuth credentials as the rest
+of the app (read-only) - no separate setup. If those aren't set, or Drive
+access fails, the app renders a generic "temporarily unavailable" page
+rather than an error page, a stack trace, or any credential/Drive detail -
+this is the public-facing failure state, not a bug.
+
+### How it reads data
+
+Everything is assembled read-only from the same three Drive-hosted
+sources the pipeline already writes - `channels.json`, `_index.json`, and
+each video's `summaries/<video_id>.json` - via `app/insights_store.py`. No
+new Drive capability was needed: `_index.json` already enumerates every
+video ever attempted, so the dashboard never lists a Drive folder
+directly. A video only appears once it has a `status: "ok"` summary
+artifact; a video that's never been summarized, or whose summarization
+recorded `status: "error"`, is counted in a small "N pending" note in the
+header rather than shown as a broken feed item.
+
+Channel grouping is resolved via `channel_id` (see "Transcript
+summarization" above) - a video whose `channel_id` doesn't match any
+currently configured channel (predates that field, or its channel was
+later removed from the registry) falls back to the **Finance** group and
+appears there under an **"Unassigned / Other"** pseudo-channel in the
+channel filter, rather than a separate top-level tab, so group tabs stay
+purely driven by `channels.json` membership. Run
+`python backfill_channel_ids.py` once to backfill `channel_id` onto
+already-archived summaries from before that field existed (see the script
+for details/limitations).
+
+Minor insight points are shown alongside major ones by default (major
+points bold, minor visually de-emphasized) with a "Show minor points"
+toggle in the detail view to hide them - no point is ever permanently
+hidden.
+
+### Deploying
+
+Runs as its own Railway service using `railway.vidproc.toml`
+(`streamlit run vidproc_app.py --server.port $PORT ...`), following the
+same multi-service-per-repo pattern as `railway.discover-and-process.toml`.
+See "Deploying the insight dashboard" further below for the full setup,
+including the `vidproc.moopertonic.net` custom domain, Cloudflare DNS, and
+rollback procedure.
+
 ## Project layout
 
 ```
@@ -671,10 +731,17 @@ app/
   job_lock.py       Drive-based advisory lock preventing overlapping discovery runs
   summarize.py      Claude model call: transcript -> structured, schema-validated summary
   summary_store.py  summaries/<video_id>.json read/write, idempotency, and summarize_eligible()
+  insights_store.py  read-only data layer for the Streamlit dashboard: load_snapshot()
   scheduler.py       optional in-process APScheduler wiring
   config.py         environment variable loading/validation
   models.py         request/response schemas
+vidproc_app.py      Streamlit dashboard entrypoint (streamlit run vidproc_app.py)
+vidproc/
+  styling.py         CSS/color constants for the dashboard's visual framework
+  state.py           pure group/channel-filter/sort logic, no Streamlit import
+  render.py          feed-card and detail-view rendering
 batch_runner.py     standalone entrypoint for a separate Railway Cron Job service
 discover_and_process.py  standalone entrypoint: discover -> process queue -> summarize eligible transcripts
+backfill_channel_ids.py  one-off script: recover channel_id for pre-existing summaries
 get_refresh_token.py  one-time local script to mint the Drive OAuth refresh token
 ```
