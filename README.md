@@ -212,14 +212,19 @@ retrying videos that had actually failed in a live production run, most
 of which succeeded on the very next fresh attempt.
 
 `run_batch()` (see `app/batch.py`) still processes queued entries in
-chunks of `BATCH_SIZE_THRESHOLD` (default `10`) with a
-`BATCH_COOLDOWN_SECONDS` (default `300`) pause between chunks, and
-checkpoints `queue.json` after every chunk - but this is now understood
-as a crash-safety / not-hammering-the-pool measure, not the fix for the
-failure rate itself. Both settings must be positive/non-negative - the
-app refuses to start with an invalid value, since a threshold `<= 0`
-would otherwise chunk the queue into zero batches and silently overwrite
-`queue.json` with an empty list. Chunking only applies to the
+chunks of `BATCH_SIZE_THRESHOLD` (default `10`), checkpointing
+`queue.json` after every chunk so a crash partway through a long run
+doesn't lose already-completed progress - that's now chunking's only
+job. `BATCH_COOLDOWN_SECONDS` (default `0`) no longer defaults to a real
+pause between chunks, since checkpointing doesn't require sleeping and
+the pool-recovery rationale for the old 300s default didn't hold up;
+only raise it if independent evidence shows a nonzero delay helps,
+since a large backlog with both a nonzero cooldown and per-video retries
+can idle for a long time otherwise. Both settings must be
+positive/non-negative - the app refuses to start with an invalid value,
+since a threshold `<= 0` would otherwise chunk the queue into zero
+batches and silently overwrite `queue.json` with an empty list.
+Chunking only applies to the
 queue-driven path (`discover_and_process.py`/`batch_runner.py`) - an
 explicit URL list (e.g. a live `POST /batch/run` request) is never
 paced, since a large one would otherwise hold the HTTP connection open

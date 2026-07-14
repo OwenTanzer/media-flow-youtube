@@ -90,6 +90,14 @@ def build_proxy_config() -> ProxyConfig | None:
             proxy_username=settings.webshare_proxy_username,
             proxy_password=settings.webshare_proxy_password,
             filter_ip_locations=settings.webshare_proxy_locations or None,
+            # The library's own retries_when_blocked (default 10) retries
+            # blocked/429 responses on the *same* client instance/session.
+            # fetch_transcript() is now the single retry authority, each
+            # attempt building a brand-new instance for a genuinely fresh
+            # connection - stacking the library's internal retries on top
+            # would let TRANSCRIPT_FETCH_MAX_ATTEMPTS=3 fan out into 30+
+            # requests per video before giving up.
+            retries_when_blocked=0,
         )
 
     if proxy_type == "generic":
@@ -166,6 +174,7 @@ def fetch_transcript(video_id: str, languages: list[str]) -> TranscriptResult:
     connection, and thus another independent draw from the pool - rather
     than giving up after a single bad draw."""
 
+    last_status = "error"
     last_message = "Unknown failure."
     for attempt in range(1, settings.transcript_fetch_max_attempts + 1):
         try:
@@ -182,10 +191,26 @@ def fetch_transcript(video_id: str, languages: list[str]) -> TranscriptResult:
             return TranscriptResult(video_id, "unavailable", message=str(exc))
         except AgeRestricted as exc:
             return TranscriptResult(video_id, "unavailable", message=str(exc))
-        except (RequestBlocked, IpBlocked, requests.RequestException) as exc:
-            last_message = str(exc)
+        except (RequestBlocked, IpBlocked) as exc:
+            last_status, last_message = "blocked", str(exc)
             logger.warning(
-                "Transient fetch failure for %s (attempt %d/%d): %s",
+                "Blocked fetching %s (attempt %d/%d): %s",
+                video_id,
+                attempt,
+                settings.transcript_fetch_max_attempts,
+                exc,
+            )
+            continue
+        except requests.RequestException as exc:
+            # Transport-level failures (DNS, TLS, dropped/incomplete
+            # connections, proxy errors) rather than an explicit
+            # YouTube/library block - kept distinct from "blocked" so a
+            # spike in one vs. the other is diagnosable (e.g. YouTube 429s
+            # vs. proxy instability), even though both stay queued for
+            # retry on the next run either way.
+            last_status, last_message = "error", str(exc)
+            logger.warning(
+                "Transient network failure fetching %s (attempt %d/%d): %s",
                 video_id,
                 attempt,
                 settings.transcript_fetch_max_attempts,
@@ -207,8 +232,8 @@ def fetch_transcript(video_id: str, languages: list[str]) -> TranscriptResult:
 
     return TranscriptResult(
         video_id,
-        "blocked",
-        message=f"Still blocked after {settings.transcript_fetch_max_attempts} attempts: {last_message}",
+        last_status,
+        message=f"Still failing after {settings.transcript_fetch_max_attempts} attempts ({last_status}): {last_message}",
     )
 
 

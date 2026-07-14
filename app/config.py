@@ -53,7 +53,7 @@ class Settings:
                 "processing nothing and overwriting queue.json with an empty list."
             )
 
-        self.batch_cooldown_seconds: float = float(_env("BATCH_COOLDOWN_SECONDS", "300"))
+        self.batch_cooldown_seconds: float = float(_env("BATCH_COOLDOWN_SECONDS", "0"))
         if self.batch_cooldown_seconds < 0 or not math.isfinite(self.batch_cooldown_seconds):
             raise ConfigError(f"BATCH_COOLDOWN_SECONDS must be a non-negative, finite number of seconds, got {self.batch_cooldown_seconds}.")
 

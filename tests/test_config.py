@@ -68,8 +68,12 @@ def test_batch_size_threshold_rejects_non_positive_values(monkeypatch, value):
         _settings_with(monkeypatch)
 
 
-def test_batch_cooldown_seconds_defaults_to_300(monkeypatch):
-    assert _settings_with(monkeypatch).batch_cooldown_seconds == 300
+def test_batch_cooldown_seconds_defaults_to_zero(monkeypatch):
+    """Regression test: an earlier default of 300s assumed a cooldown was
+    needed to let a degraded proxy pool recover. Controlled testing
+    disproved that (see README's egress proxy section), so chunking's only
+    remaining job is checkpointing - which doesn't require sleeping."""
+    assert _settings_with(monkeypatch).batch_cooldown_seconds == 0
 
 
 @pytest.mark.parametrize("value", ["-1", "-0.5", "nan", "inf"])
