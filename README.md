@@ -402,13 +402,15 @@ every enabled channel with zero videos anywhere in `_index.json` or
 currently in that channel's feed. Idempotent — a channel already
 backfilled is skipped on rerun.
 
-It deliberately does **not** use `discover_and_process.py`'s
-`_discovery_lock.json` — that lock guards a run that can legitimately
-take a long time (a large queue's batch processing plus summarization),
-and there's no reason a one-off, seconds-long backfill of a single new
-channel should have to wait for or contend with it. It takes out its own
-independent lock (`_new_channel_backfill_lock.json`) instead, only to
-stop two concurrent invocations of itself from racing each other.
+It shares `discover_and_process.py`'s own `_discovery_lock.json` rather
+than a lock of its own — both write the same `queue.json`, and a
+distinct lock would only serialize this script against itself while
+doing nothing to stop it from interleaving with (and silently corrupting)
+a concurrently-running `discover_and_process.py`. It does **not** wait
+for that lock, though: if `discover_and_process.py` is already running,
+this exits immediately rather than blocking — that run (or the next one)
+will pick up the new channel regardless, so running this never
+introduces a waiting period of its own.
 
 ### Livestreams
 
@@ -783,11 +785,23 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 Unlocking sets a per-session flag only (`st.session_state`, no cookie or
 persistent token) - a hard page reload opens a fresh Streamlit session
-and requires the token again. Adding a channel writes it via
-`app/channel_store.py`'s `write_channels()`, then immediately runs
-`app/discovery.py`'s `backfill_new_channels()` (see "Backfilling a newly
-added channel" above) so its current RSS feed is queued right away
-instead of waiting for the next `discover_and_process.py` cron cycle.
+and requires the token again.
+
+A channel ID is validated against YouTube's `UC` + 22-character shape and
+preflight-checked against its actual RSS feed (`app/discovery.py`'s
+`fetch_channel_feed()`) *before* anything is written - a bad ID is
+rejected outright rather than being permanently persisted only to fail
+later. Once that passes, the channel is written via
+`app/channel_store.py`'s `write_channels()`, then `backfill_new_channels()`
+(see "Backfilling a newly added channel" above) attempts an immediate
+backfill of its current RSS feed under the same `_discovery_lock.json`
+`discover_and_process.py` uses. This never blocks the admin panel,
+though: if that lock is already held, the channel is still added
+immediately and the panel reports the backfill as deferred to the next
+`discover_and_process.py` run, rather than waiting for the lock to free
+up. A backfill that fails outright (as opposed to being deferred) is
+reported as "channel added, backfill failed" - distinct from total
+failure, since the channel registration itself already succeeded.
 
 Channel grouping is resolved via `channel_id` (see "Transcript
 summarization" above) - a video whose `channel_id` doesn't match any

@@ -1,8 +1,11 @@
 import pytest
+import requests
 
 from app.channel_store import Channel
 from app.discovery import DiscoveryReport
 from vidproc import admin
+
+VALID_CHANNEL_ID = "UC1234567890123456789012"  # UC + 22 chars
 
 
 def test_check_admin_token_accepts_matching_token():
@@ -20,54 +23,67 @@ def test_check_admin_token_rejects_when_nothing_configured():
     assert admin.check_admin_token("", "") is False
 
 
-def _stub(monkeypatch, *, existing, backfill_report=None):
+def _stub(monkeypatch, *, existing, lock_token="the-token", backfill_report=None, feed_ok=True):
     monkeypatch.setattr(admin.channel_store, "read_channels", lambda folder_id: existing)
     written = {}
     monkeypatch.setattr(
         admin.channel_store, "write_channels", lambda folder_id, channels: written.setdefault("channels", channels)
     )
+    if feed_ok:
+        monkeypatch.setattr(admin.discovery, "fetch_channel_feed", lambda channel_id: [])
+    else:
+        def _raise(channel_id):
+            raise requests.RequestException("feed unavailable")
+
+        monkeypatch.setattr(admin.discovery, "fetch_channel_feed", _raise)
+    monkeypatch.setattr(admin.job_lock, "acquire_lock", lambda folder_id, ttl_seconds: lock_token)
+    release_calls = []
+    monkeypatch.setattr(admin.job_lock, "release_lock", lambda folder_id, token: release_calls.append(token))
     monkeypatch.setattr(
         admin.discovery,
         "backfill_new_channels",
         lambda folder_id: backfill_report or DiscoveryReport(1, 1, 3, 2, 0, []),
     )
-    return written
+    return written, release_calls
 
 
 def test_add_channel_and_backfill_writes_the_new_channel_and_runs_backfill(monkeypatch):
-    written = _stub(monkeypatch, existing=[Channel("UC_old", "Old Channel")])
+    written, release_calls = _stub(monkeypatch, existing=[Channel("UC_old234567890123456789", "Old Channel")])
 
-    report = admin.add_channel_and_backfill(
-        "folder-id", channel_id="UC_new", name="New Channel", enabled=True, group="Google", languages=["en", "es"]
+    result = admin.add_channel_and_backfill(
+        "folder-id", channel_id=VALID_CHANNEL_ID, name="New Channel", enabled=True, group="Google", languages=["en", "es"]
     )
 
     assert written["channels"] == [
-        Channel("UC_old", "Old Channel"),
-        Channel("UC_new", "New Channel", True, ["en", "es"], "Google"),
+        Channel("UC_old234567890123456789", "Old Channel"),
+        Channel(VALID_CHANNEL_ID, "New Channel", True, ["en", "es"], "Google"),
     ]
-    assert report.newly_queued == 2
+    assert result.backfill_report.newly_queued == 2
+    assert result.backfill_deferred is False
+    assert result.backfill_error is None
+    assert release_calls == ["the-token"]
 
 
 def test_add_channel_and_backfill_strips_whitespace(monkeypatch):
-    written = _stub(monkeypatch, existing=[])
+    written, _ = _stub(monkeypatch, existing=[])
 
     admin.add_channel_and_backfill(
-        "folder-id", channel_id="  UC_new  ", name="  New Channel  ", group="  ", languages=["  en  ", "  "]
+        "folder-id", channel_id=f"  {VALID_CHANNEL_ID}  ", name="  New Channel  ", group="  ", languages=["  en  ", "  "]
     )
 
     added = written["channels"][0]
-    assert added.channel_id == "UC_new"
+    assert added.channel_id == VALID_CHANNEL_ID
     assert added.name == "New Channel"
     assert added.group is None
     assert added.languages == ["en"]
 
 
 def test_add_channel_and_backfill_defaults_name_to_channel_id_when_blank(monkeypatch):
-    written = _stub(monkeypatch, existing=[])
+    written, _ = _stub(monkeypatch, existing=[])
 
-    admin.add_channel_and_backfill("folder-id", channel_id="UC_new", name="   ")
+    admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="   ")
 
-    assert written["channels"][0].name == "UC_new"
+    assert written["channels"][0].name == VALID_CHANNEL_ID
 
 
 def test_add_channel_and_backfill_rejects_blank_channel_id(monkeypatch):
@@ -77,10 +93,124 @@ def test_add_channel_and_backfill_rejects_blank_channel_id(monkeypatch):
         admin.add_channel_and_backfill("folder-id", channel_id="   ", name="Anything")
 
 
-def test_add_channel_and_backfill_rejects_a_duplicate_channel_id(monkeypatch):
-    written = _stub(monkeypatch, existing=[Channel("UC_existing", "Existing Channel")])
+@pytest.mark.parametrize("bad_id", ["not-a-channel-id", "UCtooshort", "UC" + "x" * 21, "UC" + "x" * 23])
+def test_add_channel_and_backfill_rejects_malformed_channel_id(monkeypatch, bad_id):
+    """Regression test for the review finding: a typo was previously
+    written to channels.json before YouTube ever got a chance to reject
+    it. A malformed ID is now rejected before any write happens."""
+    written, _ = _stub(monkeypatch, existing=[])
+    fetch_calls = []
+    monkeypatch.setattr(admin.discovery, "fetch_channel_feed", lambda channel_id: fetch_calls.append(channel_id))
 
-    with pytest.raises(admin.ChannelAlreadyExistsError, match="UC_existing"):
-        admin.add_channel_and_backfill("folder-id", channel_id="UC_existing", name="Duplicate")
+    with pytest.raises(ValueError, match="doesn't look like a YouTube channel ID"):
+        admin.add_channel_and_backfill("folder-id", channel_id=bad_id, name="Anything")
 
     assert "channels" not in written
+    assert fetch_calls == []  # never even attempted the preflight fetch
+
+
+def test_add_channel_and_backfill_rejects_a_channel_whose_feed_cant_be_fetched(monkeypatch):
+    """Regression test for the review finding: a well-formed but
+    nonexistent/wrong channel ID must be rejected by the RSS preflight
+    fetch *before* channels.json is written, not discovered later."""
+    written, _ = _stub(monkeypatch, existing=[], feed_ok=False)
+
+    with pytest.raises(ValueError, match="Could not fetch this channel's RSS feed"):
+        admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="Anything")
+
+    assert "channels" not in written
+
+
+def test_add_channel_and_backfill_rejects_a_duplicate_channel_id(monkeypatch):
+    written, _ = _stub(monkeypatch, existing=[Channel(VALID_CHANNEL_ID, "Existing Channel")])
+
+    with pytest.raises(admin.ChannelAlreadyExistsError, match=VALID_CHANNEL_ID):
+        admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="Duplicate")
+
+    assert "channels" not in written
+
+
+def test_add_channel_and_backfill_defers_when_discovery_lock_is_held(monkeypatch):
+    """Regression test for the review finding: backfill must share
+    discover_and_process.py's lock (not a lock of its own), and must
+    never block waiting for it - if it's held, the channel is still
+    added immediately and the backfill is simply deferred."""
+    written, release_calls = _stub(monkeypatch, existing=[], lock_token=None)
+    backfill_calls = []
+    monkeypatch.setattr(admin.discovery, "backfill_new_channels", lambda folder_id: backfill_calls.append(1))
+
+    result = admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="New Channel")
+
+    assert written["channels"] == [Channel(VALID_CHANNEL_ID, "New Channel")]
+    assert result.backfill_deferred is True
+    assert result.backfill_report is None
+    assert result.backfill_error is None
+    assert backfill_calls == []  # never attempted - must not wait for the lock either
+    assert release_calls == []  # never acquired, so nothing to release
+
+
+def test_add_channel_and_backfill_reports_a_backfill_error_without_losing_the_added_channel(monkeypatch):
+    """Regression test for the review finding: if backfill itself raises
+    after channels.json was already written, the caller must be able to
+    tell "channel added, backfill failed" apart from total failure -
+    not have the exception escape and make a successful write look like
+    it never happened."""
+    written, release_calls = _stub(monkeypatch, existing=[])
+
+    def _raise(folder_id):
+        raise RuntimeError("Drive read failed")
+
+    monkeypatch.setattr(admin.discovery, "backfill_new_channels", _raise)
+
+    result = admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="New Channel")
+
+    assert written["channels"] == [Channel(VALID_CHANNEL_ID, "New Channel")]
+    assert result.backfill_error == "Drive read failed"
+    assert result.backfill_report is None
+    assert result.backfill_deferred is False
+    assert release_calls == ["the-token"]  # still released despite the failure
+
+
+def _result(*, deferred=False, error=None, report=None):
+    return admin.AddChannelResult(
+        channel=Channel(VALID_CHANNEL_ID, "New Channel"),
+        backfill_report=report,
+        backfill_deferred=deferred,
+        backfill_error=error,
+    )
+
+
+def test_admin_flash_for_success():
+    level, message = admin.admin_flash_for(_result(report=DiscoveryReport(1, 1, 3, 2, 0, [])))
+    assert level == "success"
+    assert "2 video(s) queued" in message
+
+
+def test_admin_flash_for_deferred():
+    level, message = admin.admin_flash_for(_result(deferred=True))
+    assert level == "info"
+    assert "currently running" in message
+
+
+def test_admin_flash_for_backfill_error():
+    level, message = admin.admin_flash_for(_result(error="Drive read failed"))
+    assert level == "warning"
+    assert "Drive read failed" in message
+
+
+def test_admin_flash_for_surfaces_this_channels_own_feed_failure():
+    """Regression test for the review finding: a feed failure for the
+    just-added channel must not be silently reported as a success with
+    zero videos queued."""
+    report = DiscoveryReport(1, 1, 0, 0, 0, [(VALID_CHANNEL_ID, "feed unavailable")])
+    level, message = admin.admin_flash_for(_result(report=report))
+    assert level == "warning"
+    assert "feed unavailable" in message
+
+
+def test_admin_flash_for_success_ignores_a_different_channels_feed_failure():
+    """A feed failure for some *other* still-unbackfilled channel doesn't
+    make the just-added channel's own success message inaccurate."""
+    report = DiscoveryReport(2, 2, 3, 2, 0, [("UC_other567890123456789", "feed unavailable")])
+    level, message = admin.admin_flash_for(_result(report=report))
+    assert level == "success"

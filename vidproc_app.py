@@ -23,7 +23,7 @@ import streamlit as st
 
 from app.config import ConfigError, settings
 from app.insights_store import InsightsSnapshot, load_snapshot
-from vidproc.admin import ChannelAlreadyExistsError, add_channel_and_backfill, check_admin_token
+from vidproc.admin import ChannelAlreadyExistsError, add_channel_and_backfill, admin_flash_for, check_admin_token
 from vidproc.render import render_detail, render_empty_state, render_feed_card, render_notice
 from vidproc.state import (
     channel_filter_options,
@@ -197,6 +197,15 @@ def render_admin_panel(folder_id: str) -> None:
         st.session_state.admin_authenticated = False
         st.rerun()
 
+    # Set by a prior "Add channel" click, right before its own st.rerun()
+    # below - without stashing it in session_state across that rerun, the
+    # result of a successful add would flash and vanish immediately
+    # instead of actually being visible on the page the rerun lands on.
+    flash = st.session_state.pop("admin_flash", None)
+    if flash is not None:
+        level, message = flash
+        getattr(st, level)(message)
+
     st.markdown("<div class='vidproc-meta-text'>Add a channel</div>", unsafe_allow_html=True)
     channel_id = st.text_input("Channel ID (UC...)", key="admin-channel-id")
     name = st.text_input("Display name", key="admin-channel-name")
@@ -207,7 +216,7 @@ def render_admin_panel(folder_id: str) -> None:
     if st.button("Add channel", key="admin-add-channel"):
         languages = languages_raw.split(",") if languages_raw.strip() else None
         try:
-            report = add_channel_and_backfill(
+            result = add_channel_and_backfill(
                 folder_id,
                 channel_id=channel_id,
                 name=name,
@@ -223,8 +232,9 @@ def render_admin_panel(folder_id: str) -> None:
             logger.exception("Failed to add channel via admin panel")
             st.error("Something went wrong adding the channel - check the server logs.")
         else:
-            st.success(f"Channel added - {report.discovered_total} video(s) seen, {report.newly_queued} newly queued.")
+            st.session_state.admin_flash = admin_flash_for(result)
             _load_snapshot_cached.clear()
+            st.rerun()
 
 
 def main() -> None:
