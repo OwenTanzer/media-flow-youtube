@@ -12,6 +12,7 @@ def _fake_httpx_request() -> httpx.Request:
 def _fake_httpx_response(status_code: int = 429) -> httpx.Response:
     return httpx.Response(status_code, request=_fake_httpx_request())
 
+
 SAMPLE_MARKDOWN = """---
 video_id: abc123XYZde
 title: "A Title"
@@ -27,6 +28,30 @@ auto_generated: false
 """
 
 SAMPLE_BODY = "[00:00] hello\n[00:05] world\n"
+
+# A richer fixture for _resolve_points()/anchor-window tests: a topic
+# ("Palantir") mentioned twice, plus unrelated surrounding lines, so tests
+# can exercise "anchor found on the exact cited line", "anchor found a
+# couple lines away (within the window)", and "anchor nowhere nearby".
+RICH_BODY = (
+    "[00:00] Welcome back to the show everyone.\n"
+    "[00:10] Palantir is testing resistance near 40 dollars today.\n"
+    "[00:20] Traders are watching the 40 dollar level closely.\n"
+    "[00:30] Meanwhile crude oil slipped below 70 dollars a barrel.\n"
+    "[00:40] That's it for today, thanks for watching.\n"
+)
+
+
+def _point(source_timestamp="[00:05]", source_anchor="world", **overrides):
+    kwargs = dict(
+        importance="major",
+        main_point="P",
+        explanation="E",
+        source_timestamp=source_timestamp,
+        source_anchor=source_anchor,
+    )
+    kwargs.update(overrides)
+    return summarize.SummaryPoint(**kwargs)
 
 
 def test_strip_frontmatter_removes_only_the_leading_block():
@@ -153,36 +178,92 @@ def test_max_transcript_seconds_finds_the_last_timestamp():
     assert summarize._max_transcript_seconds("no timestamps here") == 0
 
 
-def test_validate_points_rejects_out_of_range_timestamp():
-    points = [summarize.SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=999)]
-    with pytest.raises(ValueError, match="outside the transcript's own range"):
-        summarize._validate_points(points, SAMPLE_BODY)
+def test_index_transcript_lines_returns_seconds_and_text_in_order():
+    indexed = summarize._index_transcript_lines(RICH_BODY)
+    assert [seconds for seconds, _ in indexed] == [0, 10, 20, 30, 40]
+    assert indexed[1][1] == "Palantir is testing resistance near 40 dollars today."
 
 
-def test_validate_points_rejects_negative_timestamp():
-    points = [summarize.SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=-1)]
-    with pytest.raises(ValueError, match="outside the transcript's own range"):
-        summarize._validate_points(points, SAMPLE_BODY)
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("[14:32]", 872),
+        ("14:32", 872),
+        ("[1:02:15]", 3735),
+        ("1:02:15", 3735),
+        ("[00:05]", 5),
+    ],
+)
+def test_parse_source_timestamp_parses_bracketed_and_bare_forms(raw, expected):
+    assert summarize._parse_source_timestamp(raw) == expected
 
 
-def test_validate_points_accepts_nonchronological_order():
+@pytest.mark.parametrize("raw", ["", "not a timestamp", "14:32:99:11", "[]", "yesterday"])
+def test_parse_source_timestamp_returns_none_for_garbage(raw):
+    assert summarize._parse_source_timestamp(raw) is None
+
+
+def test_resolve_points_accepts_a_citation_on_the_exact_line():
+    points = [_point(source_timestamp="[00:10]", source_anchor="Palantir is testing resistance")]
+    resolved = summarize._resolve_points(points, RICH_BODY)
+    assert resolved == [
+        summarize.ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=10)
+    ]
+
+
+def test_resolve_points_accepts_anchor_within_the_window_but_not_on_the_exact_line():
+    # Cited line is [00:10]; the anchor text actually lives on [00:30],
+    # two lines later - within _ANCHOR_WINDOW_LINES (2).
+    points = [_point(source_timestamp="[00:10]", source_anchor="crude oil slipped")]
+    resolved = summarize._resolve_points(points, RICH_BODY)
+    assert resolved[0].timestamp_seconds == 10
+
+
+def test_resolve_points_rejects_anchor_outside_the_window():
+    # [00:00] and [00:40] are 4 lines apart - outside the +-2 line window.
+    points = [_point(source_timestamp="[00:00]", source_anchor="thanks for watching")]
+    with pytest.raises(ValueError, match="was not found within"):
+        summarize._resolve_points(points, RICH_BODY)
+
+
+def test_resolve_points_anchor_match_is_case_and_whitespace_insensitive():
+    points = [_point(source_timestamp="[00:10]", source_anchor="  PALANTIR is   testing RESISTANCE  ")]
+    resolved = summarize._resolve_points(points, RICH_BODY)
+    assert resolved[0].timestamp_seconds == 10
+
+
+def test_resolve_points_rejects_unparseable_source_timestamp():
+    points = [_point(source_timestamp="not a timestamp")]
+    with pytest.raises(ValueError, match="not a valid"):
+        summarize._resolve_points(points, SAMPLE_BODY)
+
+
+def test_resolve_points_rejects_a_timestamp_that_is_not_a_real_transcript_line():
+    # 999s isn't anywhere in SAMPLE_BODY (only 0s and 5s exist) - this is
+    # the strict-equality replacement for the old "out of range" check,
+    # and also rejects a plausible-looking but non-real in-range value.
+    points = [_point(source_timestamp="[00:02]", source_anchor="hello")]
+    with pytest.raises(ValueError, match="not one of the transcript's own line timestamps"):
+        summarize._resolve_points(points, SAMPLE_BODY)
+
+
+def test_resolve_points_rejects_anchor_text_that_does_not_appear_at_all():
+    points = [_point(source_timestamp="[00:05]", source_anchor="something never said")]
+    with pytest.raises(ValueError, match="was not found within"):
+        summarize._resolve_points(points, SAMPLE_BODY)
+
+
+def test_resolve_points_accepts_nonchronological_order():
     """Regression test: real videos (livestreams especially) revisit the
     same topic more than once, and a strict ordering requirement rejected
-    genuinely well-formed output for that content - points only need to be
-    in-range now, not strictly ordered."""
+    genuinely well-formed output for that content - points only need to
+    each independently resolve, not be strictly ordered."""
     points = [
-        summarize.SummaryPoint(importance="major", main_point="Second", explanation="E", timestamp_seconds=5),
-        summarize.SummaryPoint(importance="minor", main_point="First", explanation="E", timestamp_seconds=0),
+        _point(source_timestamp="[00:05]", source_anchor="world"),
+        _point(source_timestamp="[00:00]", source_anchor="hello"),
     ]
-    summarize._validate_points(points, SAMPLE_BODY)  # should not raise
-
-
-def test_validate_points_accepts_valid_in_range_chronological_points():
-    points = [
-        summarize.SummaryPoint(importance="major", main_point="First", explanation="E", timestamp_seconds=0),
-        summarize.SummaryPoint(importance="minor", main_point="Second", explanation="E", timestamp_seconds=5),
-    ]
-    summarize._validate_points(points, SAMPLE_BODY)  # should not raise
+    resolved = summarize._resolve_points(points, SAMPLE_BODY)
+    assert [p.timestamp_seconds for p in resolved] == [5, 0]
 
 
 def test_max_points_for_duration_scales_with_length_and_has_a_ceiling():
@@ -193,11 +274,15 @@ def test_max_points_for_duration_scales_with_length_and_has_a_ceiling():
     assert summarize._max_points_for_duration(999_999) == summarize._MAX_POINTS_CEILING
 
 
+def _resolved(importance, timestamp_seconds, main_point="P"):
+    return summarize.ResolvedPoint(importance=importance, main_point=main_point, explanation="E", timestamp_seconds=timestamp_seconds)
+
+
 def test_select_significant_points_keeps_majors_over_minors_when_over_the_cap():
-    major_a = summarize.SummaryPoint(importance="major", main_point="Major A", explanation="E", timestamp_seconds=0)
-    minor_a = summarize.SummaryPoint(importance="minor", main_point="Minor A", explanation="E", timestamp_seconds=1)
-    major_b = summarize.SummaryPoint(importance="major", main_point="Major B", explanation="E", timestamp_seconds=2)
-    minor_b = summarize.SummaryPoint(importance="minor", main_point="Minor B", explanation="E", timestamp_seconds=3)
+    major_a = _resolved("major", 0, "Major A")
+    minor_a = _resolved("minor", 1, "Minor A")
+    major_b = _resolved("major", 2, "Major B")
+    minor_b = _resolved("minor", 3, "Minor B")
 
     selected, truncated = summarize._select_significant_points([major_a, minor_a, major_b, minor_b], max_points=2)
 
@@ -206,9 +291,9 @@ def test_select_significant_points_keeps_majors_over_minors_when_over_the_cap():
 
 
 def test_select_significant_points_preserves_original_order_among_kept_points():
-    p1 = summarize.SummaryPoint(importance="major", main_point="P1", explanation="E", timestamp_seconds=0)
-    p2 = summarize.SummaryPoint(importance="minor", main_point="P2", explanation="E", timestamp_seconds=1)
-    p3 = summarize.SummaryPoint(importance="major", main_point="P3", explanation="E", timestamp_seconds=2)
+    p1 = _resolved("major", 0, "P1")
+    p2 = _resolved("minor", 1, "P2")
+    p3 = _resolved("major", 2, "P3")
 
     selected, truncated = summarize._select_significant_points([p1, p2, p3], max_points=2)
 
@@ -218,7 +303,7 @@ def test_select_significant_points_preserves_original_order_among_kept_points():
 
 
 def test_select_significant_points_does_not_truncate_when_under_the_cap():
-    p1 = summarize.SummaryPoint(importance="major", main_point="P1", explanation="E", timestamp_seconds=0)
+    p1 = _resolved("major", 0, "P1")
     selected, truncated = summarize._select_significant_points([p1], max_points=5)
     assert truncated is False
     assert selected == [p1]
@@ -258,7 +343,7 @@ def test_summarize_transcript_success(monkeypatch):
     expected_output = summarize.ModelSummaryOutput(
         video_type="Analytic Overview",
         summary="A summary.",
-        points=[summarize.SummaryPoint(importance="major", main_point="Point one", explanation="Because X.", timestamp_seconds=5)],
+        points=[_point(source_timestamp="[00:05]", source_anchor="world", main_point="Point one", explanation="Because X.")],
     )
     monkeypatch.setattr(
         summarize.anthropic, "Anthropic", _fake_client(_FakeParsedMessage(expected_output, usage=_FakeUsage(123, 45)))
@@ -268,20 +353,24 @@ def test_summarize_transcript_success(monkeypatch):
         SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024
     )
 
-    assert output == expected_output
+    assert output.video_type == "Analytic Overview"
+    assert output.summary == "A summary."
+    assert output.points == [
+        summarize.ResolvedPoint(importance="major", main_point="Point one", explanation="Because X.", timestamp_seconds=5)
+    ]
     assert usage.input_tokens == 123
     assert usage.output_tokens == 45
     assert points_truncated is False
 
 
 def test_summarize_transcript_raises_on_invalid_points(monkeypatch):
-    """The model can return a well-typed but out-of-range timestamp_seconds
-    - Pydantic alone can't catch this, since it only validates int/str
-    shape, not values against the actual transcript."""
+    """The model can return a well-typed but ungrounded citation - Pydantic
+    alone can't catch this, since it only validates the string shape, not
+    whether the cited line and excerpt are real."""
     bad_output = summarize.ModelSummaryOutput(
         video_type="Analytic Overview",
         summary="S.",
-        points=[summarize.SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=9999)],
+        points=[_point(source_timestamp="[00:02]", source_anchor="hello")],  # 2s isn't a real line in SAMPLE_BODY
     )
     monkeypatch.setattr(summarize.anthropic, "Anthropic", _fake_client(_FakeParsedMessage(bad_output)))
 
@@ -370,7 +459,7 @@ def test_summarize_transcript_disables_the_sdks_own_internal_retries(monkeypatch
     captured = {}
     fake = _FakeParsedMessage(
         summarize.ModelSummaryOutput(
-            video_type="Analytic Overview", summary="S.", points=[summarize.SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)]
+            video_type="Analytic Overview", summary="S.", points=[_point(source_timestamp="[00:00]", source_anchor="hello")]
         )
     )
     monkeypatch.setattr(summarize.anthropic, "Anthropic", _fake_client(fake, captured_init_kwargs=captured))
@@ -407,8 +496,16 @@ def test_summarize_transcript_raises_on_real_pydantic_validation_error(monkeypat
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"video_type": "Not A Real Type", "summary": "S.", "points": [{"importance": "major", "main_point": "P", "explanation": "E", "timestamp_seconds": 0}]},
-        {"video_type": "Analytic Overview", "summary": "", "points": [{"importance": "major", "main_point": "P", "explanation": "E", "timestamp_seconds": 0}]},
+        {
+            "video_type": "Not A Real Type",
+            "summary": "S.",
+            "points": [{"importance": "major", "main_point": "P", "explanation": "E", "source_timestamp": "[00:00]", "source_anchor": "hello"}],
+        },
+        {
+            "video_type": "Analytic Overview",
+            "summary": "",
+            "points": [{"importance": "major", "main_point": "P", "explanation": "E", "source_timestamp": "[00:00]", "source_anchor": "hello"}],
+        },
         {"video_type": "Analytic Overview", "summary": "S.", "points": []},
     ],
 )
@@ -426,13 +523,13 @@ def test_model_summary_output_accepts_each_valid_video_type():
         summarize.ModelSummaryOutput(
             video_type=video_type,
             summary="S.",
-            points=[summarize.SummaryPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)],
+            points=[_point(source_timestamp="[00:00]", source_anchor="hello")],
         )  # should not raise
 
 
-@pytest.mark.parametrize("field_name", ["main_point", "explanation"])
+@pytest.mark.parametrize("field_name", ["main_point", "explanation", "source_timestamp", "source_anchor"])
 def test_summary_point_rejects_empty_strings(field_name):
-    kwargs = {"importance": "major", "main_point": "P", "explanation": "E", "timestamp_seconds": 0}
+    kwargs = dict(importance="major", main_point="P", explanation="E", source_timestamp="[00:00]", source_anchor="hello")
     kwargs[field_name] = ""
     with pytest.raises(summarize.pydantic.ValidationError):
         summarize.SummaryPoint(**kwargs)

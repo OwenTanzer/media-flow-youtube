@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from dataclasses import dataclass
 from typing import Literal
 
 import anthropic
@@ -20,7 +21,7 @@ logger = logging.getLogger("media_flow.summarize")
 # changes. Deliberately a code constant, not an env var - drifting it
 # independently of the prompt text would corrupt the idempotency check in
 # summary_store.needs_summarization().
-PROMPT_VERSION = "v5"
+PROMPT_VERSION = "v6"
 
 # Convenience tuple for callers/tests - must be kept in sync with
 # ModelSummaryOutput.video_type's Literal values below.
@@ -51,9 +52,10 @@ Every transcript line is prefixed with its own timestamp in brackets, e.g. "[14:
 - "importance" is "major" for a point central to the video's purpose, "minor" for a supporting or secondary point.
 - "main_point" is one sentence or phrase stating the point.
 - "explanation" is 2 to 4 sentences of supporting detail, using only what the transcript actually supports - favor giving real substance and specifics (numbers, reasoning, context) over being terse.
-- "timestamp_seconds" MUST be copied from one specific transcript line's own bracketed timestamp - the line where this point is first mentioned or introduced - converted to a plain integer number of seconds (e.g. "[14:32]" -> 872, "[1:02:15]" -> 3735). Never estimate, round, or invent a timestamp: pick an actual bracketed line you are citing and convert only that line's own value. This value can never exceed the transcript's own last timestamp.
+- "source_timestamp" is the exact bracketed timestamp of ONE transcript line that supports this point - copy it verbatim, brackets included (e.g. "[14:32]" or "[1:02:15]"). Do not compute, estimate, convert, or invent anything here - just copy the bracket text of a real transcript line.
+- "source_anchor" is a short excerpt (a few words to one sentence) copied verbatim from that same transcript line, so your citation can be checked against the transcript. Do not paraphrase or summarize it - copy the actual words.
 
-Many videos (livestreams especially) revisit the same topic more than once - e.g. the same asset, subject, or claim comes up early, then again later in more depth. When that happens, write the point/explanation to reflect the fullest picture of what was said about it across all those mentions, but still set "timestamp_seconds" to one single real transcript line you are citing (e.g. wherever the point is best substantiated) - never a value synthesized or averaged across multiple mentions. Points do not need to be in strict chronological order if a topic is revisited.
+Many videos (livestreams especially) revisit the same topic more than once - e.g. the same asset, subject, or claim comes up early, then again later in more depth. When that happens, "explanation" may still draw on the fullest picture of what was said about it across all those mentions - but "source_timestamp"/"source_anchor" must always point at ONE single real line you are citing, never a value that combines, averages, or estimates across multiple mentions. Pick whichever one mention you're citing evidence from. Points do not need to be in strict chronological order if a topic is revisited.
 
 Be concise and factual. State uncertainty explicitly (e.g. "the speaker suggests..." vs "the speaker states...") rather than presenting an inference as a stated fact. Do not include information not supported by the transcript text.
 
@@ -72,6 +74,18 @@ _FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n\n", re.DOTALL)
 # Matches the "[HH:MM:SS] " / "[MM:SS] " prefix youtube.render_transcript_markdown()
 # puts at the start of every transcript line.
 _TIMESTAMP_LINE_RE = re.compile(r"^\[(?:(\d+):)?(\d{1,2}):(\d{2})\] ", re.MULTILINE)
+
+# Matches a bare "source_timestamp" value the model is asked to copy
+# verbatim from a transcript line's own bracket - e.g. "[14:32]" or
+# "[1:02:15]" - optionally without the brackets, in case the model drops
+# them despite the prompt's instruction to keep them.
+_SOURCE_TIMESTAMP_RE = re.compile(r"^\[?(?:(\d+):)?(\d{1,2}):(\d{2})\]?$")
+
+# How many transcript lines on either side of the cited line source_anchor
+# is allowed to be found in - a little slack for an excerpt that straddles
+# a line break, without being loose enough to accept a citation for
+# unrelated content elsewhere in the transcript.
+_ANCHOR_WINDOW_LINES = 2
 
 # From the Claude API pricing table, USD per million tokens (input, output).
 # Unrecognized models return None from estimate_cost_usd() rather than
@@ -129,10 +143,23 @@ class SummarizationError(RuntimeError):
 
 
 class SummaryPoint(BaseModel):
+    """The schema the model must produce for one point. Deliberately asks
+    for literal transcript evidence only, never a computed value: the
+    model copies a real line's bracketed timestamp and a verbatim excerpt
+    from it, and application code (_resolve_points()) is solely
+    responsible for verifying that evidence against the transcript and
+    converting it to timestamp_seconds - the earlier design let the model
+    both "remember" a line and compute its own timestamp_seconds in one
+    step, and validated only that the result was plausible (in range),
+    which let a wrong-but-plausible number through. Requiring literal
+    copy-paste evidence, checked against the transcript, is a strictly
+    stronger guarantee than range-checking a self-reported number."""
+
     importance: Literal["major", "minor"]
     main_point: str = Field(min_length=1)
     explanation: str = Field(min_length=1)
-    timestamp_seconds: int
+    source_timestamp: str = Field(min_length=1)
+    source_anchor: str = Field(min_length=1)
 
 
 class ModelSummaryOutput(BaseModel):
@@ -140,10 +167,9 @@ class ModelSummaryOutput(BaseModel):
     the persisted artifact (title, author, url, source ids, hash, model,
     prompt_version, display timestamps, usage, status) is filled in or
     derived by application code from the known source artifact - see
-    summary_store.py. In particular, the human-readable "timestamp" string
-    is never taken from the model - it's derived deterministically from
-    timestamp_seconds via youtube.format_timestamp(), so the two can't
-    disagree with each other.
+    summary_store.py. In particular, points' timestamp_seconds and the
+    human-readable "timestamp" string are never taken from the model - see
+    ResolvedPoint below.
 
     Minimum lengths on every field (including requiring at least one point)
     are deliberate: an empty/blank response is schema-valid by Pydantic's
@@ -153,6 +179,31 @@ class ModelSummaryOutput(BaseModel):
     video_type: Literal["Post-Market Update", "Thesis Piece", "Analytic Overview", "Pre-Market Brief"]
     summary: str = Field(min_length=1)
     points: list[SummaryPoint] = Field(min_length=1)
+
+
+@dataclass
+class ResolvedPoint:
+    """A SummaryPoint after its source_timestamp/source_anchor have been
+    verified against the transcript and converted to a real
+    timestamp_seconds - see _resolve_points(). This, not SummaryPoint, is
+    what summarize_transcript() actually returns to callers (see
+    ResolvedSummary): nothing downstream ever sees a model-reported
+    timestamp, computed or otherwise."""
+
+    importance: Literal["major", "minor"]
+    main_point: str
+    explanation: str
+    timestamp_seconds: int
+
+
+@dataclass
+class ResolvedSummary:
+    """summarize_transcript()'s actual return shape - same fields as
+    ModelSummaryOutput, but with points resolved (see ResolvedPoint)."""
+
+    video_type: str
+    summary: str
+    points: list[ResolvedPoint]
 
 
 class Usage(BaseModel):
@@ -237,40 +288,114 @@ def count_prompt_tokens(transcript_body: str, *, model: str) -> int:
     return result.input_tokens
 
 
-def _max_transcript_seconds(transcript_body: str) -> int:
-    """Highest timestamp actually present in the transcript body shown to
-    the model, used to validate the model didn't invent an out-of-range
-    timestamp_seconds for some point."""
+def _index_transcript_lines(transcript_body: str) -> list[tuple[int, str]]:
+    """Returns (timestamp_seconds, line_text) for every timestamped line in
+    the transcript, in original order - the shared source of truth for the
+    max-timestamp check, the "is this a real line" check, and source_anchor
+    window matching below."""
 
-    max_seconds = 0
+    lines = []
     for match in _TIMESTAMP_LINE_RE.finditer(transcript_body):
         hours = int(match.group(1)) if match.group(1) else 0
         minutes = int(match.group(2))
         seconds = int(match.group(3))
-        max_seconds = max(max_seconds, hours * 3600 + minutes * 60 + seconds)
-    return max_seconds
+        line_end = transcript_body.find("\n", match.end())
+        if line_end == -1:
+            line_end = len(transcript_body)
+        lines.append((hours * 3600 + minutes * 60 + seconds, transcript_body[match.end() : line_end]))
+    return lines
 
 
-def _validate_points(points: list[SummaryPoint], transcript_body: str) -> None:
-    """Raises ValueError if a point's timestamp_seconds isn't trustworthy:
-    negative, or beyond the transcript's own timestamp range - Pydantic
-    only validates that it's an int, not that it's plausible. Points are
-    deliberately *not* required to be in chronological order: real videos
-    (livestreams especially) revisit the same topic more than once, and a
-    strict ordering requirement rejected genuinely well-formed output for
-    that content - see _select_significant_points() for the actual bound
-    that matters for long videos (a cap on point count, not their order)."""
+def _max_transcript_seconds(transcript_body: str) -> int:
+    """Highest timestamp actually present in the transcript body shown to
+    the model - used to size the point budget (_max_points_for_duration())."""
 
-    max_seconds = _max_transcript_seconds(transcript_body)
+    return max((seconds for seconds, _ in _index_transcript_lines(transcript_body)), default=0)
+
+
+def _parse_source_timestamp(raw: str) -> int | None:
+    """Parses a model-supplied source_timestamp value (expected verbatim
+    from a transcript line's own bracket, e.g. "[14:32]") into seconds.
+    Returns None if it doesn't match the expected [H:MM:SS]/[MM:SS] shape
+    at all - a distinct failure from "parses fine but isn't a real
+    transcript line", which _resolve_points() checks separately."""
+
+    match = _SOURCE_TIMESTAMP_RE.match(raw.strip())
+    if not match:
+        return None
+    hours = int(match.group(1)) if match.group(1) else 0
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _resolve_points(points: list[SummaryPoint], transcript_body: str) -> list[ResolvedPoint]:
+    """Verifies each point's cited evidence against the transcript and
+    computes its real timestamp_seconds - the model never computes or
+    reports this number itself; it only cites a literal transcript line
+    (source_timestamp) and a short excerpt from it (source_anchor). Raises
+    ValueError - a content/grounding failure Pydantic's schema check alone
+    can't catch, same as the old range check - if:
+
+      - source_timestamp doesn't parse as a "[H:MM:SS]"/"[MM:SS]" value;
+      - that exact value isn't one of the transcript's own real line
+        timestamps (strict equality, not "in range" - the model must cite
+        a real line, not merely land on a plausible-sounding number); or
+      - source_anchor doesn't appear (case/whitespace-insensitive) within
+        _ANCHOR_WINDOW_LINES lines of that timestamp, which allows a
+        little slack for an excerpt that straddles a line break without
+        permitting a citation for unrelated transcript content.
+
+    Points are deliberately *not* required to be in chronological order:
+    real videos (livestreams especially) revisit the same topic more than
+    once, and a strict ordering requirement rejected genuinely well-formed
+    output for that content - see _select_significant_points() for the
+    actual bound that matters for long videos (a cap on point count, not
+    their order)."""
+
+    indexed = _index_transcript_lines(transcript_body)
+    line_index_by_second: dict[int, int] = {}
+    for i, (seconds, _text) in enumerate(indexed):
+        line_index_by_second.setdefault(seconds, i)
+
+    resolved: list[ResolvedPoint] = []
     for point in points:
-        if point.timestamp_seconds < 0 or point.timestamp_seconds > max_seconds:
+        seconds = _parse_source_timestamp(point.source_timestamp)
+        if seconds is None:
             raise ValueError(
-                f"timestamp_seconds={point.timestamp_seconds} is outside the transcript's own "
-                f"range [0, {max_seconds}] for point {point.main_point!r}."
+                f"source_timestamp {point.source_timestamp!r} is not a valid [H:MM:SS]/[MM:SS] "
+                f"value for point {point.main_point!r}."
+            )
+        line_index = line_index_by_second.get(seconds)
+        if line_index is None:
+            raise ValueError(
+                f"source_timestamp {point.source_timestamp!r} ({seconds}s) is not one of the "
+                f"transcript's own line timestamps for point {point.main_point!r}."
             )
 
+        window_start = max(0, line_index - _ANCHOR_WINDOW_LINES)
+        window_end = min(len(indexed), line_index + _ANCHOR_WINDOW_LINES + 1)
+        window_text = " ".join(text for _, text in indexed[window_start:window_end]).lower()
+        anchor = " ".join(point.source_anchor.split()).lower()
+        if anchor not in window_text:
+            raise ValueError(
+                f"source_anchor {point.source_anchor!r} was not found within "
+                f"{_ANCHOR_WINDOW_LINES} line(s) of {point.source_timestamp!r} for point "
+                f"{point.main_point!r}."
+            )
 
-def _select_significant_points(points: list[SummaryPoint], max_points: int) -> tuple[list[SummaryPoint], bool]:
+        resolved.append(
+            ResolvedPoint(
+                importance=point.importance,
+                main_point=point.main_point,
+                explanation=point.explanation,
+                timestamp_seconds=seconds,
+            )
+        )
+    return resolved
+
+
+def _select_significant_points(points: list[ResolvedPoint], max_points: int) -> tuple[list[ResolvedPoint], bool]:
     """Enforces _max_points_for_duration()'s cap as a hard backstop,
     independent of whether the model already respected it in the prompt:
     if the model still returns more than max_points, keep only the most
@@ -290,9 +415,11 @@ def _select_significant_points(points: list[SummaryPoint], max_points: int) -> t
 
 def summarize_transcript(
     transcript_body: str, *, model: str, max_output_tokens: int
-) -> tuple[ModelSummaryOutput, Usage, bool]:
-    """Calls Claude to produce a ModelSummaryOutput for one transcript.
-    Raises SummarizationError on any provider failure or invalid/unparseable
+) -> tuple[ResolvedSummary, Usage, bool]:
+    """Calls Claude to produce a ResolvedSummary for one transcript (the
+    model itself produces a ModelSummaryOutput; _resolve_points() verifies
+    and converts it - see that function's docstring). Raises
+    SummarizationError on any provider failure or invalid/unparseable
     output - never raises a raw SDK exception, so callers don't need to know
     the SDK's exception hierarchy. Returns (output, usage, points_truncated) -
     points_truncated is True if _select_significant_points() had to drop
@@ -362,13 +489,15 @@ def summarize_transcript(
         )
 
     try:
-        _validate_points(response.parsed_output.points, transcript_body)
+        resolved_points = _resolve_points(response.parsed_output.points, transcript_body)
     except ValueError as exc:
         raise SummarizationError(f"Model output failed validation: {exc}", retryable=True, usage=response_usage) from exc
 
-    selected_points, points_truncated = _select_significant_points(response.parsed_output.points, max_points)
-    output = response.parsed_output
-    if points_truncated:
-        output = output.model_copy(update={"points": selected_points})
+    selected_points, points_truncated = _select_significant_points(resolved_points, max_points)
+    output = ResolvedSummary(
+        video_type=response.parsed_output.video_type,
+        summary=response.parsed_output.summary,
+        points=selected_points,
+    )
 
     return output, response_usage, points_truncated
