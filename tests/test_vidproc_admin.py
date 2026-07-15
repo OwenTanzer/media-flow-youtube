@@ -147,7 +147,12 @@ def test_add_channel_and_backfill_writes_the_new_channel_and_runs_backfill(monke
     written, release_calls = _stub(monkeypatch, existing=[Channel("UC_old234567890123456789", "Old Channel")])
 
     result = admin.add_channel_and_backfill(
-        "folder-id", channel_id=VALID_CHANNEL_ID, name="New Channel", enabled=True, group="Google", languages=["en", "es"]
+        "folder-id",
+        channel_id=VALID_CHANNEL_ID,
+        name="New Channel",
+        enabled=True,
+        group_choice="Google",
+        languages=["en", "es"],
     )
 
     assert written["channels"] == [
@@ -164,20 +169,24 @@ def test_add_channel_and_backfill_strips_whitespace(monkeypatch):
     written, _ = _stub(monkeypatch, existing=[])
 
     admin.add_channel_and_backfill(
-        "folder-id", channel_id=f"  {VALID_CHANNEL_ID}  ", name="  New Channel  ", group="  ", languages=["  en  ", "  "]
+        "folder-id",
+        channel_id=f"  {VALID_CHANNEL_ID}  ",
+        name="  New Channel  ",
+        group_choice="Google",
+        languages=["  en  ", "  "],
     )
 
     added = written["channels"][0]
     assert added.channel_id == VALID_CHANNEL_ID
     assert added.name == "New Channel"
-    assert added.group is None
+    assert added.group == "Google"
     assert added.languages == ["en"]
 
 
 def test_add_channel_and_backfill_defaults_name_to_channel_id_when_blank(monkeypatch):
     written, _ = _stub(monkeypatch, existing=[])
 
-    admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="   ")
+    admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="   ", group_choice="Google")
 
     assert written["channels"][0].name == VALID_CHANNEL_ID
 
@@ -186,7 +195,7 @@ def test_add_channel_and_backfill_rejects_blank_channel_id(monkeypatch):
     _stub(monkeypatch, existing=[])
 
     with pytest.raises(ValueError, match="Channel ID is required"):
-        admin.add_channel_and_backfill("folder-id", channel_id="   ", name="Anything")
+        admin.add_channel_and_backfill("folder-id", channel_id="   ", name="Anything", group_choice="Google")
 
 
 @pytest.mark.parametrize("bad_id", ["not-a-channel-id", "UCtooshort", "UC" + "x" * 21, "UC" + "x" * 23])
@@ -199,7 +208,7 @@ def test_add_channel_and_backfill_rejects_malformed_channel_id(monkeypatch, bad_
     monkeypatch.setattr(admin.discovery, "fetch_channel_feed", lambda channel_id: fetch_calls.append(channel_id))
 
     with pytest.raises(ValueError, match="doesn't look like a YouTube channel ID"):
-        admin.add_channel_and_backfill("folder-id", channel_id=bad_id, name="Anything")
+        admin.add_channel_and_backfill("folder-id", channel_id=bad_id, name="Anything", group_choice="Google")
 
     assert "channels" not in written
     assert fetch_calls == []  # never even attempted the preflight fetch
@@ -212,7 +221,7 @@ def test_add_channel_and_backfill_rejects_a_channel_whose_feed_cant_be_fetched(m
     written, _ = _stub(monkeypatch, existing=[], feed_ok=False)
 
     with pytest.raises(ValueError, match="Could not fetch this channel's RSS feed"):
-        admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="Anything")
+        admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="Anything", group_choice="Google")
 
     assert "channels" not in written
 
@@ -221,8 +230,32 @@ def test_add_channel_and_backfill_rejects_a_duplicate_channel_id(monkeypatch):
     written, _ = _stub(monkeypatch, existing=[Channel(VALID_CHANNEL_ID, "Existing Channel")])
 
     with pytest.raises(admin.ChannelAlreadyExistsError, match=VALID_CHANNEL_ID):
-        admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="Duplicate")
+        admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="Duplicate", group_choice="Google")
 
+    assert "channels" not in written
+
+
+def test_add_channel_and_backfill_does_not_create_a_group_when_channel_validation_fails(monkeypatch):
+    """Regression test for the review finding: creating the group before
+    validating the channel left an orphaned group in groups.json (one not
+    even selectable on retry, since the dropdown was built from
+    channels.json) whenever the channel itself turned out to be invalid.
+    Group resolution/creation must not happen until every channel-level
+    check has already passed."""
+    written, _ = _stub(monkeypatch, existing=[Channel(VALID_CHANNEL_ID, "Existing Channel")])
+    groups_written = _stub_groups(monkeypatch)
+
+    with pytest.raises(admin.ChannelAlreadyExistsError):
+        admin.add_channel_and_backfill(
+            "folder-id",
+            channel_id=VALID_CHANNEL_ID,
+            name="Duplicate",
+            group_choice=admin.NEW_GROUP_OPTION,
+            new_group_name="Crypto",
+            new_group_video_types=["Market Update"],
+        )
+
+    assert "groups" not in groups_written
     assert "channels" not in written
 
 
@@ -235,9 +268,9 @@ def test_add_channel_and_backfill_defers_when_discovery_lock_is_held(monkeypatch
     backfill_calls = []
     monkeypatch.setattr(admin.discovery, "backfill_new_channels", lambda folder_id: backfill_calls.append(1))
 
-    result = admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="New Channel")
+    result = admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="New Channel", group_choice="Google")
 
-    assert written["channels"] == [Channel(VALID_CHANNEL_ID, "New Channel")]
+    assert written["channels"] == [Channel(VALID_CHANNEL_ID, "New Channel", group="Google")]
     assert result.backfill_deferred is True
     assert result.backfill_report is None
     assert result.backfill_error is None
@@ -257,9 +290,11 @@ def test_add_channel_and_backfill_skips_backfill_entirely_for_a_disabled_channel
     backfill_calls = []
     monkeypatch.setattr(admin.discovery, "backfill_new_channels", lambda folder_id: backfill_calls.append(1))
 
-    result = admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="New Channel", enabled=False)
+    result = admin.add_channel_and_backfill(
+        "folder-id", channel_id=VALID_CHANNEL_ID, name="New Channel", group_choice="Google", enabled=False
+    )
 
-    assert written["channels"] == [Channel(VALID_CHANNEL_ID, "New Channel", False)]
+    assert written["channels"] == [Channel(VALID_CHANNEL_ID, "New Channel", False, group="Google")]
     assert result.channel.enabled is False
     assert result.backfill_report is None
     assert result.backfill_deferred is False
@@ -282,9 +317,11 @@ def test_add_channel_and_backfill_reports_a_backfill_error_without_losing_the_ad
 
     monkeypatch.setattr(admin.discovery, "backfill_new_channels", _raise)
 
-    result = admin.add_channel_and_backfill("folder-id", channel_id=VALID_CHANNEL_ID, name="New Channel")
+    result = admin.add_channel_and_backfill(
+        "folder-id", channel_id=VALID_CHANNEL_ID, name="New Channel", group_choice="Google"
+    )
 
-    assert written["channels"] == [Channel(VALID_CHANNEL_ID, "New Channel")]
+    assert written["channels"] == [Channel(VALID_CHANNEL_ID, "New Channel", group="Google")]
     assert result.backfill_error == "Drive read failed"
     assert result.backfill_report is None
     assert result.backfill_deferred is False

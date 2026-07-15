@@ -31,7 +31,6 @@ from vidproc.admin import (
     admin_flash_for,
     check_admin_token,
     delete_group,
-    resolve_group_selection,
     update_group_video_types,
 )
 from vidproc.render import render_detail, render_empty_state, render_feed_card, render_notice
@@ -230,10 +229,13 @@ def render_admin_panel(folder_id: str, channels: list) -> None:
     # Existing groups only, plus an explicit "create new" option - picking
     # an existing group can never spawn a new tab, so a new one only ever
     # gets created as a conscious choice, not via a free-text typo of an
-    # existing group's name.
-    group_choice = st.selectbox(
-        "Group", options=[*groups_for_channels(channels), NEW_GROUP_OPTION], key="admin-channel-group-choice"
-    )
+    # existing group's name. Union of channels.json's groups and
+    # groups.json's registered names, not just the former - otherwise a
+    # group with no channel using it yet (e.g. one just created, or one
+    # whose only channel was since removed/reassigned) wouldn't appear
+    # here at all, forcing a re-creation attempt that fails as a duplicate.
+    known_group_names = sorted({*groups_for_channels(channels), *(g.name for g in group_store.read_groups(folder_id))})
+    group_choice = st.selectbox("Group", options=[*known_group_names, NEW_GROUP_OPTION], key="admin-channel-group-choice")
     new_group_name = ""
     new_group_video_types_raw = ""
     if group_choice == NEW_GROUP_OPTION:
@@ -251,13 +253,14 @@ def render_admin_panel(folder_id: str, channels: list) -> None:
         languages = languages_raw.split(",") if languages_raw.strip() else None
         new_group_video_types = new_group_video_types_raw.split(",") if new_group_video_types_raw.strip() else []
         try:
-            group = resolve_group_selection(folder_id, group_choice, new_group_name, new_group_video_types)
             result = add_channel_and_backfill(
                 folder_id,
                 channel_id=channel_id,
                 name=name,
+                group_choice=group_choice,
+                new_group_name=new_group_name,
+                new_group_video_types=new_group_video_types,
                 enabled=enabled,
-                group=group,
                 languages=languages,
             )
         except (ChannelAlreadyExistsError, ValueError) as exc:

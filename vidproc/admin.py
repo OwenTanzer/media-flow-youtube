@@ -140,18 +140,26 @@ def delete_group(folder_id: str, name: str) -> None:
 
 def resolve_group_selection(folder_id: str, selected: str, new_group_name: str, new_group_video_types: list[str]) -> str:
     """Resolves the admin panel's group selectbox into the actual `group`
-    value to pass to add_channel_and_backfill(). Picking an existing
-    group from the selectbox returns it verbatim, with no Drive write - a
-    new group is only ever created when NEW_GROUP_OPTION was explicitly
-    selected, making that (and specifying its video_types) a conscious
-    choice rather than something a typo in a free-text field could
-    trigger by accident.
+    value - picking an existing group from the selectbox returns it
+    verbatim, with no Drive write; a new group is only ever created when
+    NEW_GROUP_OPTION was explicitly selected, making that (and specifying
+    its video_types) a conscious choice rather than something a typo in a
+    free-text field could trigger by accident.
 
     When NEW_GROUP_OPTION is selected, this creates the group (see
     create_group() - same ValueError cases apply: blank name, no
     non-blank video_types, or an already-registered name) before
-    returning its name, so the group exists by the time
-    add_channel_and_backfill() references it."""
+    returning its name.
+
+    Called by add_channel_and_backfill() only *after* the channel itself
+    has fully passed validation (blank/malformed ID, duplicate check, RSS
+    preflight) - group creation is the one Drive write in that whole flow
+    that can't be validated away in advance (naming collisions aside), so
+    it deliberately happens last, right before the channel write itself,
+    to minimize the window where a new group could be left registered
+    with no channel actually using it (see the review finding this
+    addresses - this doesn't make the two writes a single atomic
+    transaction, just orders them to fail closed instead of open)."""
 
     if selected != NEW_GROUP_OPTION:
         return selected
@@ -164,8 +172,10 @@ def add_channel_and_backfill(
     *,
     channel_id: str,
     name: str,
+    group_choice: str,
+    new_group_name: str = "",
+    new_group_video_types: list[str] | None = None,
     enabled: bool = True,
-    group: str | None = None,
     languages: list[str] | None = None,
 ) -> AddChannelResult:
     """Registers a new channel in channels.json, then immediately backfills
@@ -177,10 +187,23 @@ def add_channel_and_backfill(
     and backfill only ever consider enabled channels, so there's nothing
     for it to find until the channel is enabled.
 
-    Raises ValueError for a blank/malformed channel_id or one whose feed
-    can't be fetched (checked *before* writing anything, so a typo is
-    never permanently written - see the review finding this addresses),
-    or ChannelAlreadyExistsError if channel_id is already registered.
+    group_choice/new_group_name/new_group_video_types are the admin
+    panel's group selectbox inputs verbatim (see resolve_group_selection())
+    - deliberately taken here rather than a pre-resolved `group: str`, so
+    that group resolution (which may create a new group - a Drive write)
+    only happens *after* every channel-level check below has already
+    passed. Doing it the other way around (resolve/create the group
+    first, then validate the channel) was the review finding this
+    addresses: a channel validation failure after an already-created
+    group left an orphaned group in groups.json that didn't even appear
+    in the panel's own dropdown (built from channels.json's groups) to
+    retry against.
+
+    Raises ValueError for a blank/malformed channel_id, one whose feed
+    can't be fetched, or an invalid group_choice/new_group_name/
+    new_group_video_types combination (all checked *before* writing
+    anything, so a typo is never permanently written), or
+    ChannelAlreadyExistsError if channel_id is already registered.
     Callers should catch and display these, not treat them as an
     unexpected failure.
 
@@ -204,7 +227,6 @@ def add_channel_and_backfill(
             "22 characters (find it in the channel page's source, or via a channel-ID lookup tool)."
         )
     name = name.strip() or channel_id
-    group = group.strip() or None if group else None
     languages = [code.strip() for code in languages if code.strip()] if languages else None
 
     existing = channel_store.read_channels(folder_id)
@@ -218,6 +240,12 @@ def add_channel_and_backfill(
         discovery.fetch_channel_feed(channel_id)
     except (requests.RequestException, ET.ParseError) as exc:
         raise ValueError(f"Could not fetch this channel's RSS feed - double-check the channel ID. ({exc})") from exc
+
+    # Every channel-level check has now passed - only now does group
+    # resolution run, since it's the one remaining step capable of a
+    # Drive write (creating a new group) that a validation failure above
+    # would otherwise leave orphaned.
+    group = resolve_group_selection(folder_id, group_choice, new_group_name, new_group_video_types or [])
 
     new_channel = Channel(channel_id=channel_id, name=name, enabled=enabled, languages=languages, group=group)
     channel_store.write_channels(folder_id, [*existing, new_channel])
