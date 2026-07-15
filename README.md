@@ -530,9 +530,27 @@ did before this feature existed. The Admin tab's "+ Create a new group"
 flow (see "Admin panel" below) requires specifying at least one video
 type up front, so a new group is never left unconfigured by accident.
 
-Changing a group's `video_types` only affects videos summarized
-*afterward* - it's not retroactive, and doesn't itself force
-re-summarization of anything already archived.
+A description can optionally be attached to each category too
+(`"video_type_descriptions": {"Post-Market Update": "a recap/review of a
+trading session..."}`) - the model classifies meaningfully more reliably
+against a real definition than a bare name alone (this is how Finance's
+own default categories are defined - see
+`summarize.FALLBACK_VIDEO_TYPE_DESCRIPTIONS`). Not editable from the
+admin panel's create/edit-group forms (those only take names) - add it by
+hand-editing `groups.json` directly, same as e.g. `channels.json`'s
+`languages` field.
+
+Editing a group's `video_types`/`video_type_descriptions` **is**
+retroactive, just not immediately: each summary artifact records a
+`video_types_fingerprint` (a hash of the exact taxonomy it was classified
+against), and `needs_summarization()` treats a changed fingerprint as a
+new unit of work, exactly like a changed transcript hash/model/prompt
+version - so any video previously summarized under a different taxonomy
+becomes eligible for re-summarization again on the *next*
+`discover_and_process.py` run, at that run's usual API cost. This also
+means seeding `groups.json` late (after the scheduled job has already run
+at least once under the fallback categories) self-corrects on the next
+run rather than leaving those videos permanently misclassified.
 
 An existing group's `video_types` can be edited or deleted later too, via
 the Admin tab's "Manage groups" section (an expander per group, with

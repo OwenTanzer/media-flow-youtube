@@ -177,14 +177,26 @@ def write_summary(folder_id: str, video_id: str, artifact: dict) -> None:
     )
 
 
-def _is_same_work_item(existing: dict | None, source_hash: str, model: str, prompt_version: str) -> bool:
+def _is_same_work_item(
+    existing: dict | None, source_hash: str, model: str, prompt_version: str, taxonomy_fingerprint: str | None = None
+) -> bool:
     """True if an existing artifact was produced for this exact (transcript
-    hash, model, prompt version) combination - i.e. retrying/overwriting it
-    represents the same unit of work, not a fresh one. A changed hash,
-    model, or prompt version means prior attempts don't count against this
-    "new" work item's retry budget."""
+    hash, model, prompt version, taxonomy fingerprint) combination - i.e.
+    retrying/overwriting it represents the same unit of work, not a fresh
+    one. A changed hash, model, prompt version, or taxonomy fingerprint
+    means prior attempts don't count against this "new" work item's retry
+    budget.
+
+    taxonomy_fingerprint (see app/group_store.py's video_types_fingerprint())
+    identifies the video's group's video_types/video_type_descriptions at
+    the moment of comparison - defaults to None, which skips this
+    dimension of the check entirely (existing simpler callers/tests that
+    don't care about it keep working unchanged); summarize_eligible()
+    always passes the real per-video value."""
 
     if existing is None:
+        return False
+    if taxonomy_fingerprint is not None and existing.get("video_types_fingerprint") != taxonomy_fingerprint:
         return False
     return (
         existing.get("source_transcript_hash") == source_hash
@@ -200,25 +212,27 @@ def needs_summarization(
     prompt_version: str,
     max_attempts: int | None = None,
     now: datetime | None = None,
+    taxonomy_fingerprint: str | None = None,
 ) -> bool:
     """True unless a current, successful summary already exists for this
-    exact (transcript hash, model, prompt version) combination, or a prior
-    failure for that same combination has already exhausted its retry
-    budget, was classified as non-retryable (e.g. a safety refusal -
-    deterministic for the same input, so retrying wastes budget without
-    changing the outcome), or hasn't reached its recorded next_retry_at
-    yet (a retryable failure gets a backoff window, not an immediate retry
-    on the very next invocation). A changed hash, model, or prompt version
-    always makes a video eligible again, resetting the attempt count,
-    since that's a new unit of work.
+    exact (transcript hash, model, prompt version, taxonomy fingerprint)
+    combination, or a prior failure for that same combination has already
+    exhausted its retry budget, was classified as non-retryable (e.g. a
+    safety refusal - deterministic for the same input, so retrying wastes
+    budget without changing the outcome), or hasn't reached its recorded
+    next_retry_at yet (a retryable failure gets a backoff window, not an
+    immediate retry on the very next invocation). A changed hash, model,
+    prompt version, or taxonomy fingerprint always makes a video eligible
+    again, resetting the attempt count, since that's a new unit of work -
+    see _is_same_work_item()'s docstring for what taxonomy_fingerprint is.
 
-    max_attempts and now are optional only so existing simpler call sites
-    keep working; summarize_eligible() always passes max_attempts (now
-    defaults to the real current time)."""
+    max_attempts, now, and taxonomy_fingerprint are optional only so
+    existing simpler call sites keep working; summarize_eligible() always
+    passes all three (now defaults to the real current time)."""
 
     if existing is None:
         return True
-    if not _is_same_work_item(existing, source_hash, model, prompt_version):
+    if not _is_same_work_item(existing, source_hash, model, prompt_version, taxonomy_fingerprint):
         return True
     if existing.get("status") == "ok":
         return False
@@ -361,6 +375,8 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
 
         group_name = group_by_channel_id.get(entry.get("channel_id"), DEFAULT_GROUP)
         video_types = group_store.get_video_types(groups, group_name, DEFAULT_GROUP)
+        video_type_descriptions = group_store.get_video_type_descriptions(groups, group_name, DEFAULT_GROUP)
+        taxonomy_fingerprint = group_store.video_types_fingerprint(video_types, video_type_descriptions)
 
         full_body = strip_frontmatter(markdown)
         # Hash the complete transcript, before any truncation - otherwise a
@@ -375,14 +391,21 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
 
         existing = read_summary(folder_id, video_id)
         if not needs_summarization(
-            existing, source_hash, settings.summary_model, PROMPT_VERSION, settings.summary_max_attempts_per_video
+            existing,
+            source_hash,
+            settings.summary_model,
+            PROMPT_VERSION,
+            settings.summary_max_attempts_per_video,
+            taxonomy_fingerprint=taxonomy_fingerprint,
         ):
             skipped_current += 1
             continue
 
         prior_attempts = (
             existing.get("attempts", 0)
-            if _is_same_work_item(existing, source_hash, settings.summary_model, PROMPT_VERSION)
+            if _is_same_work_item(
+                existing, source_hash, settings.summary_model, PROMPT_VERSION, taxonomy_fingerprint
+            )
             else 0
         )
         this_attempt = prior_attempts + 1
@@ -415,6 +438,13 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
             "channel_id": entry.get("channel_id"),
             "model": settings.summary_model,
             "prompt_version": PROMPT_VERSION,
+            # Part of needs_summarization()'s idempotency check alongside
+            # source_transcript_hash/model/prompt_version - lets a later
+            # edit to this video's group's video_types/video_type_descriptions
+            # (see app/group_store.py's video_types_fingerprint()) make
+            # this video eligible for re-summarization again on its own,
+            # without needing a fresh PROMPT_VERSION bump.
+            "video_types_fingerprint": taxonomy_fingerprint,
             "generated_at": generated_at_dt.isoformat(),
             "attempts": this_attempt,
         }
@@ -449,7 +479,12 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
         # SummarizationError instead, so a blip on this endpoint doesn't
         # abort the whole run and skip every remaining video.
         try:
-            input_tokens_estimate = count_prompt_tokens(model_input, model=settings.summary_model, video_types=video_types)
+            input_tokens_estimate = count_prompt_tokens(
+                model_input,
+                model=settings.summary_model,
+                video_types=video_types,
+                video_type_descriptions=video_type_descriptions,
+            )
         except SummarizationError as exc:
             failed += 1
             failures.append((video_id, str(exc)))
@@ -501,6 +536,7 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
                 model=settings.summary_model,
                 max_output_tokens=settings.summary_max_output_tokens,
                 video_types=video_types,
+                video_type_descriptions=video_type_descriptions,
             )
         except SummarizationError as exc:
             failures.append((video_id, str(exc)))
