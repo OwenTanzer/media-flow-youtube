@@ -494,13 +494,72 @@ Claude only produces `video_type`, `summary`, and each point's
 `importance`, `main_point`, `explanation`, `source_timestamp`, and
 `source_anchor`, constrained by a JSON schema (`output_config.format`) so
 the response is always valid JSON with no Markdown fences or surrounding
-prose. `video_type` is one of exactly four categories - `"Post-Market Update"`,
-`"Pre-Market Brief"`, `"Thesis Piece"`, or `"Analytic Overview"` - enforced
-by the schema itself (a `Literal`, not a free-text field), so an
-unrecognized classification is rejected the same way a missing field
-would be. Every string field and the `points` list itself also require at
-least one character/item, since an empty response is otherwise
-schema-valid despite not being a usable summary.
+prose. `video_type`'s allowed categories are **per-group**, not fixed -
+see "Per-group video types (groups.json)" below - but still enforced by
+the schema itself for whichever group applies (a `Literal` built
+dynamically per call, not a free-text field), so an unrecognized
+classification is rejected the same way a missing field would be. Every
+string field and the `points` list itself also require at least one
+character/item, since an empty response is otherwise schema-valid
+despite not being a usable summary.
+
+### Per-group video types (groups.json)
+
+Each dashboard group (see "group" in `channels.json` above) has its own
+`video_type` classification taxonomy - the finance-flavored default
+categories (`"Post-Market Update"`, `"Pre-Market Brief"`, `"Thesis
+Piece"`, `"Analytic Overview"`) don't make sense for, say, a "Google"
+group's product/tutorial content. Configure this in `groups.json` in the
+same Drive folder:
+
+```json
+{
+  "version": 1,
+  "groups": [
+    {"name": "Finance", "video_types": ["Post-Market Update", "Pre-Market Brief", "Thesis Piece", "Analytic Overview"]},
+    {"name": "Google", "video_types": ["Short Showcase", "Tutorial"]}
+  ]
+}
+```
+
+A group with no entry here (or an empty `video_types` list) falls back
+to `DEFAULT_GROUP`'s (Finance's) configured list, and finally to the
+hardcoded default categories above if neither has anything configured at
+all - so a deployment with no `groups.json` set up behaves exactly as it
+did before this feature existed. The Admin tab's "+ Create a new group"
+flow (see "Admin panel" below) requires specifying at least one video
+type up front, so a new group is never left unconfigured by accident.
+
+A description can optionally be attached to each category too
+(`"video_type_descriptions": {"Post-Market Update": "a recap/review of a
+trading session..."}`) - the model classifies meaningfully more reliably
+against a real definition than a bare name alone (this is how Finance's
+own default categories are defined - see
+`summarize.FALLBACK_VIDEO_TYPE_DESCRIPTIONS`). Not editable from the
+admin panel's create/edit-group forms (those only take names) - add it by
+hand-editing `groups.json` directly, same as e.g. `channels.json`'s
+`languages` field.
+
+Editing a group's `video_types`/`video_type_descriptions` **is**
+retroactive, just not immediately: each summary artifact records a
+`video_types_fingerprint` (a hash of the exact taxonomy it was classified
+against), and `needs_summarization()` treats a changed fingerprint as a
+new unit of work, exactly like a changed transcript hash/model/prompt
+version - so any video previously summarized under a different taxonomy
+becomes eligible for re-summarization again on the *next*
+`discover_and_process.py` run, at that run's usual API cost. This also
+means seeding `groups.json` late (after the scheduled job has already run
+at least once under the fallback categories) self-corrects on the next
+run rather than leaving those videos permanently misclassified.
+
+An existing group's `video_types` can be edited or deleted later too, via
+the Admin tab's "Manage groups" section (an expander per group, with
+"Save" to replace its list and "Delete" to remove its configuration
+entirely) - see "Admin panel" below. Neither operation renames a group or
+touches `channels.json`: deleting a group's configuration just makes any
+channel still assigned to it fall back to the default group's
+`video_types` (or the hardcoded default) until it's reconfigured or the
+channel is moved to a different group.
 
 **`timestamp_seconds` is never trusted from the model at all - not even as
 a self-reported number.** An earlier version asked the model to compute
@@ -578,44 +637,52 @@ bumps the `PROMPT_VERSION` constant in `app/summarize.py`), deliberately
 re-summarizes everything, resetting the attempt count below since it's a
 new unit of work.
 
-A failure isn't retried unconditionally forever. Each failure is classified
-`retryable` or not: rate limits, connection errors, transient malformed
-output, and failed point validation are retryable; a safety refusal is
-not, since it's deterministic for the same input and retrying just burns
-budget for a guaranteed repeat. A retryable failure keeps being retried on
-subsequent runs (`attempts` incrementing each time) until it succeeds or
-hits `SUMMARY_MAX_ATTEMPTS_PER_VIDEO` (default `3`), at which point it
-stops being retried until something changes (the transcript hash, model,
-or prompt version). A run's `SummaryReport` (logged by
-`discover_and_process.py`) includes a `retried` count - videos this run
-that had a prior non-`ok` attempt for the same transcript/model/prompt -
-separate from the `failed` count of this run's own outcomes.
+A failure isn't retried unconditionally forever, and retrying doesn't wait
+for a future run. Each failure is classified `retryable` or not: rate
+limits, connection errors, transient malformed output, and failed point
+validation are retryable; a safety refusal is not, since it's deterministic
+for the same input and retrying just burns budget for a guaranteed repeat.
+A retryable failure is retried immediately, in the same call to
+`summarize_eligible()`, up to `SUMMARY_MAX_ATTEMPTS_PER_VIDEO` (default
+`3`) attempts in one pass - there's no waiting between attempts except a
+short fixed pause (`_RATE_LIMIT_RETRY_DELAY_SECONDS`, 5 seconds) before an
+attempt that follows a rate limit specifically, since an immediate
+zero-delay retry right after a 429 tends to prolong the throttling rather
+than resolve it. Every other retryable failure (a transient connection
+blip, a citation that failed grounding) retries at once. A run's
+`SummaryReport` (logged by `discover_and_process.py`) includes a `retried`
+count - videos this run whose first attempt wasn't its only one - separate
+from the `failed` count of this run's own final outcomes.
 
-A retryable failure also records `next_retry_at`
-(`generated_at` + `SUMMARY_RETRY_BACKOFF_SECONDS`, default `900`) and isn't
-eligible again until that time passes - without this, a transient failure
-would otherwise be retried again on the very next invocation regardless of
-how recently it just failed. A non-retryable failure has no
-`next_retry_at` at all, since it isn't retried regardless of elapsed time.
+Only once every immediate attempt is exhausted (or a non-retryable failure
+ends the loop early) does a video fall through to the rare, genuinely
+deferred outcome: a `status: "error"` artifact recording `attempts` and
+`next_retry_at` (`generated_at` + `SUMMARY_RETRY_BACKOFF_SECONDS`, default
+`900`), not eligible again until that time passes. This is meant as a last
+resort for a persistent provider-level problem that survives every
+immediate attempt in this run - it is no longer the normal path a
+transient failure takes to eventually succeed. A non-retryable failure has
+no `next_retry_at` at all, since it isn't retried regardless of elapsed
+time.
 
-**Fallback summary on the last attempt.** Some speakers - meandering,
-conversational, non-linear delivery - make the per-point timestamp
-citation genuinely hard to ground even when the model clearly understood
-the content; a video like that can otherwise exhaust its retry budget and
-sit permanently as `status: "error"` with no usable output at all. When a
-retryable failure happens on a video's *last* allowed attempt, one extra
-call is made for a much simpler ask - a plain 2-3 paragraph prose summary
-of the video as a whole, with no per-line citation to get wrong. If that
-succeeds, the artifact is written as `status: "ok"` with an empty `points`
-list, `"fallback_summary": true`, and the summary text itself prefixed
-with a `⚠️` marker so it reads as visually distinct anywhere it's
-displayed, not just via that field. A non-retryable failure (e.g. a
-safety refusal) skips the fallback attempt entirely - the simpler prompt
-would very likely be refused for the same reason and isn't worth the
-extra call. If the fallback call itself fails, the video falls through to
-the normal `status: "error"` artifact exactly as it would have otherwise -
-this is a best-effort extra attempt, not a guarantee every video
-eventually gets a summary.
+**Fallback summary once every immediate attempt fails.** Some speakers -
+meandering, conversational, non-linear delivery - make the per-point
+timestamp citation genuinely hard to ground even when the model clearly
+understood the content; a video like that can otherwise exhaust its retry
+budget and sit permanently as `status: "error"` with no usable output at
+all. Once a video's immediate attempts are exhausted and the last failure
+is retryable, one extra call is made for a much simpler ask - a plain 2-3
+paragraph prose summary of the video as a whole, with no per-line citation
+to get wrong. If that succeeds, the artifact is written as `status: "ok"`
+with an empty `points` list, `"fallback_summary": true`, and the summary
+text itself prefixed with a `⚠️` marker so it reads as visually distinct
+anywhere it's displayed, not just via that field. A non-retryable failure
+(e.g. a safety refusal) skips the fallback attempt entirely - the simpler
+prompt would very likely be refused for the same reason and isn't worth
+the extra call. If the fallback call itself fails, the video falls through
+to the normal `status: "error"` artifact exactly as it would have
+otherwise - this is a best-effort extra attempt, not a guarantee every
+video eventually gets a summary.
 
 A genuine, still-broken auth/credential problem is handled differently
 from a per-video failure, deliberately - two ways:
@@ -714,10 +781,10 @@ silently retry internally for up to ~30 minutes (2 retries, each up to a
 10-minute timeout) - comfortably long enough to run past
 `DISCOVERY_LOCK_TTL_SECONDS`'s default 30-minute window with no chance to
 renew the lock in between. The app's own outer retry loop
-(`SUMMARY_MAX_ATTEMPTS_PER_VIDEO`, across scheduled runs, with the lock
-renewed before each attempt) is the sole retry authority instead - the
-same fix already applied to the Webshare proxy's internal retries in
-`app/youtube.py`.
+(`SUMMARY_MAX_ATTEMPTS_PER_VIDEO`, retried immediately within the same run,
+with the lock renewed before each attempt) is the sole retry authority
+instead - the same fix already applied to the Webshare proxy's internal
+retries in `app/youtube.py`.
 
 ## Insight dashboard (optional)
 
@@ -778,7 +845,10 @@ explicit "+ Create a new group..." option - not free text. Creating a
 new top-level tab is therefore always a conscious choice: picking an
 existing group can never accidentally spawn a new one via a typo (e.g.
 "Goggle" vs "Google"), since choosing that option requires separately
-typing and confirming the new group's name.
+typing and confirming the new group's name - and its `video_types` (see
+"Per-group video types (groups.json)" above): a new group can't be
+created without specifying at least one classification category up
+front, so it's never left unconfigured.
 
 This is a shared-secret bearer token compared with a constant-time
 check (`secrets.compare_digest`), not a real user/password auth system -
@@ -907,7 +977,8 @@ app/
   youtube.py        URL parsing, transcript fetch, oEmbed title lookup, Markdown rendering
   drive.py          Drive upload/read + generic Drive file helpers
   queue_store.py    queue.json read/write helpers (plain URLs or {"url","languages","first_seen_at"} entries)
-  channel_store.py  channels.json read helper (the discovery source registry)
+  channel_store.py  channels.json read/write helper (the discovery source registry)
+  group_store.py    groups.json read/write helper (each group's video_type classification categories)
   discovery.py      RSS feed fetch/parse + discover_and_enqueue(): queues unseen uploads
   job_lock.py       Drive-based advisory lock preventing overlapping discovery runs
   summarize.py      Claude model call: transcript -> structured, schema-validated summary

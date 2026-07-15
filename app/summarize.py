@@ -21,11 +21,28 @@ logger = logging.getLogger("media_flow.summarize")
 # changes. Deliberately a code constant, not an env var - drifting it
 # independently of the prompt text would corrupt the idempotency check in
 # summary_store.needs_summarization().
-PROMPT_VERSION = "v6"
+PROMPT_VERSION = "v7"
 
-# Convenience tuple for callers/tests - must be kept in sync with
-# ModelSummaryOutput.video_type's Literal values below.
-VIDEO_TYPES = ("Post-Market Update", "Thesis Piece", "Analytic Overview", "Pre-Market Brief")
+# Used when a video's group has no video_types configured at all (see
+# app/group_store.py) - preserves the original, pre-group-configuration
+# classification taxonomy so a deployment with no groups.json set up
+# behaves exactly as it did before groups could configure this themselves.
+FALLBACK_VIDEO_TYPES = ["Post-Market Update", "Pre-Market Brief", "Thesis Piece", "Analytic Overview"]
+
+# The original per-category definitions these 4 categories shipped with,
+# before classification became per-group/data-driven - a bare category
+# name alone is a materially weaker signal for the model than an actual
+# definition of what it means. Only used alongside FALLBACK_VIDEO_TYPES
+# (see group_store.get_video_type_descriptions()); a group that
+# configures its own video_types without descriptions gets none, rather
+# than these by accident.
+FALLBACK_VIDEO_TYPE_DESCRIPTIONS = {
+    "Post-Market Update": "a recap/review of a trading session or period that has already happened.",
+    "Pre-Market Brief": "forward-looking commentary or a plan for a session/period that hasn't happened yet.",
+    "Thesis Piece": "an in-depth case for or against a single specific idea, asset, or claim.",
+    "Analytic Overview": "a broader technical/analytical walkthrough across multiple assets or topics, not tied "
+    "to a single specific thesis or session (e.g. a live multi-asset chart-reading session).",
+}
 
 # Upper bound on how many points the model may return, scaling with video
 # length but never exceeding _MAX_POINTS_CEILING - without this, a very
@@ -41,7 +58,15 @@ def _max_points_for_duration(duration_seconds: int) -> int:
     return max(1, min(_MAX_POINTS_CEILING, duration_seconds // _POINT_INTERVAL_SECONDS))
 
 
-def _build_system_prompt(max_points: int) -> str:
+def _build_system_prompt(
+    max_points: int, video_types: list[str], video_type_descriptions: dict[str, str] | None = None
+) -> str:
+    video_type_descriptions = video_type_descriptions or {}
+    types_list = ", ".join(f'"{t}"' for t in video_types)
+    description_lines = "\n".join(
+        f'  - "{t}": {video_type_descriptions[t]}' for t in video_types if t in video_type_descriptions
+    )
+    descriptions_block = f"\n{description_lines}" if description_lines else ""
     return f"""You are extracting structured, timestamped insights from a YouTube video transcript.
 
 Identify the transcript-supported major and minor points made in the video. Include at most {max_points} points - however many major/minor points are actually present in the video's substantive content, up to that limit. A short, thin video may have only one or two points; a long, information-dense video may have many, up to {max_points}. Do not pad the list to hit a target count. If the video's substantive content exceeds {max_points} distinguishable points, select only the {max_points} most significant ones (favoring "major" points over "minor" ones) rather than trying to cram in everything - do not omit real content to keep the list short otherwise.
@@ -60,11 +85,7 @@ Many videos (livestreams especially) revisit the same topic more than once - e.g
 Be concise and factual. State uncertainty explicitly (e.g. "the speaker suggests..." vs "the speaker states...") rather than presenting an inference as a stated fact. Do not include information not supported by the transcript text.
 
 Also provide:
-- "video_type": classify the video as exactly one of "Post-Market Update", "Pre-Market Brief", "Thesis Piece", or "Analytic Overview".
-  - "Post-Market Update": a recap/review of a trading session or period that has already happened.
-  - "Pre-Market Brief": forward-looking commentary or a plan for a session/period that hasn't happened yet.
-  - "Thesis Piece": an in-depth case for or against a single specific idea, asset, or claim.
-  - "Analytic Overview": a broader technical/analytical walkthrough across multiple assets or topics, not tied to a single specific thesis or session (e.g. a live multi-asset chart-reading session).
+- "video_type": classify the video as exactly one of {types_list}.{descriptions_block}
   If more than one could apply, pick whichever describes the video's primary purpose.
 - "summary": one to three sentences summarizing the video as a whole.
 """
@@ -183,11 +204,17 @@ class SummarizationError(RuntimeError):
     grounding check - as opposed to a provider-level problem (rate limit,
     connection error, 5xx) that's retryable in the sense that a *later*
     attempt may succeed, but where an immediate second call right now
-    can't fix anything and, for a rate limit specifically, actively makes
-    it worse. Only fallback_eligible failures are candidates for
-    summary_store.summarize_eligible()'s last-attempt fallback path
-    (summarize_fallback()); every other retryable failure just waits for
-    next_retry_at like normal, even on the final attempt."""
+    can't fix anything on its own. summarize_eligible() retries these
+    immediately, in the same run, up to summary_max_attempts_per_video
+    before falling back to summarize_fallback() (only fallback_eligible
+    failures are candidates for that) or finally recording status: "error"
+    with a next_retry_at for a later run.
+
+    rate_limited marks specifically a 429/RateLimitError - the one
+    retryable case where an immediate zero-delay retry is actively
+    counterproductive (it tends to prolong the throttling rather than
+    resolve it), so summarize_eligible() waits a short, fixed delay before
+    retrying this specific case and no other."""
 
     def __init__(
         self,
@@ -197,12 +224,14 @@ class SummarizationError(RuntimeError):
         usage: "Usage | None" = None,
         possibly_billed: bool = False,
         fallback_eligible: bool = False,
+        rate_limited: bool = False,
     ):
         super().__init__(message)
         self.retryable = retryable
         self.usage = usage
         self.possibly_billed = possibly_billed
         self.fallback_eligible = fallback_eligible
+        self.rate_limited = rate_limited
 
 
 class SummaryPoint(BaseModel):
@@ -225,9 +254,11 @@ class SummaryPoint(BaseModel):
     source_anchor: str = Field(min_length=1)
 
 
-class ModelSummaryOutput(BaseModel):
-    """Only the fields the model is trusted to produce. Everything else in
-    the persisted artifact (title, author, url, source ids, hash, model,
+class _ModelSummaryOutputBase(BaseModel):
+    """Every field the model is trusted to produce except video_type,
+    which is bound dynamically per call by _build_model_output_schema()
+    below - see that function's docstring. Everything else in the
+    persisted artifact (title, author, url, source ids, hash, model,
     prompt_version, display timestamps, usage, status) is filled in or
     derived by application code from the known source artifact - see
     summary_store.py. In particular, points' timestamp_seconds and the
@@ -239,9 +270,21 @@ class ModelSummaryOutput(BaseModel):
     default rules despite the output contract requiring actual timestamped
     insights, so without these an empty summary would be accepted as "ok"."""
 
-    video_type: Literal["Post-Market Update", "Thesis Piece", "Analytic Overview", "Pre-Market Brief"]
     summary: str = Field(min_length=1)
     points: list[SummaryPoint] = Field(min_length=1)
+
+
+def _build_model_output_schema(video_types: list[str]) -> type[_ModelSummaryOutputBase]:
+    """Builds a ModelSummaryOutput schema whose video_type field is a
+    Literal constrained to exactly this call's video_types (see
+    app/group_store.py - each dashboard group configures its own
+    classification categories, so this can no longer be a single fixed
+    class with a hardcoded Literal). Rebuilt per call rather than cached,
+    since video_types varies by the video's group."""
+
+    return pydantic.create_model(
+        "ModelSummaryOutput", __base__=_ModelSummaryOutputBase, video_type=(Literal[tuple(video_types)], ...)
+    )
 
 
 class FallbackSummaryOutput(BaseModel):
@@ -312,13 +355,22 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
     return (input_tokens / 1_000_000) * input_price + (output_tokens / 1_000_000) * output_price
 
 
-def count_prompt_tokens(transcript_body: str, *, model: str) -> int:
+def count_prompt_tokens(
+    transcript_body: str,
+    *,
+    model: str,
+    video_types: list[str] | None = None,
+    video_type_descriptions: dict[str, str] | None = None,
+) -> int:
     """Real input token count for this exact prompt (system prompt + output
     schema overhead + the transcript itself) via the Anthropic token-
     counting endpoint - used to reserve accurate per-run budget before a
     call, replacing an earlier chars-per-token heuristic that both
     excluded the system prompt/schema and wasn't a true upper bound either
-    way.
+    way. video_types (the video's group's configured classification
+    categories - see app/group_store.py) affects the exact prompt text and
+    output schema, and so the real token count too; defaults to
+    FALLBACK_VIDEO_TYPES when not given.
 
     A genuine, still-broken credential problem (AuthenticationError /
     PermissionDeniedError - the key is present but invalid/expired/lacks
@@ -338,24 +390,29 @@ def count_prompt_tokens(transcript_body: str, *, model: str) -> int:
     video with no durable retry state, the way an unconditional re-raise
     would."""
 
+    video_types = video_types or FALLBACK_VIDEO_TYPES
     max_points = _max_points_for_duration(_max_transcript_seconds(transcript_body))
     try:
         client = anthropic.Anthropic(max_retries=_CLIENT_MAX_RETRIES)
         result = client.messages.count_tokens(
             model=model,
-            system=_build_system_prompt(max_points),
+            system=_build_system_prompt(max_points, video_types, video_type_descriptions),
             messages=[{"role": "user", "content": transcript_body}],
-            output_format=ModelSummaryOutput,
+            output_format=_build_model_output_schema(video_types),
         )
     except (anthropic.AuthenticationError, anthropic.PermissionDeniedError):
         raise
     except anthropic.RateLimitError as exc:
-        raise SummarizationError(f"Token count rate limited: {exc}", retryable=True) from exc
+        raise SummarizationError(f"Token count rate limited: {exc}", retryable=True, rate_limited=True) from exc
     except anthropic.APIConnectionError as exc:
         raise SummarizationError(f"Token count connection error: {exc}", retryable=True) from exc
     except anthropic.APIStatusError as exc:
         retryable = exc.status_code >= 500 or exc.status_code == 429
-        raise SummarizationError(f"Token count API error ({exc.status_code}): {exc.message}", retryable=retryable) from exc
+        raise SummarizationError(
+            f"Token count API error ({exc.status_code}): {exc.message}",
+            retryable=retryable,
+            rate_limited=exc.status_code == 429,
+        ) from exc
     except anthropic.AnthropicError:
         # Anything else unanticipated (e.g. a credential-resolution
         # failure at client construction) is treated conservatively as a
@@ -504,7 +561,12 @@ def _select_significant_points(points: list[ResolvedPoint], max_points: int) -> 
 
 
 def summarize_transcript(
-    transcript_body: str, *, model: str, max_output_tokens: int
+    transcript_body: str,
+    *,
+    model: str,
+    max_output_tokens: int,
+    video_types: list[str] | None = None,
+    video_type_descriptions: dict[str, str] | None = None,
 ) -> tuple[ResolvedSummary, Usage, bool]:
     """Calls Claude to produce a ResolvedSummary for one transcript (the
     model itself produces a ModelSummaryOutput; _resolve_points() verifies
@@ -513,22 +575,30 @@ def summarize_transcript(
     output - never raises a raw SDK exception, so callers don't need to know
     the SDK's exception hierarchy. Returns (output, usage, points_truncated) -
     points_truncated is True if _select_significant_points() had to drop
-    points to enforce the length-based cap."""
+    points to enforce the length-based cap.
 
+    video_types is the video's group's configured classification categories
+    (see app/group_store.py) - defaults to FALLBACK_VIDEO_TYPES
+    when not given. summary_store.summarize_eligible() always resolves and
+    passes the real per-video value; the default here exists for callers
+    (and tests) that don't care about this dimension."""
+
+    video_types = video_types or FALLBACK_VIDEO_TYPES
     max_points = _max_points_for_duration(_max_transcript_seconds(transcript_body))
+    output_schema = _build_model_output_schema(video_types)
 
     try:
         client = anthropic.Anthropic(max_retries=_CLIENT_MAX_RETRIES)
         response = client.messages.parse(
             model=model,
             max_tokens=max_output_tokens,
-            system=_build_system_prompt(max_points),
+            system=_build_system_prompt(max_points, video_types, video_type_descriptions),
             messages=[{"role": "user", "content": transcript_body}],
-            output_format=ModelSummaryOutput,
+            output_format=output_schema,
         )
     except anthropic.RateLimitError as exc:
         # Transient - the same request will very likely succeed shortly.
-        raise SummarizationError(f"Rate limited: {exc}", retryable=True) from exc
+        raise SummarizationError(f"Rate limited: {exc}", retryable=True, rate_limited=True) from exc
     except anthropic.APIConnectionError as exc:
         # Transient network-level failure, unrelated to the request itself.
         raise SummarizationError(f"Connection error: {exc}", retryable=True) from exc
@@ -537,7 +607,9 @@ def summarize_transcript(
         # transient; 4xx other than that reflects a bad request/auth
         # problem that will recur identically on retry.
         retryable = exc.status_code >= 500 or exc.status_code == 429
-        raise SummarizationError(f"API error ({exc.status_code}): {exc.message}", retryable=retryable) from exc
+        raise SummarizationError(
+            f"API error ({exc.status_code}): {exc.message}", retryable=retryable, rate_limited=exc.status_code == 429
+        ) from exc
     except anthropic.AnthropicError as exc:
         # Catch-all for anything not already covered above (e.g. a
         # credential-resolution failure at client construction, which is
@@ -629,12 +701,14 @@ def summarize_fallback(transcript_body: str, *, model: str, max_output_tokens: i
             output_format=FallbackSummaryOutput,
         )
     except anthropic.RateLimitError as exc:
-        raise SummarizationError(f"Rate limited: {exc}", retryable=True) from exc
+        raise SummarizationError(f"Rate limited: {exc}", retryable=True, rate_limited=True) from exc
     except anthropic.APIConnectionError as exc:
         raise SummarizationError(f"Connection error: {exc}", retryable=True) from exc
     except anthropic.APIStatusError as exc:
         retryable = exc.status_code >= 500 or exc.status_code == 429
-        raise SummarizationError(f"API error ({exc.status_code}): {exc.message}", retryable=retryable) from exc
+        raise SummarizationError(
+            f"API error ({exc.status_code}): {exc.message}", retryable=retryable, rate_limited=exc.status_code == 429
+        ) from exc
     except anthropic.AnthropicError as exc:
         raise SummarizationError(f"Anthropic SDK error: {exc}", retryable=False) from exc
     except pydantic.ValidationError as exc:

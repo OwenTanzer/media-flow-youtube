@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 import pytest
 
 from app import summary_store
+from app.channel_store import Channel
+from app.group_store import Group
 from app.summarize import ResolvedPoint, ResolvedSummary, SummarizationError, Usage
 
 
@@ -19,6 +21,17 @@ def _reset_bulk_read_executor():
     summary_store._bulk_read_executor = None
     if executor is not None:
         executor.shutdown(wait=True)
+
+# Matches what real code resolves to for a video whose group is
+# unconfigured/unresolvable (see summary_store.group_store.get_video_types()/
+# get_video_type_descriptions()'s fallback chain) - tests that build an
+# "existing" summary dict without stubbing channel_store/group_store need
+# this so their fixture represents a *matching* taxonomy, not an
+# incidental mismatch that _is_same_work_item() would now (correctly)
+# treat as a different work item.
+_DEFAULT_TAXONOMY_FINGERPRINT = summary_store.group_store.video_types_fingerprint(
+    summary_store.group_store.FALLBACK_VIDEO_TYPES, summary_store.group_store.FALLBACK_VIDEO_TYPE_DESCRIPTIONS
+)
 
 TRANSCRIPT_MARKDOWN = """---
 video_id: abc123XYZde
@@ -111,6 +124,60 @@ def test_needs_summarization_true_when_hash_changed_even_if_attempts_exhausted()
     assert summary_store.needs_summarization(existing, "sha256:new", "claude-haiku-4-5", "v1", max_attempts=3) is True
 
 
+def test_needs_summarization_true_when_taxonomy_fingerprint_changed():
+    """Regression test for the review finding: editing a group's
+    video_types/video_type_descriptions later (see
+    vidproc/admin.py's update_group_video_types()) must make a video
+    previously summarized under a *different* taxonomy eligible for
+    re-summarization again - not leave it marked "current" forever just
+    because its hash/model/prompt_version still match."""
+    existing = {
+        "status": "ok",
+        "source_transcript_hash": "sha256:abc",
+        "model": "claude-haiku-4-5",
+        "prompt_version": "v1",
+        "video_types_fingerprint": "old-fingerprint",
+    }
+    assert (
+        summary_store.needs_summarization(
+            existing, "sha256:abc", "claude-haiku-4-5", "v1", taxonomy_fingerprint="new-fingerprint"
+        )
+        is True
+    )
+
+
+def test_needs_summarization_false_when_taxonomy_fingerprint_matches():
+    existing = {
+        "status": "ok",
+        "source_transcript_hash": "sha256:abc",
+        "model": "claude-haiku-4-5",
+        "prompt_version": "v1",
+        "video_types_fingerprint": "the-fingerprint",
+    }
+    assert (
+        summary_store.needs_summarization(
+            existing, "sha256:abc", "claude-haiku-4-5", "v1", taxonomy_fingerprint="the-fingerprint"
+        )
+        is False
+    )
+
+
+def test_needs_summarization_ignores_taxonomy_fingerprint_when_not_given():
+    """Callers that don't pass taxonomy_fingerprint (existing simpler call
+    sites/tests) must keep working exactly as before - this dimension of
+    the check is opt-in, not silently enforced against artifacts that
+    predate it."""
+    existing = {
+        "status": "ok",
+        "source_transcript_hash": "sha256:abc",
+        "model": "claude-haiku-4-5",
+        "prompt_version": "v1",
+        # No video_types_fingerprint at all - an artifact from before this
+        # feature existed.
+    }
+    assert summary_store.needs_summarization(existing, "sha256:abc", "claude-haiku-4-5", "v1") is False
+
+
 def test_extract_channel_from_markdown():
     assert summary_store._extract_channel(TRANSCRIPT_MARKDOWN) == "A Channel"
 
@@ -152,7 +219,7 @@ def _stub_drive(monkeypatch, *, index, transcripts, existing_summaries=None):
     monkeypatch.setattr(summary_store.drive, "upload_text_file", _upload_text_file)
     # A small, fixed, real-looking token count by default - individual
     # tests override this via monkeypatch when they care about the value.
-    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model: 100)
+    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model, video_types, video_type_descriptions: 100)
     return written
 
 
@@ -300,6 +367,139 @@ _INDEX_ONE_VIDEO = {
 }
 
 
+def test_summarize_eligible_resolves_video_types_from_the_videos_channel_and_group(monkeypatch):
+    """Regression test for the whole point of per-group video_types: a
+    video's channel_id must resolve to its channels.json group, and that
+    group's configured video_types (app/group_store.py) is what actually
+    gets passed to the model call - not always the fallback list."""
+    index_with_channel = {"abc123XYZde": {**_INDEX_ONE_VIDEO["abc123XYZde"], "channel_id": "UC_google"}}
+    _stub_drive(monkeypatch, index=index_with_channel, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+    monkeypatch.setattr(
+        summary_store.channel_store,
+        "read_channels",
+        lambda folder_id: [Channel("UC_google", "Google Channel", group="Google")],
+    )
+    monkeypatch.setattr(
+        summary_store.group_store,
+        "read_groups",
+        lambda folder_id: [
+            Group(
+                name="Google",
+                video_types=["Tutorial", "Short Showcase"],
+                video_type_descriptions={"Tutorial": "a how-to walkthrough."},
+            )
+        ],
+    )
+
+    captured = {}
+
+    def _fake_summarize_transcript(body, model, max_output_tokens, video_types, video_type_descriptions):
+        captured["video_types"] = video_types
+        captured["video_type_descriptions"] = video_type_descriptions
+        return (
+            ResolvedSummary(
+                video_type="Tutorial",
+                summary="S.",
+                points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)],
+            ),
+            Usage(input_tokens=1, output_tokens=1),
+            False,
+        )
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _fake_summarize_transcript)
+
+    summary_store.summarize_eligible("folder-id")
+
+    assert captured["video_types"] == ["Tutorial", "Short Showcase"]
+    assert captured["video_type_descriptions"] == {"Tutorial": "a how-to walkthrough."}
+
+
+def test_summarize_eligible_re_summarizes_when_the_groups_video_types_change(monkeypatch):
+    """Regression test for the review finding: a video already marked
+    "current" (matching hash/model/prompt_version) must become eligible
+    again once its group's video_types are edited later - the taxonomy
+    fingerprint is part of the identity check, not just PROMPT_VERSION."""
+    body = summary_store.strip_frontmatter(TRANSCRIPT_MARKDOWN)
+    current_hash = summary_store.transcript_hash(body)
+    stale_fingerprint = summary_store.group_store.video_types_fingerprint(["Old Category"], {})
+    existing_summaries = {
+        "abc123XYZde": {
+            "status": "ok",
+            "source_transcript_hash": current_hash,
+            "model": "claude-haiku-4-5",
+            "prompt_version": summary_store.PROMPT_VERSION,
+            "video_types_fingerprint": stale_fingerprint,
+        }
+    }
+    index_with_channel = {"abc123XYZde": {**_INDEX_ONE_VIDEO["abc123XYZde"], "channel_id": "UC_google"}}
+    _stub_drive(
+        monkeypatch,
+        index=index_with_channel,
+        transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN},
+        existing_summaries=existing_summaries,
+    )
+    monkeypatch.setattr(
+        summary_store.channel_store, "read_channels", lambda folder_id: [Channel("UC_google", "Google Channel", group="Google")]
+    )
+    monkeypatch.setattr(
+        summary_store.group_store,
+        "read_groups",
+        lambda folder_id: [Group(name="Google", video_types=["New Category"])],
+    )
+    output = ResolvedSummary(
+        video_type="New Category",
+        summary="S.",
+        points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)],
+    )
+    monkeypatch.setattr(
+        summary_store,
+        "summarize_transcript",
+        lambda body, model, max_output_tokens, video_types, video_type_descriptions: (
+            output,
+            Usage(input_tokens=1, output_tokens=1),
+            False,
+        ),
+    )
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert report.summarized == 1
+    assert report.skipped_current == 0
+
+
+def test_summarize_eligible_falls_back_to_default_group_video_types_for_an_unresolvable_channel(monkeypatch):
+    """A video whose channel_id is missing or doesn't match any configured
+    channel falls back to DEFAULT_GROUP's video_types, same as the
+    dashboard (app/insights_store.py) treats an unresolvable channel_id."""
+    _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+    monkeypatch.setattr(summary_store.channel_store, "read_channels", lambda folder_id: [])
+    monkeypatch.setattr(
+        summary_store.group_store,
+        "read_groups",
+        lambda folder_id: [Group(name=summary_store.DEFAULT_GROUP, video_types=["Custom Finance Type"])],
+    )
+
+    captured = {}
+
+    def _fake_summarize_transcript(body, model, max_output_tokens, video_types, video_type_descriptions):
+        captured["video_types"] = video_types
+        return (
+            ResolvedSummary(
+                video_type="Custom Finance Type",
+                summary="S.",
+                points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)],
+            ),
+            Usage(input_tokens=1, output_tokens=1),
+            False,
+        )
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _fake_summarize_transcript)
+
+    summary_store.summarize_eligible("folder-id")
+
+    assert captured["video_types"] == ["Custom Finance Type"]
+
+
 def test_summarize_eligible_summarizes_a_newly_eligible_video(monkeypatch):
     written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
 
@@ -309,7 +509,7 @@ def test_summarize_eligible_summarizes_a_newly_eligible_video(monkeypatch):
         points=[ResolvedPoint(importance="major", main_point="Point", explanation="Because.", timestamp_seconds=0)],
     )
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=10, output_tokens=5), False)
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens, video_types, video_type_descriptions: (output, Usage(input_tokens=10, output_tokens=5), False)
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -353,7 +553,7 @@ def test_summarize_eligible_surfaces_video_published_at_from_the_index(monkeypat
     monkeypatch.setattr(
         summary_store,
         "summarize_transcript",
-        lambda body, model, max_output_tokens: (output, Usage(input_tokens=10, output_tokens=5), False),
+        lambda body, model, max_output_tokens, video_types, video_type_descriptions: (output, Usage(input_tokens=10, output_tokens=5), False),
     )
 
     summary_store.summarize_eligible("folder-id")
@@ -378,7 +578,7 @@ def test_summarize_eligible_surfaces_channel_id_from_the_index(monkeypatch):
     monkeypatch.setattr(
         summary_store,
         "summarize_transcript",
-        lambda body, model, max_output_tokens: (output, Usage(input_tokens=10, output_tokens=5), False),
+        lambda body, model, max_output_tokens, video_types, video_type_descriptions: (output, Usage(input_tokens=10, output_tokens=5), False),
     )
 
     summary_store.summarize_eligible("folder-id")
@@ -395,6 +595,7 @@ def test_summarize_eligible_skips_already_current_summary(monkeypatch):
             "source_transcript_hash": current_hash,
             "model": "claude-haiku-4-5",
             "prompt_version": summary_store.PROMPT_VERSION,
+            "video_types_fingerprint": _DEFAULT_TAXONOMY_FINGERPRINT,
         }
     }
     _stub_drive(
@@ -435,6 +636,7 @@ def test_summarize_eligible_hash_reflects_content_beyond_the_truncation_cutoff(m
             "source_transcript_hash": truncated_hash,
             "model": "claude-haiku-4-5",
             "prompt_version": summary_store.PROMPT_VERSION,
+            "video_types_fingerprint": _DEFAULT_TAXONOMY_FINGERPRINT,
         }
     }
     _stub_drive(
@@ -445,7 +647,7 @@ def test_summarize_eligible_hash_reflects_content_beyond_the_truncation_cutoff(m
     )
     output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens, video_types, video_type_descriptions: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -469,6 +671,7 @@ def test_summarize_eligible_ignores_non_ok_index_entries(monkeypatch):
 
 
 def test_summarize_eligible_isolates_a_per_video_failure(monkeypatch):
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 1)
     written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
 
     def _raise(*a, **k):
@@ -514,6 +717,7 @@ def test_summarize_eligible_does_not_retry_a_prior_non_retryable_failure(monkeyp
             "source_transcript_hash": current_hash,
             "model": "claude-haiku-4-5",
             "prompt_version": summary_store.PROMPT_VERSION,
+            "video_types_fingerprint": _DEFAULT_TAXONOMY_FINGERPRINT,
             "attempts": 1,
             "retryable": False,
         }
@@ -543,6 +747,7 @@ def test_summarize_eligible_stops_retrying_after_max_attempts_per_video(monkeypa
             "source_transcript_hash": current_hash,
             "model": "claude-haiku-4-5",
             "prompt_version": summary_store.PROMPT_VERSION,
+            "video_types_fingerprint": _DEFAULT_TAXONOMY_FINGERPRINT,
             "attempts": 2,
             "retryable": True,
         }
@@ -571,6 +776,7 @@ def test_summarize_eligible_counts_a_retry_and_increments_attempts(monkeypatch):
             "source_transcript_hash": current_hash,
             "model": "claude-haiku-4-5",
             "prompt_version": summary_store.PROMPT_VERSION,
+            "video_types_fingerprint": _DEFAULT_TAXONOMY_FINGERPRINT,
             "attempts": 1,
             "retryable": True,
         }
@@ -583,7 +789,7 @@ def test_summarize_eligible_counts_a_retry_and_increments_attempts(monkeypatch):
     )
     output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens, video_types, video_type_descriptions: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -599,6 +805,7 @@ def _existing_error(current_hash, *, attempts, retryable):
         "source_transcript_hash": current_hash,
         "model": "claude-haiku-4-5",
         "prompt_version": summary_store.PROMPT_VERSION,
+        "video_types_fingerprint": _DEFAULT_TAXONOMY_FINGERPRINT,
         "attempts": attempts,
         "retryable": retryable,
     }
@@ -642,34 +849,96 @@ def test_summarize_eligible_uses_a_fallback_summary_on_the_last_retryable_attemp
     assert report.total_output_tokens == 20
 
 
-def test_summarize_eligible_does_not_use_fallback_before_the_last_attempt(monkeypatch):
-    """Every earlier attempt still gets a real shot at the normal,
-    per-point-cited format first - fallback is last-resort only. Uses a
-    fallback_eligible failure so this test isolates the "not the last
-    attempt yet" gate specifically, not the eligibility gate."""
-    body = summary_store.strip_frontmatter(TRANSCRIPT_MARKDOWN)
-    current_hash = summary_store.transcript_hash(body)
+def test_summarize_eligible_uses_fallback_only_after_every_immediate_attempt_is_exhausted(monkeypatch):
+    """Retries now happen immediately within a single summarize_eligible()
+    call, in one pass, rather than one attempt per external run - every
+    immediate attempt still gets a real shot at the normal, per-point-cited
+    format first, and fallback is invoked exactly once, only after all of
+    them have failed."""
     monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 3)
-    existing_summaries = {"abc123XYZde": _existing_error(current_hash, attempts=1, retryable=True)}
     written = _stub_drive(
         monkeypatch,
         index=_INDEX_ONE_VIDEO,
         transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN},
-        existing_summaries=existing_summaries,
     )
 
+    attempt_calls = []
+
     def _raise(*a, **k):
+        attempt_calls.append(1)
         raise SummarizationError("grounding failed", retryable=True, fallback_eligible=True)
 
     monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
     fallback_calls = []
-    monkeypatch.setattr(summary_store, "summarize_fallback", lambda *a, **k: fallback_calls.append(1))
+
+    def _fallback(*a, **k):
+        fallback_calls.append(1)
+        return "fallback text", Usage(input_tokens=10, output_tokens=5)
+
+    monkeypatch.setattr(summary_store, "summarize_fallback", _fallback)
 
     report = summary_store.summarize_eligible("folder-id")
 
-    assert fallback_calls == []
+    assert len(attempt_calls) == 3
+    assert len(fallback_calls) == 1
+    assert report.summarized == 1
+    assert report.failed == 0
+    assert written["abc123XYZde.json"]["status"] == "ok"
+    assert written["abc123XYZde.json"]["fallback_summary"] is True
+    assert written["abc123XYZde.json"]["attempts"] == 3
+
+
+def test_summarize_eligible_retries_immediately_in_one_pass_and_then_succeeds(monkeypatch):
+    """Retries happen right here, within one summarize_eligible() call - a
+    video whose first two attempts fail but third succeeds must not need
+    to be summarized again on a later run to reach that success."""
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 3)
+    written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+
+    calls = []
+
+    def _flaky(*a, **k):
+        calls.append(1)
+        if len(calls) < 3:
+            raise SummarizationError("transient", retryable=True)
+        return (
+            ResolvedSummary(video_type="Bullish", summary="ok", points=[]),
+            Usage(input_tokens=100, output_tokens=50),
+            False,
+        )
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _flaky)
+    slept = []
+    monkeypatch.setattr(summary_store.time, "sleep", lambda seconds: slept.append(seconds))
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert len(calls) == 3
+    assert slept == []  # no rate limit involved - no delay between immediate retries
+    assert report.summarized == 1
+    assert report.failed == 0
+    assert written["abc123XYZde.json"]["status"] == "ok"
+    assert written["abc123XYZde.json"]["attempts"] == 3
+
+
+def test_summarize_eligible_pauses_only_for_rate_limited_retries(monkeypatch):
+    """A rate limit is the one retryable failure where an immediate,
+    zero-delay retry is actively counterproductive - it gets a short fixed
+    pause instead, still within the same in-process retry pass."""
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 2)
+    _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+
+    def _raise(*a, **k):
+        raise SummarizationError("rate limited", retryable=True, rate_limited=True)
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
+    slept = []
+    monkeypatch.setattr(summary_store.time, "sleep", lambda seconds: slept.append(seconds))
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert slept == [summary_store._RATE_LIMIT_RETRY_DELAY_SECONDS]
     assert report.failed == 1
-    assert written["abc123XYZde.json"]["status"] == "error"
 
 
 def test_summarize_eligible_does_not_use_fallback_for_a_non_retryable_failure(monkeypatch):
@@ -786,7 +1055,7 @@ def test_summarize_eligible_stops_at_max_videos_per_run(monkeypatch):
 
     output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens, video_types, video_type_descriptions: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -844,7 +1113,7 @@ def test_summarize_eligible_stops_on_budget_when_remaining_headroom_runs_out(mon
         for i in range(2)
     }
     _stub_drive(monkeypatch, index=index, transcripts={f"vid{i}.md": TRANSCRIPT_MARKDOWN for i in range(2)})
-    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model: 100)
+    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model, video_types, video_type_descriptions: 100)
     monkeypatch.setattr(summary_store.settings, "summary_max_output_tokens", 100)
     # One call's reserved cost (100 input + 100 output tokens) is ~$0.0006 -
     # comfortably under this cap on its own, but two calls' worth isn't.
@@ -854,7 +1123,7 @@ def test_summarize_eligible_stops_on_budget_when_remaining_headroom_runs_out(mon
     monkeypatch.setattr(
         summary_store,
         "summarize_transcript",
-        lambda body, model, max_output_tokens: (output, Usage(input_tokens=100, output_tokens=100), False),
+        lambda body, model, max_output_tokens, video_types, video_type_descriptions: (output, Usage(input_tokens=100, output_tokens=100), False),
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -889,7 +1158,7 @@ def test_summarize_eligible_calls_on_progress_before_model_call_and_before_write
     _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
     output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens, video_types, video_type_descriptions: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     calls = []
@@ -909,7 +1178,7 @@ def test_summarize_eligible_does_not_write_if_lock_is_lost_before_the_write(monk
     written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
     output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens, video_types, video_type_descriptions: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     calls = []
@@ -978,8 +1247,9 @@ def test_summarize_eligible_conservatively_charges_reserved_estimate_for_possibl
     failures like this could otherwise let real spend exceed the
     configured cap with nothing to show for it in our own totals."""
     _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
-    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model: 500)
+    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model, video_types, video_type_descriptions: 500)
     monkeypatch.setattr(summary_store.settings, "summary_max_output_tokens", 200)
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 1)
 
     def _raise(*a, **k):
         raise SummarizationError("schema validation failed", retryable=True, possibly_billed=True)
@@ -1069,7 +1339,7 @@ def test_summarize_eligible_records_points_truncated_flag(monkeypatch):
     monkeypatch.setattr(
         summary_store,
         "summarize_transcript",
-        lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), True),
+        lambda body, model, max_output_tokens, video_types, video_type_descriptions: (output, Usage(input_tokens=1, output_tokens=1), True),
     )
 
     summary_store.summarize_eligible("folder-id")
@@ -1085,7 +1355,7 @@ def test_summarize_eligible_omits_points_truncated_flag_when_not_truncated(monke
     monkeypatch.setattr(
         summary_store,
         "summarize_transcript",
-        lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False),
+        lambda body, model, max_output_tokens, video_types, video_type_descriptions: (output, Usage(input_tokens=1, output_tokens=1), False),
     )
 
     summary_store.summarize_eligible("folder-id")

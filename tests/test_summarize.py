@@ -5,6 +5,13 @@ import pytest
 from app import summarize
 
 
+def _model_output(**kwargs):
+    """Constructs an instance of the dynamically-built ModelSummaryOutput
+    schema (see summarize._build_model_output_schema()) using the default
+    fallback video_types - most tests don't care about this dimension."""
+    return summarize._build_model_output_schema(summarize.FALLBACK_VIDEO_TYPES)(**kwargs)
+
+
 def _fake_httpx_request() -> httpx.Request:
     return httpx.Request("POST", "https://api.anthropic.com/v1/messages")
 
@@ -110,8 +117,66 @@ def test_count_prompt_tokens_returns_the_real_input_token_count(monkeypatch):
     # otherwise the count undercounts exactly like the old chars-per-token
     # heuristic did.
     max_points = summarize._max_points_for_duration(summarize._max_transcript_seconds(SAMPLE_BODY))
-    assert seen_kwargs["system"] == summarize._build_system_prompt(max_points)
-    assert seen_kwargs["output_format"] is summarize.ModelSummaryOutput
+    assert seen_kwargs["system"] == summarize._build_system_prompt(max_points, summarize.FALLBACK_VIDEO_TYPES)
+    assert set(seen_kwargs["output_format"].model_fields["video_type"].annotation.__args__) == set(
+        summarize.FALLBACK_VIDEO_TYPES
+    )
+
+
+def test_count_prompt_tokens_uses_the_given_video_types(monkeypatch):
+    """Regression test: a video's group-specific classification categories
+    (see app/group_store.py) must actually affect the counted prompt, not
+    just be silently ignored in favor of the fallback."""
+    seen_kwargs = {}
+
+    class _FakeMessages:
+        def count_tokens(self, **kwargs):
+            seen_kwargs.update(kwargs)
+            return _FakeTokenCount(input_tokens=321)
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            self.messages = _FakeMessages()
+
+    monkeypatch.setattr(summarize.anthropic, "Anthropic", _FakeClient)
+
+    summarize.count_prompt_tokens(SAMPLE_BODY, model="claude-haiku-4-5", video_types=["Tutorial", "Short Showcase"])
+
+    assert "Tutorial" in seen_kwargs["system"]
+    assert "Short Showcase" in seen_kwargs["system"]
+    assert set(seen_kwargs["output_format"].model_fields["video_type"].annotation.__args__) == {
+        "Tutorial",
+        "Short Showcase",
+    }
+
+
+def test_build_system_prompt_includes_descriptions_when_given():
+    """Regression test for the review finding: bare category names alone
+    are a materially weaker classification signal than the original
+    per-category definitions - a description, when configured, must
+    actually reach the prompt."""
+    prompt = summarize._build_system_prompt(
+        5, ["Tutorial", "Short Showcase"], {"Tutorial": "a how-to walkthrough."}
+    )
+    assert '"Tutorial": a how-to walkthrough.' in prompt
+    # Short Showcase has no configured description - listed as a bare
+    # option, not given a fabricated one.
+    assert "Short Showcase" in prompt
+    assert '"Short Showcase":' not in prompt
+
+
+def test_build_system_prompt_omits_the_descriptions_block_when_none_given():
+    prompt_without = summarize._build_system_prompt(5, ["Tutorial"])
+    prompt_with_empty = summarize._build_system_prompt(5, ["Tutorial"], {})
+    assert prompt_without == prompt_with_empty
+    assert '"Tutorial":' not in prompt_without
+
+
+def test_fallback_video_type_descriptions_cover_every_fallback_video_type():
+    """Regression test: the whole point of restoring these is that
+    Finance's classification prompt doesn't regress to bare names - every
+    fallback category needs its original definition."""
+    assert set(summarize.FALLBACK_VIDEO_TYPE_DESCRIPTIONS) == set(summarize.FALLBACK_VIDEO_TYPES)
 
 
 @pytest.mark.parametrize(
@@ -411,7 +476,7 @@ def _fake_client(parse_result_or_raiser, captured_init_kwargs=None):
 
 
 def test_summarize_transcript_success(monkeypatch):
-    expected_output = summarize.ModelSummaryOutput(
+    expected_output = _model_output(
         video_type="Analytic Overview",
         summary="A summary.",
         points=[_point(source_timestamp="[00:05]", source_anchor="world", main_point="Point one", explanation="Because X.")],
@@ -438,7 +503,7 @@ def test_summarize_transcript_raises_on_invalid_points(monkeypatch):
     """The model can return a well-typed but ungrounded citation - Pydantic
     alone can't catch this, since it only validates the string shape, not
     whether the cited line and excerpt are real."""
-    bad_output = summarize.ModelSummaryOutput(
+    bad_output = _model_output(
         video_type="Analytic Overview",
         summary="S.",
         points=[_point(source_timestamp="[00:02]", source_anchor="hello")],  # 2s isn't a real line in SAMPLE_BODY
@@ -550,7 +615,7 @@ def test_summarize_transcript_disables_the_sdks_own_internal_retries(monkeypatch
     loop is the sole retry authority now."""
     captured = {}
     fake = _FakeParsedMessage(
-        summarize.ModelSummaryOutput(
+        _model_output(
             video_type="Analytic Overview", summary="S.", points=[_point(source_timestamp="[00:00]", source_anchor="hello")]
         )
     )
@@ -569,7 +634,9 @@ def test_summarize_transcript_raises_on_real_pydantic_validation_error(monkeypat
     Uncaught, this would escape summarize_transcript() and abort the whole
     run instead of being isolated to one video."""
     try:
-        summarize.pydantic.TypeAdapter(summarize.ModelSummaryOutput).validate_json("not valid json at all")
+        summarize.pydantic.TypeAdapter(summarize._build_model_output_schema(summarize.FALLBACK_VIDEO_TYPES)).validate_json(
+            "not valid json at all"
+        )
     except summarize.pydantic.ValidationError as exc:
         real_validation_error = exc
 
@@ -606,20 +673,36 @@ def test_summarize_transcript_raises_on_real_pydantic_validation_error(monkeypat
 )
 def test_model_summary_output_rejects_empty_or_invalid_content(kwargs):
     """Regression test: an empty points list, blank summary, or a
-    video_type outside the four allowed categories must be rejected -
+    video_type outside the configured categories must be rejected -
     an empty/mistyped response is otherwise schema-valid by Pydantic's
     default rules despite the output contract requiring actual content."""
     with pytest.raises(summarize.pydantic.ValidationError):
-        summarize.ModelSummaryOutput(**kwargs)
+        _model_output(**kwargs)
 
 
 def test_model_summary_output_accepts_each_valid_video_type():
-    for video_type in summarize.VIDEO_TYPES:
-        summarize.ModelSummaryOutput(
+    for video_type in summarize.FALLBACK_VIDEO_TYPES:
+        _model_output(
             video_type=video_type,
             summary="S.",
             points=[_point(source_timestamp="[00:00]", source_anchor="hello")],
         )  # should not raise
+
+
+def test_build_model_output_schema_rejects_a_video_type_outside_the_given_list():
+    """Regression test for the whole point of per-group video_types: the
+    schema must actually constrain video_type to exactly the list passed
+    in, not silently accept anything."""
+    Schema = summarize._build_model_output_schema(["Tutorial", "Short Showcase"])
+    with pytest.raises(summarize.pydantic.ValidationError):
+        Schema(
+            video_type="Analytic Overview",  # valid for Finance, not for this call's group
+            summary="S.",
+            points=[_point(source_timestamp="[00:00]", source_anchor="hello")],
+        )
+    Schema(
+        video_type="Tutorial", summary="S.", points=[_point(source_timestamp="[00:00]", source_anchor="hello")]
+    )  # should not raise
 
 
 @pytest.mark.parametrize("field_name", ["main_point", "explanation", "source_timestamp", "source_anchor"])

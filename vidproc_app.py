@@ -21,6 +21,7 @@ import time
 
 import streamlit as st
 
+from app import group_store
 from app.config import ConfigError, settings
 from app.insights_store import InsightsSnapshot, load_snapshot
 from vidproc.admin import (
@@ -29,7 +30,8 @@ from vidproc.admin import (
     add_channel_and_backfill,
     admin_flash_for,
     check_admin_token,
-    resolve_group_selection,
+    delete_group,
+    update_group_video_types,
 )
 from vidproc.render import render_detail, render_empty_state, render_feed_card, render_notice
 from vidproc.state import (
@@ -227,26 +229,38 @@ def render_admin_panel(folder_id: str, channels: list) -> None:
     # Existing groups only, plus an explicit "create new" option - picking
     # an existing group can never spawn a new tab, so a new one only ever
     # gets created as a conscious choice, not via a free-text typo of an
-    # existing group's name.
-    group_choice = st.selectbox(
-        "Group", options=[*groups_for_channels(channels), NEW_GROUP_OPTION], key="admin-channel-group-choice"
-    )
+    # existing group's name. Union of channels.json's groups and
+    # groups.json's registered names, not just the former - otherwise a
+    # group with no channel using it yet (e.g. one just created, or one
+    # whose only channel was since removed/reassigned) wouldn't appear
+    # here at all, forcing a re-creation attempt that fails as a duplicate.
+    known_group_names = sorted({*groups_for_channels(channels), *(g.name for g in group_store.read_groups(folder_id))})
+    group_choice = st.selectbox("Group", options=[*known_group_names, NEW_GROUP_OPTION], key="admin-channel-group-choice")
     new_group_name = ""
+    new_group_video_types_raw = ""
     if group_choice == NEW_GROUP_OPTION:
         new_group_name = st.text_input("New group name", key="admin-channel-new-group")
+        new_group_video_types_raw = st.text_input(
+            "Video types for this new group, comma-separated",
+            key="admin-channel-new-group-video-types",
+            help='e.g. "Short Showcase, Tutorial" - the classification categories used when summarizing '
+            "videos in this group (see the Finance group's own categories for an example).",
+        )
 
     languages_raw = st.text_input("Languages, comma-separated (optional)", key="admin-channel-languages")
 
     if st.button("Add channel", key="admin-add-channel"):
         languages = languages_raw.split(",") if languages_raw.strip() else None
+        new_group_video_types = new_group_video_types_raw.split(",") if new_group_video_types_raw.strip() else []
         try:
-            group = resolve_group_selection(group_choice, new_group_name)
             result = add_channel_and_backfill(
                 folder_id,
                 channel_id=channel_id,
                 name=name,
+                group_choice=group_choice,
+                new_group_name=new_group_name,
+                new_group_video_types=new_group_video_types,
                 enabled=enabled,
-                group=group,
                 languages=languages,
             )
         except (ChannelAlreadyExistsError, ValueError) as exc:
@@ -260,6 +274,41 @@ def render_admin_panel(folder_id: str, channels: list) -> None:
             st.session_state.admin_flash = admin_flash_for(result)
             _load_snapshot_cached.clear()
             st.rerun()
+
+    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='vidproc-meta-text'>Manage groups</div>", unsafe_allow_html=True)
+    existing_groups = group_store.read_groups(folder_id)
+    if not existing_groups:
+        render_empty_state("No groups configured yet - new ones are created via the form above.")
+    for group in existing_groups:
+        with st.expander(group.name):
+            types_raw = st.text_input(
+                "Video types, comma-separated",
+                value=", ".join(group.video_types),
+                key=f"group-types-{group.name}",
+            )
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Save", key=f"group-save-{group.name}"):
+                    try:
+                        update_group_video_types(folder_id, group.name, types_raw.split(","))
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.success(f"Updated {group.name}.")
+                        st.rerun()
+            with col2:
+                if st.button("Delete", key=f"group-delete-{group.name}"):
+                    try:
+                        delete_group(folder_id, group.name)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.success(
+                            f"Deleted {group.name}'s configuration. Any channel still assigned to it will "
+                            "fall back to the default group's video types until reassigned or reconfigured."
+                        )
+                        st.rerun()
 
 
 def main() -> None:

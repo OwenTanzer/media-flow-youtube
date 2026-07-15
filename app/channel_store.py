@@ -16,6 +16,13 @@ logger = logging.getLogger("media_flow.channels")
 
 CHANNELS_FILENAME = "channels.json"
 
+# The dashboard's default top-level group for any channel whose channels.json
+# entry has no explicit "group", and for any video whose channel_id doesn't
+# resolve to a known channel at all. Also summary_store.py's fallback group
+# name when resolving a video's channel to its configured video_types (see
+# app/group_store.py).
+DEFAULT_GROUP = "Finance"
+
 
 @dataclass
 class Channel:
@@ -29,6 +36,10 @@ class Channel:
     # "unset, needs a fallback" - the fallback itself belongs at the point
     # group is consumed, not here.
     group: str | None = None
+
+
+def resolve_group(channel: Channel) -> str:
+    return channel.group or DEFAULT_GROUP
 
 
 def _channel_to_dict(channel: Channel) -> dict:

@@ -19,24 +19,15 @@ from datetime import datetime, timezone
 from typing import Literal
 
 from . import channel_store, drive, summary_store
-from .channel_store import Channel
+from .channel_store import Channel, DEFAULT_GROUP, resolve_group
 
 logger = logging.getLogger("media_flow.insights_store")
-
-# The dashboard's default top-level group for any channel whose channels.json
-# entry has no explicit "group" (see app/channel_store.py), and for any video
-# whose channel_id doesn't resolve to a known channel at all.
-DEFAULT_GROUP = "Finance"
 
 # The Level-2 channel-filter label for a video whose channel_id is missing
 # or doesn't match any currently configured channel (predates the
 # channel_id field, or its channel was later removed from the registry -
 # see backfill_channel_ids.py for the former).
 UNASSIGNED_CHANNEL_LABEL = "Unassigned / Other"
-
-
-def resolve_group(channel: Channel) -> str:
-    return channel.group or DEFAULT_GROUP
 
 
 @dataclass

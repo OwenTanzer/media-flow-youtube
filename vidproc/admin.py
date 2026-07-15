@@ -14,10 +14,11 @@ from dataclasses import dataclass
 
 import requests
 
-from app import channel_store, discovery, job_lock
+from app import channel_store, discovery, group_store, job_lock
 from app.channel_store import Channel
 from app.config import settings
 from app.discovery import DiscoveryReport
+from app.group_store import Group
 
 logger = logging.getLogger("media_flow.vidproc_admin")
 
@@ -67,23 +68,103 @@ def check_admin_token(entered: str, configured: str | None) -> bool:
     return secrets.compare_digest(entered, configured)
 
 
-def resolve_group_selection(selected: str, new_group_name: str) -> str:
-    """Resolves the admin panel's group selectbox into the actual `group`
-    value to pass to add_channel_and_backfill(). Picking an existing
-    group from the selectbox returns it verbatim - a new group is only
-    ever created when NEW_GROUP_OPTION was explicitly selected, making
-    that a conscious choice rather than something a typo in a free-text
-    field could trigger by accident.
+def create_group(folder_id: str, name: str, video_types: list[str]) -> Group:
+    """Registers a new group in groups.json with its own video_type
+    classification categories (see app/group_store.py, app/summarize.py) -
+    every dashboard group needs its own list, since the finance-flavored
+    default categories (see summarize.FALLBACK_VIDEO_TYPES) don't make
+    sense for e.g. a "Google" group's product/tutorial content.
 
-    Raises ValueError if NEW_GROUP_OPTION was selected but new_group_name
-    is blank - "create a new group" with no name isn't a valid choice."""
+    Raises ValueError for a blank name, no non-blank video_types, or a
+    name that's already registered."""
+
+    name = name.strip()
+    if not name:
+        raise ValueError("Group name is required.")
+    cleaned_types = [t.strip() for t in video_types if t.strip()]
+    if not cleaned_types:
+        raise ValueError(f"At least one video type is required for the new group {name!r}.")
+
+    existing = group_store.read_groups(folder_id)
+    if any(g.name == name for g in existing):
+        raise ValueError(f"Group {name!r} is already registered.")
+
+    new_group = Group(name=name, video_types=cleaned_types)
+    group_store.write_groups(folder_id, [*existing, new_group])
+    return new_group
+
+
+def update_group_video_types(folder_id: str, name: str, video_types: list[str]) -> Group:
+    """Replaces an existing group's video_types list in groups.json - the
+    editing half of create_group()/delete_group(). Does not rename
+    groups: a group's name is also the value channels.json's Channel.group
+    field stores directly (see app/channel_store.py), so renaming here
+    would silently orphan every channel still set to the old name rather
+    than updating them - out of scope for this function.
+
+    Raises ValueError for no non-blank video_types, or if name isn't
+    currently registered (use create_group() to add a new one)."""
+
+    cleaned_types = [t.strip() for t in video_types if t.strip()]
+    if not cleaned_types:
+        raise ValueError(f"At least one video type is required for group {name!r}.")
+
+    existing = group_store.read_groups(folder_id)
+    if not any(g.name == name for g in existing):
+        raise ValueError(f"Group {name!r} is not registered.")
+
+    updated_groups = [Group(name=g.name, video_types=cleaned_types) if g.name == name else g for g in existing]
+    group_store.write_groups(folder_id, updated_groups)
+    return next(g for g in updated_groups if g.name == name)
+
+
+def delete_group(folder_id: str, name: str) -> None:
+    """Removes a group's classification configuration from groups.json
+    entirely. Does not touch channels.json: any channel still set to this
+    group keeps that value, and just falls back to the default group's
+    video_types (or summarize.FALLBACK_VIDEO_TYPES) the next time it's
+    summarized, until the group is reconfigured or the channel is moved -
+    the same fallback behavior as a group that was never configured in
+    groups.json at all (see app/group_store.py's get_video_types()). The
+    dashboard's group tab itself isn't affected either - tabs are derived
+    from channels.json's group values (see vidproc/state.py), independent
+    of groups.json.
+
+    Raises ValueError if name isn't currently registered."""
+
+    existing = group_store.read_groups(folder_id)
+    if not any(g.name == name for g in existing):
+        raise ValueError(f"Group {name!r} is not registered.")
+    group_store.write_groups(folder_id, [g for g in existing if g.name != name])
+
+
+def resolve_group_selection(folder_id: str, selected: str, new_group_name: str, new_group_video_types: list[str]) -> str:
+    """Resolves the admin panel's group selectbox into the actual `group`
+    value - picking an existing group from the selectbox returns it
+    verbatim, with no Drive write; a new group is only ever created when
+    NEW_GROUP_OPTION was explicitly selected, making that (and specifying
+    its video_types) a conscious choice rather than something a typo in a
+    free-text field could trigger by accident.
+
+    When NEW_GROUP_OPTION is selected, this creates the group (see
+    create_group() - same ValueError cases apply: blank name, no
+    non-blank video_types, or an already-registered name) before
+    returning its name.
+
+    Called by add_channel_and_backfill() only *after* the channel itself
+    has fully passed validation (blank/malformed ID, duplicate check, RSS
+    preflight) - group creation is the one Drive write in that whole flow
+    that can't be validated away in advance (naming collisions aside), so
+    it deliberately happens last, right before the channel write itself,
+    to minimize the window where a new group could be left registered
+    with no channel actually using it (see the review finding this
+    addresses - this doesn't make the two writes a single atomic
+    transaction, just orders them to fail closed instead of open)."""
 
     if selected != NEW_GROUP_OPTION:
         return selected
-    new_group_name = new_group_name.strip()
-    if not new_group_name:
-        raise ValueError("Enter a name for the new group, or pick an existing one from the list instead.")
-    return new_group_name
+    new_group = create_group(folder_id, new_group_name, new_group_video_types)
+    return new_group.name
 
 
 def add_channel_and_backfill(
@@ -91,8 +172,10 @@ def add_channel_and_backfill(
     *,
     channel_id: str,
     name: str,
+    group_choice: str,
+    new_group_name: str = "",
+    new_group_video_types: list[str] | None = None,
     enabled: bool = True,
-    group: str | None = None,
     languages: list[str] | None = None,
 ) -> AddChannelResult:
     """Registers a new channel in channels.json, then immediately backfills
@@ -104,10 +187,23 @@ def add_channel_and_backfill(
     and backfill only ever consider enabled channels, so there's nothing
     for it to find until the channel is enabled.
 
-    Raises ValueError for a blank/malformed channel_id or one whose feed
-    can't be fetched (checked *before* writing anything, so a typo is
-    never permanently written - see the review finding this addresses),
-    or ChannelAlreadyExistsError if channel_id is already registered.
+    group_choice/new_group_name/new_group_video_types are the admin
+    panel's group selectbox inputs verbatim (see resolve_group_selection())
+    - deliberately taken here rather than a pre-resolved `group: str`, so
+    that group resolution (which may create a new group - a Drive write)
+    only happens *after* every channel-level check below has already
+    passed. Doing it the other way around (resolve/create the group
+    first, then validate the channel) was the review finding this
+    addresses: a channel validation failure after an already-created
+    group left an orphaned group in groups.json that didn't even appear
+    in the panel's own dropdown (built from channels.json's groups) to
+    retry against.
+
+    Raises ValueError for a blank/malformed channel_id, one whose feed
+    can't be fetched, or an invalid group_choice/new_group_name/
+    new_group_video_types combination (all checked *before* writing
+    anything, so a typo is never permanently written), or
+    ChannelAlreadyExistsError if channel_id is already registered.
     Callers should catch and display these, not treat them as an
     unexpected failure.
 
@@ -131,7 +227,6 @@ def add_channel_and_backfill(
             "22 characters (find it in the channel page's source, or via a channel-ID lookup tool)."
         )
     name = name.strip() or channel_id
-    group = group.strip() or None if group else None
     languages = [code.strip() for code in languages if code.strip()] if languages else None
 
     existing = channel_store.read_channels(folder_id)
@@ -145,6 +240,12 @@ def add_channel_and_backfill(
         discovery.fetch_channel_feed(channel_id)
     except (requests.RequestException, ET.ParseError) as exc:
         raise ValueError(f"Could not fetch this channel's RSS feed - double-check the channel ID. ({exc})") from exc
+
+    # Every channel-level check has now passed - only now does group
+    # resolution run, since it's the one remaining step capable of a
+    # Drive write (creating a new group) that a validation failure above
+    # would otherwise leave orphaned.
+    group = resolve_group_selection(folder_id, group_choice, new_group_name, new_group_video_types or [])
 
     new_channel = Channel(channel_id=channel_id, name=name, enabled=enabled, languages=languages, group=group)
     channel_store.write_channels(folder_id, [*existing, new_channel])
