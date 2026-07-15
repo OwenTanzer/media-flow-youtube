@@ -1,7 +1,9 @@
-"""Discovers new uploads from configured YouTube channels via their public
-RSS feeds and queues previously-unseen video IDs for the existing batch
-pipeline. See discover_and_process.py (repo root) for the serialized
-entrypoint that combines this with running the queue."""
+"""Discovers new uploads from configured YouTube channels and queues
+previously-unseen video IDs for the existing batch pipeline. Uses the
+YouTube Data API's uploads-playlist flow (app/youtube_data_api.py, issue
+#24) when YOUTUBE_DATA_API_KEY is set, otherwise falls back to each
+channel's public upload RSS feed. See discover_and_process.py (repo root)
+for the serialized entrypoint that combines this with running the queue."""
 
 from __future__ import annotations
 
@@ -12,7 +14,10 @@ from datetime import datetime, timezone
 
 import requests
 
-from . import channel_store, drive, queue_store, youtube
+from . import channel_store, drive, queue_store, uploads_playlist_store, youtube, youtube_data_api
+from .config import settings
+from .discovered_video import DiscoveredVideo
+from .youtube_data_api import YouTubeDataApiError
 
 logger = logging.getLogger("media_flow.discovery")
 
@@ -21,13 +26,6 @@ ATOM_NS = {
     "atom": "http://www.w3.org/2005/Atom",
     "yt": "http://www.youtube.com/xml/schemas/2015",
 }
-
-
-@dataclass
-class DiscoveredVideo:
-    video_id: str
-    channel_id: str
-    published: str | None
 
 
 @dataclass
@@ -84,19 +82,44 @@ def _known_video_ids(folder_id: str, existing_queue: list[str | dict]) -> set[st
     return known
 
 
+def _fetch_channel_videos_via_api(
+    channel: channel_store.Channel, known_ids: set[str], playlist_cache: dict[str, str], api_key: str
+) -> list[DiscoveredVideo]:
+    """Resolves (and caches, in playlist_cache) the channel's uploads
+    playlist ID, then polls it via the Data API. Raises YouTubeDataApiError
+    on any failure - the caller isolates one channel's failure from the
+    others, same as fetch_channel_feed()."""
+
+    playlist_id = playlist_cache.get(channel.channel_id)
+    if playlist_id is None:
+        playlist_id = youtube_data_api.resolve_uploads_playlist_id(channel.channel_id, api_key)
+        playlist_cache[channel.channel_id] = playlist_id
+
+    return youtube_data_api.fetch_uploads_playlist_videos(playlist_id, api_key, known_ids, channel.channel_id)
+
+
 def _enqueue_new_videos(folder_id: str, channels: list[channel_store.Channel]) -> tuple[int, int, int, list[tuple[str, str]]]:
-    """Fetches each given channel's RSS feed and enqueues any video not
-    already known (in _index.json or queue.json), scoped to exactly the
+    """Fetches each given channel's latest uploads and enqueues any video
+    not already known (in _index.json or queue.json), scoped to exactly the
     channels passed in. Shared core for discover_and_enqueue() (every
     enabled channel, the normal recurring poll) and
     backfill_new_channels() (just channels with no known videos yet - see
     that function and backfill_new_channels.py at the repo root).
+
+    Uses the YouTube Data API's uploads-playlist flow (issue #24) as the
+    exclusive source when YOUTUBE_DATA_API_KEY is set - RSS is only used as
+    a fallback while that key is unset, so there's never a double-fetch per
+    channel.
 
     Returns (discovered_total, newly_queued, duplicates_skipped,
     feed_failures)."""
 
     existing_queue = queue_store.read_queue(folder_id)
     known_ids = _known_video_ids(folder_id, existing_queue)
+
+    api_key = settings.youtube_data_api_key
+    playlist_cache = uploads_playlist_store.read_cache(folder_id) if api_key else {}
+    playlist_cache_dirty = False
 
     new_entries: list[str | dict] = []
     discovered_total = 0
@@ -106,8 +129,14 @@ def _enqueue_new_videos(folder_id: str, channels: list[channel_store.Channel]) -
 
     for channel in channels:
         try:
-            videos = fetch_channel_feed(channel.channel_id)
-        except (requests.RequestException, ET.ParseError) as exc:
+            if api_key:
+                had_cached_playlist = channel.channel_id in playlist_cache
+                videos = _fetch_channel_videos_via_api(channel, known_ids, playlist_cache, api_key)
+                if not had_cached_playlist:
+                    playlist_cache_dirty = True
+            else:
+                videos = fetch_channel_feed(channel.channel_id)
+        except (requests.RequestException, ET.ParseError, YouTubeDataApiError) as exc:
             logger.warning("Feed fetch failed for channel %s (%s): %s", channel.channel_id, channel.name, exc)
             feed_failures.append((channel.channel_id, str(exc)))
             continue
@@ -128,6 +157,8 @@ def _enqueue_new_videos(folder_id: str, channels: list[channel_store.Channel]) -
 
     if new_entries:
         queue_store.write_queue(folder_id, existing_queue + new_entries)
+    if playlist_cache_dirty:
+        uploads_playlist_store.write_cache(folder_id, playlist_cache)
 
     return discovered_total, len(new_entries), duplicates_skipped, feed_failures
 

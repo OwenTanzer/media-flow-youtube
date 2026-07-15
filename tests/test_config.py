@@ -140,6 +140,15 @@ def test_summary_max_cost_usd_per_run_rejects_invalid_values(monkeypatch, value)
         _settings_with(monkeypatch)
 
 
+def test_youtube_data_api_key_defaults_to_none(monkeypatch):
+    monkeypatch.delenv("YOUTUBE_DATA_API_KEY", raising=False)
+    assert _settings_with(monkeypatch).youtube_data_api_key is None
+
+
+def test_youtube_data_api_key_reads_from_env(monkeypatch):
+    assert _settings_with(monkeypatch, YOUTUBE_DATA_API_KEY="some-key").youtube_data_api_key == "some-key"
+
+
 def test_vidproc_admin_token_defaults_to_none(monkeypatch):
     monkeypatch.delenv("VIDPROC_ADMIN_TOKEN", raising=False)
     assert _settings_with(monkeypatch).vidproc_admin_token is None
