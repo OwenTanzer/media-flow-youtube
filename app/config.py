@@ -98,12 +98,6 @@ class Settings:
                 f"SUMMARY_MAX_TRANSCRIPT_CHARS must be a positive integer, got {self.summary_max_transcript_chars}."
             )
 
-        self.summary_max_videos_per_run: int = int(_env("SUMMARY_MAX_VIDEOS_PER_RUN", "20"))
-        if self.summary_max_videos_per_run < 1:
-            raise ConfigError(
-                f"SUMMARY_MAX_VIDEOS_PER_RUN must be a positive integer, got {self.summary_max_videos_per_run}."
-            )
-
         self.summary_max_total_tokens_per_run: int = int(_env("SUMMARY_MAX_TOTAL_TOKENS_PER_RUN", "500000"))
         if self.summary_max_total_tokens_per_run < 1:
             raise ConfigError(

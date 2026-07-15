@@ -110,14 +110,13 @@ def test_summary_settings_defaults(monkeypatch):
     assert settings.summary_model == "claude-haiku-4-5"
     assert settings.summary_max_output_tokens == 4096
     assert settings.summary_max_transcript_chars == 400000
-    assert settings.summary_max_videos_per_run == 20
     assert settings.summary_max_total_tokens_per_run == 500000
     assert settings.summary_max_cost_usd_per_run == 2.0
 
 
 @pytest.mark.parametrize(
     "env_var",
-    ["SUMMARY_MAX_OUTPUT_TOKENS", "SUMMARY_MAX_TRANSCRIPT_CHARS", "SUMMARY_MAX_VIDEOS_PER_RUN", "SUMMARY_MAX_TOTAL_TOKENS_PER_RUN"],
+    ["SUMMARY_MAX_OUTPUT_TOKENS", "SUMMARY_MAX_TRANSCRIPT_CHARS", "SUMMARY_MAX_TOTAL_TOKENS_PER_RUN"],
 )
 @pytest.mark.parametrize("value", ["0", "-1"])
 def test_summary_positive_int_settings_reject_non_positive_values(monkeypatch, env_var, value):

@@ -723,8 +723,10 @@ multi-pass chunking-and-merging across several model calls.
 
 ### Cost controls
 
-`SUMMARY_MAX_VIDEOS_PER_RUN`, `SUMMARY_MAX_TOTAL_TOKENS_PER_RUN`, and
-`SUMMARY_MAX_COST_USD_PER_RUN` each independently bound one run. Before
+`SUMMARY_MAX_TOTAL_TOKENS_PER_RUN` and `SUMMARY_MAX_COST_USD_PER_RUN` each
+independently bound one run - there's no separate cap on the *number* of
+videos processed; a run keeps draining the eligible backlog until it's
+empty or one of these real spend limits is actually hit. Before
 each call, its worst-case cost/tokens are reserved against these caps -
 not just checked against totals from already-completed calls - so a
 single call starting just under a cap can't push the run well past it.
