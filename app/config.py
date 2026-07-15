@@ -98,6 +98,17 @@ class Settings:
                 f"SUMMARY_MAX_TRANSCRIPT_CHARS must be a positive integer, got {self.summary_max_transcript_chars}."
             )
 
+        # The standalone backlog worker is deliberately independent of the
+        # discovery lock. Keep a modest fan-out so it drains useful work
+        # quickly without turning a small Haiku workload into a rate-limit
+        # storm.
+        self.summary_worker_concurrency: int = int(_env("SUMMARY_WORKER_CONCURRENCY", "4"))
+        if not 1 <= self.summary_worker_concurrency <= 16:
+            raise ConfigError(
+                "SUMMARY_WORKER_CONCURRENCY must be an integer from 1 to 16, "
+                f"got {self.summary_worker_concurrency}."
+            )
+
         self.summary_max_total_tokens_per_run: int = int(_env("SUMMARY_MAX_TOTAL_TOKENS_PER_RUN", "500000"))
         if self.summary_max_total_tokens_per_run < 1:
             raise ConfigError(

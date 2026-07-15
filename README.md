@@ -432,8 +432,18 @@ them immediately, exactly as before this existed.
 
 ## Transcript summarization (optional)
 
-The final stage of `discover_and_process.py` turns every successfully
-archived transcript (`status: "ok"` in `_index.json`) into a structured,
+> **Current execution model:** `summarize_backlog.py` is a separate Railway
+> Cron Job (`railway.summarize-backlog.toml`), not a stage of
+> `discover_and_process.py`. It reads successful transcripts and writes only
+> independent `summaries/<video_id>.json` artifacts, so it does not acquire
+> the discovery/queue Drive lock. It runs up to four summaries concurrently;
+> each eligible video gets exactly three structured attempts followed by one
+> loose fallback. Failed artifacts are eligible again on the next worker run.
+> There is no token-count preflight, per-run budget gate, retry timestamp, or
+> permanent attempt-count lockout.
+
+`summarize_backlog.py` turns every successfully archived transcript
+(`status: "ok"` in `_index.json`) into a structured,
 timestamped JSON insight artifact via Claude - `summaries/<video_id>.json`
 in the same Drive folder. It never touches `no_captions`/`blocked`/etc.
 entries, and a failure summarizing one video never blocks transcript
@@ -442,14 +452,13 @@ complete.
 
 ### Setup
 
-Set `ANTHROPIC_API_KEY` (resolved automatically by the Anthropic SDK - not
-touched by this app's own config or logs) wherever `discover_and_process.py`
-runs. This stage is genuinely optional: if the key isn't set, it's skipped
-cleanly (logged, not an error) rather than failing the whole run - discovery
-and transcript archiving are unaffected either way. Nothing else is
-required once it's set - all other settings have working defaults. See
-[`.env.example`](.env.example) for `SUMMARY_MODEL` (default
-`claude-haiku-4-5`) and the cost/length controls below.
+Set `ANTHROPIC_API_KEY` wherever the independent summary worker runs. This
+stage is optional: if the key is absent, the worker exits cleanly and
+discovery/transcript archiving continue unaffected. Configure the Railway
+Cron Job with `python summarize_backlog.py` (the included
+`railway.summarize-backlog.toml` runs it every five minutes). See
+[`.env.example`](.env.example) for the Haiku model, response-size, transcript
+length, and worker-concurrency settings.
 
 ### Output format
 
@@ -997,7 +1006,8 @@ vidproc/
 requirements-vidproc.txt  separate, minimal dependency set for the dashboard - see "Insight dashboard" above
 Dockerfile.vidproc  dedicated build for the vidproc Railway service (isolated from requirements.txt)
 batch_runner.py     standalone entrypoint for a separate Railway Cron Job service
-discover_and_process.py  standalone entrypoint: discover -> process queue -> summarize eligible transcripts
+discover_and_process.py  standalone entrypoint: discover -> process queue (locked)
+summarize_backlog.py     standalone entrypoint: concurrent independent summary worker
 backfill_channel_ids.py  one-off script: recover channel_id for pre-existing summaries
 backfill_new_channels.py  one-off/rerunnable script: backfill a newly-added channel's current RSS feed, decoupled from discover_and_process.py's lock
 get_refresh_token.py  one-time local script to mint the Drive OAuth refresh token
