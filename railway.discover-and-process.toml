@@ -3,5 +3,5 @@ builder = "NIXPACKS"
 
 [deploy]
 startCommand = "python discover_and_process.py"
-cronSchedule = "0 */3 * * *"
+cronSchedule = "0 * * * *"
 restartPolicyType = "NEVER"
