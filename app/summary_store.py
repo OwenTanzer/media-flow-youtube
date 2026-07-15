@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -59,6 +60,16 @@ def _get_bulk_read_executor() -> ThreadPoolExecutor:
 # per-point-cited summary anywhere the text is displayed, not just via
 # the "fallback_summary" field below.
 FALLBACK_SUMMARY_SYMBOL = "⚠️"  # warning sign (U+26A0 U+FE0F)
+
+# A video's retry+fallback resolution happens entirely within one call to
+# summarize_eligible() now, not spread across scheduled runs (see that
+# function's docstring) - retries are immediate (no delay) for every
+# retryable failure except a rate limit specifically, where a zero-delay
+# retry tends to prolong the throttling rather than resolve it. This is a
+# short, fixed pause, not the multi-minute SUMMARY_RETRY_BACKOFF_SECONDS
+# window a video only ever falls back to if it's still failing after
+# every immediate attempt (see _next_retry_at()).
+_RATE_LIMIT_RETRY_DELAY_SECONDS = 5
 
 _CHANNEL_RE = re.compile(r"^channel: (.+)$", re.MULTILINE)
 
@@ -283,6 +294,28 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
     status: "error" artifact) and never aborts the run - discovery and
     transcript archiving have already completed by the time this runs.
 
+    A video retries immediately, in this same call, up to
+    settings.summary_max_attempts_per_video - it does not wait for a
+    future scheduled run between attempts (see _RATE_LIMIT_RETRY_DELAY_SECONDS
+    for the one exception: a short, fixed pause specifically for a rate
+    limit, since an immediate zero-delay retry there tends to prolong the
+    throttling rather than resolve it). Once every immediate attempt is
+    exhausted (or a non-retryable failure occurs), one extra call is made
+    via summarize_fallback() for a plain prose summary with no per-line
+    citations to get wrong, if the last failure is fallback_eligible -
+    some speakers (meandering, conversational, non-linear delivery) make
+    the normal source_timestamp/source_anchor grounding hard even when the
+    model understood the content fine. A successful fallback writes
+    status: "ok" with "fallback_summary": true, an empty points list, and
+    the summary text prefixed with FALLBACK_SUMMARY_SYMBOL so it's
+    visually distinguishable wherever it's displayed, not just via that
+    field. Only if the fallback isn't attempted or also fails does the
+    video end this call as status: "error", with a next_retry_at for a
+    later run - a persistent provider-level issue (rate limit, connection
+    error) that outlasts every immediate attempt genuinely may need more
+    time than one run can give it, but this is the rare last resort now,
+    not the normal path.
+
     Two distinct failure handling paths exist, deliberately:
 
     - Transient, per-video failures (rate limits, connection errors,
@@ -298,21 +331,6 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
       changes when only the environment does) - and since summarization is
       an optional stage, an unconfigured deployment should skip it
       cleanly rather than fail discover_and_process.py's whole run.
-
-    A third path handles a video that fails on its *last* allowed attempt
-    (this_attempt >= settings.summary_max_attempts_per_video) with a
-    retryable error: rather than let it sit permanently as status:
-    "error", one extra call is made via summarize_fallback() for a plain
-    prose summary with no per-line citations to get wrong - some speakers
-    (meandering, conversational, non-linear delivery) make the normal
-    source_timestamp/source_anchor grounding hard even when the model
-    understood the content fine. A successful fallback writes status:
-    "ok" with "fallback_summary": true, an empty points list, and the
-    summary text prefixed with FALLBACK_SUMMARY_SYMBOL so it's visually
-    distinguishable wherever it's displayed, not just via that field. If
-    the fallback call itself fails, the video falls through to the normal
-    status: "error" artifact exactly as before - this is a best-effort
-    extra attempt, not a guarantee every video eventually gets a summary.
 
     on_progress is called (a) right before the model call, so a long-running
     lock lease (see discover_and_process.py) is renewed going into a
@@ -408,7 +426,6 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
             )
             else 0
         )
-        this_attempt = prior_attempts + 1
         if prior_attempts > 0:
             retried += 1
 
@@ -446,12 +463,11 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
             # without needing a fresh PROMPT_VERSION bump.
             "video_types_fingerprint": taxonomy_fingerprint,
             "generated_at": generated_at_dt.isoformat(),
-            "attempts": this_attempt,
         }
         if truncated:
             base_fields["transcript_truncated"] = True
 
-        def _write_failure_artifact(exc: SummarizationError) -> None:
+        def _write_failure_artifact(exc: SummarizationError, attempts: int) -> None:
             if on_progress is not None:
                 # Re-check lock ownership immediately before writing, not
                 # just after - a takeover during the model call must stop
@@ -462,6 +478,7 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
                 video_id,
                 {
                     **base_fields,
+                    "attempts": attempts,
                     "status": "error",
                     "retryable": exc.retryable,
                     "message": str(exc),
@@ -488,7 +505,7 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
         except SummarizationError as exc:
             failed += 1
             failures.append((video_id, str(exc)))
-            _write_failure_artifact(exc)
+            _write_failure_artifact(exc, prior_attempts + 1)
             continue
 
         reserved_tokens = input_tokens_estimate + settings.summary_max_output_tokens
@@ -524,139 +541,170 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
 
         eligible += 1
 
-        if on_progress is not None:
-            # Renew before the (possibly slow) model call, not just after -
-            # a long transcript or a slow provider response can otherwise
-            # run past the lock's TTL with no renewal at all in between.
-            on_progress()
+        # Retries happen immediately, right here, up to
+        # summary_max_attempts_per_video - not by returning and waiting for
+        # summarize_eligible() to be called again on some future run (see
+        # this function's docstring). Only a rate limit gets any delay at
+        # all (_RATE_LIMIT_RETRY_DELAY_SECONDS), and it's a short, fixed
+        # one - a zero-delay retry right after a 429 tends to prolong the
+        # throttling rather than resolve it, but every other retryable
+        # failure (validation/grounding misses, transient connection
+        # errors) gains nothing from waiting and retries at once.
+        this_attempt = prior_attempts
+        last_exc: SummarizationError | None = None
+        resolved = False
+        while this_attempt < settings.summary_max_attempts_per_video:
+            this_attempt += 1
 
-        try:
-            model_output, usage, points_truncated = summarize_transcript(
-                model_input,
-                model=settings.summary_model,
-                max_output_tokens=settings.summary_max_output_tokens,
-                video_types=video_types,
-                video_type_descriptions=video_type_descriptions,
-            )
-        except SummarizationError as exc:
-            failures.append((video_id, str(exc)))
-            if exc.usage is not None:
-                # The API still returned (and billed) a response even
-                # though it's being treated as a failure - e.g. a safety
-                # refusal or an unparseable structured output. Count it,
-                # or the budget silently under-tracks real spend.
-                _count_usage(exc.usage.input_tokens, exc.usage.output_tokens)
-            elif exc.possibly_billed:
-                # Usage is unknown but a response plausibly still happened
-                # (e.g. the SDK's own schema validation raising before we
-                # get access to the raw response). Conservatively charge
-                # this call's reserved worst-case estimate rather than
-                # contributing zero - otherwise repeated failures like this
-                # could let real spend exceed the cap with nothing to show
-                # for it in our own tracked totals.
-                _count_usage(input_tokens_estimate, settings.summary_max_output_tokens)
+            if on_progress is not None:
+                # Renew before the (possibly slow) model call, not just after -
+                # a long transcript or a slow provider response can otherwise
+                # run past the lock's TTL with no renewal at all in between.
+                on_progress()
 
-            # Last resort: this video has now used up its normal per-point
-            # citation attempts and would otherwise sit permanently as
-            # status: "error" until something upstream changes. Some
-            # speakers (meandering, conversational, non-linear delivery)
-            # make source_timestamp/source_anchor grounding hard even when
-            # the model clearly understood the content - rather than give
-            # up entirely, try once for a plain prose summary instead,
-            # which has no per-line citation to get wrong.
-            #
-            # Gated on fallback_eligible, not just retryable: retryable
-            # also covers rate limits, connection errors, and 5xx - an
-            # immediate second call right after one of those can't fix
-            # anything and, for a rate limit specifically, only makes it
-            # worse. fallback_eligible is reserved for content/structured-
-            # output problems with this attempt's own response (see
-            # SummarizationError's docstring), where an immediate retry
-            # with a much simpler schema is actually likely to help.
-            # Still only on the video's last attempt - every earlier
-            # attempt gets a real shot at the full, timestamped citation
-            # format first.
-            if exc.fallback_eligible and this_attempt >= settings.summary_max_attempts_per_video:
-                try:
-                    fallback_summary, fallback_usage = summarize_fallback(
-                        model_input, model=settings.summary_model, max_output_tokens=settings.summary_max_output_tokens
-                    )
-                except SummarizationError as fallback_exc:
-                    if fallback_exc.usage is not None:
-                        _count_usage(fallback_exc.usage.input_tokens, fallback_exc.usage.output_tokens)
-                    elif fallback_exc.possibly_billed:
-                        _count_usage(input_tokens_estimate, settings.summary_max_output_tokens)
-                    failed += 1
-                    _write_failure_artifact(exc)
-                    continue
-
-                _count_usage(fallback_usage.input_tokens, fallback_usage.output_tokens)
-                fallback_cost = estimate_cost_usd(
-                    settings.summary_model, fallback_usage.input_tokens, fallback_usage.output_tokens
+            try:
+                model_output, usage, points_truncated = summarize_transcript(
+                    model_input,
+                    model=settings.summary_model,
+                    max_output_tokens=settings.summary_max_output_tokens,
+                    video_types=video_types,
+                    video_type_descriptions=video_type_descriptions,
                 )
+            except SummarizationError as exc:
+                last_exc = exc
+                if exc.usage is not None:
+                    # The API still returned (and billed) a response even
+                    # though it's being treated as a failure - e.g. a safety
+                    # refusal or an unparseable structured output. Count it,
+                    # or the budget silently under-tracks real spend.
+                    _count_usage(exc.usage.input_tokens, exc.usage.output_tokens)
+                elif exc.possibly_billed:
+                    # Usage is unknown but a response plausibly still happened
+                    # (e.g. the SDK's own schema validation raising before we
+                    # get access to the raw response). Conservatively charge
+                    # this call's reserved worst-case estimate rather than
+                    # contributing zero - otherwise repeated failures like this
+                    # could let real spend exceed the cap with nothing to show
+                    # for it in our own tracked totals.
+                    _count_usage(input_tokens_estimate, settings.summary_max_output_tokens)
+
+                if not exc.retryable:
+                    # Deterministic for the same input (e.g. a safety
+                    # refusal) - no number of immediate retries changes
+                    # the outcome, so stop trying this video right away.
+                    break
+                if exc.rate_limited and this_attempt < settings.summary_max_attempts_per_video:
+                    # Only pause if another attempt will actually follow -
+                    # no point delaying right before giving up anyway.
+                    time.sleep(_RATE_LIMIT_RETRY_DELAY_SECONDS)
+                continue  # try again immediately (loop condition checks the attempt cap)
+            else:
+                # Success.
+                _count_usage(usage.input_tokens, usage.output_tokens)
+                cost = estimate_cost_usd(settings.summary_model, usage.input_tokens, usage.output_tokens)
+                artifact = {
+                    **base_fields,
+                    "attempts": this_attempt,
+                    "video_type": model_output.video_type,
+                    "summary": model_output.summary,
+                    "points": [
+                        {
+                            "importance": point.importance,
+                            "main_point": point.main_point,
+                            "explanation": point.explanation,
+                            "timestamp_seconds": point.timestamp_seconds,
+                            # Derived in application code, never trusted from
+                            # the model - guarantees it can't disagree with
+                            # timestamp_seconds.
+                            "timestamp": format_timestamp(point.timestamp_seconds),
+                        }
+                        for point in model_output.points
+                    ],
+                    "status": "ok",
+                    "usage": {
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "estimated_cost_usd": cost,
+                    },
+                }
+                if points_truncated:
+                    # The model returned more points than
+                    # _max_points_for_duration() allows for this video's
+                    # length - only the most significant ones (major over
+                    # minor) were kept.
+                    artifact["points_truncated"] = True
+
                 if on_progress is not None:
                     on_progress()
-                write_summary(
-                    folder_id,
-                    video_id,
-                    {
-                        **base_fields,
-                        "video_type": None,
-                        "summary": f"{FALLBACK_SUMMARY_SYMBOL} {fallback_summary}",
-                        "points": [],
-                        "status": "ok",
-                        "fallback_summary": True,
-                        "usage": {
-                            "input_tokens": fallback_usage.input_tokens,
-                            "output_tokens": fallback_usage.output_tokens,
-                            "estimated_cost_usd": fallback_cost,
-                        },
-                    },
-                )
+                write_summary(folder_id, video_id, artifact)
                 summarized += 1
-                continue
+                resolved = True
+                break
 
-            failed += 1
-            _write_failure_artifact(exc)
+        if resolved:
             continue
 
-        _count_usage(usage.input_tokens, usage.output_tokens)
-        cost = estimate_cost_usd(settings.summary_model, usage.input_tokens, usage.output_tokens)
+        # Every immediate attempt is now exhausted (or the last one was
+        # non-retryable) - last_exc is always set here, since the loop
+        # above only reaches this point after running at least once
+        # (needs_summarization() already excludes a video whose prior
+        # attempts already met the cap).
+        failures.append((video_id, str(last_exc)))
 
-        artifact = {
-            **base_fields,
-            "video_type": model_output.video_type,
-            "summary": model_output.summary,
-            "points": [
+        # Last resort: try once for a plain prose summary with no
+        # per-line citation to get wrong - some speakers (meandering,
+        # conversational, non-linear delivery) make the normal
+        # source_timestamp/source_anchor grounding hard even when the
+        # model clearly understood the content. Gated on fallback_eligible,
+        # not just retryable: retryable also covers rate limits/connection
+        # errors/5xx, where a different-schema call right now doesn't
+        # address the actual (provider-level) problem - fallback_eligible
+        # is reserved for content/structured-output problems with this
+        # attempt's own response, where a simpler schema is actually
+        # likely to help.
+        if last_exc.fallback_eligible:
+            try:
+                fallback_summary, fallback_usage = summarize_fallback(
+                    model_input, model=settings.summary_model, max_output_tokens=settings.summary_max_output_tokens
+                )
+            except SummarizationError as fallback_exc:
+                if fallback_exc.usage is not None:
+                    _count_usage(fallback_exc.usage.input_tokens, fallback_exc.usage.output_tokens)
+                elif fallback_exc.possibly_billed:
+                    _count_usage(input_tokens_estimate, settings.summary_max_output_tokens)
+                failed += 1
+                _write_failure_artifact(last_exc, this_attempt)
+                continue
+
+            _count_usage(fallback_usage.input_tokens, fallback_usage.output_tokens)
+            fallback_cost = estimate_cost_usd(
+                settings.summary_model, fallback_usage.input_tokens, fallback_usage.output_tokens
+            )
+            if on_progress is not None:
+                on_progress()
+            write_summary(
+                folder_id,
+                video_id,
                 {
-                    "importance": point.importance,
-                    "main_point": point.main_point,
-                    "explanation": point.explanation,
-                    "timestamp_seconds": point.timestamp_seconds,
-                    # Derived in application code, never trusted from the
-                    # model - guarantees it can't disagree with
-                    # timestamp_seconds.
-                    "timestamp": format_timestamp(point.timestamp_seconds),
-                }
-                for point in model_output.points
-            ],
-            "status": "ok",
-            "usage": {
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "estimated_cost_usd": cost,
-            },
-        }
-        if points_truncated:
-            # The model returned more points than _max_points_for_duration()
-            # allows for this video's length - only the most significant
-            # ones (major over minor) were kept.
-            artifact["points_truncated"] = True
+                    **base_fields,
+                    "attempts": this_attempt,
+                    "video_type": None,
+                    "summary": f"{FALLBACK_SUMMARY_SYMBOL} {fallback_summary}",
+                    "points": [],
+                    "status": "ok",
+                    "fallback_summary": True,
+                    "usage": {
+                        "input_tokens": fallback_usage.input_tokens,
+                        "output_tokens": fallback_usage.output_tokens,
+                        "estimated_cost_usd": fallback_cost,
+                    },
+                },
+            )
+            summarized += 1
+            continue
 
-        if on_progress is not None:
-            on_progress()
-        write_summary(folder_id, video_id, artifact)
-        summarized += 1
+        failed += 1
+        _write_failure_artifact(last_exc, this_attempt)
 
     return SummaryReport(
         eligible=eligible,

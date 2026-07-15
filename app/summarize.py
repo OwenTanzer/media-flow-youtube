@@ -204,11 +204,17 @@ class SummarizationError(RuntimeError):
     grounding check - as opposed to a provider-level problem (rate limit,
     connection error, 5xx) that's retryable in the sense that a *later*
     attempt may succeed, but where an immediate second call right now
-    can't fix anything and, for a rate limit specifically, actively makes
-    it worse. Only fallback_eligible failures are candidates for
-    summary_store.summarize_eligible()'s last-attempt fallback path
-    (summarize_fallback()); every other retryable failure just waits for
-    next_retry_at like normal, even on the final attempt."""
+    can't fix anything on its own. summarize_eligible() retries these
+    immediately, in the same run, up to summary_max_attempts_per_video
+    before falling back to summarize_fallback() (only fallback_eligible
+    failures are candidates for that) or finally recording status: "error"
+    with a next_retry_at for a later run.
+
+    rate_limited marks specifically a 429/RateLimitError - the one
+    retryable case where an immediate zero-delay retry is actively
+    counterproductive (it tends to prolong the throttling rather than
+    resolve it), so summarize_eligible() waits a short, fixed delay before
+    retrying this specific case and no other."""
 
     def __init__(
         self,
@@ -218,12 +224,14 @@ class SummarizationError(RuntimeError):
         usage: "Usage | None" = None,
         possibly_billed: bool = False,
         fallback_eligible: bool = False,
+        rate_limited: bool = False,
     ):
         super().__init__(message)
         self.retryable = retryable
         self.usage = usage
         self.possibly_billed = possibly_billed
         self.fallback_eligible = fallback_eligible
+        self.rate_limited = rate_limited
 
 
 class SummaryPoint(BaseModel):
@@ -395,12 +403,16 @@ def count_prompt_tokens(
     except (anthropic.AuthenticationError, anthropic.PermissionDeniedError):
         raise
     except anthropic.RateLimitError as exc:
-        raise SummarizationError(f"Token count rate limited: {exc}", retryable=True) from exc
+        raise SummarizationError(f"Token count rate limited: {exc}", retryable=True, rate_limited=True) from exc
     except anthropic.APIConnectionError as exc:
         raise SummarizationError(f"Token count connection error: {exc}", retryable=True) from exc
     except anthropic.APIStatusError as exc:
         retryable = exc.status_code >= 500 or exc.status_code == 429
-        raise SummarizationError(f"Token count API error ({exc.status_code}): {exc.message}", retryable=retryable) from exc
+        raise SummarizationError(
+            f"Token count API error ({exc.status_code}): {exc.message}",
+            retryable=retryable,
+            rate_limited=exc.status_code == 429,
+        ) from exc
     except anthropic.AnthropicError:
         # Anything else unanticipated (e.g. a credential-resolution
         # failure at client construction) is treated conservatively as a
@@ -586,7 +598,7 @@ def summarize_transcript(
         )
     except anthropic.RateLimitError as exc:
         # Transient - the same request will very likely succeed shortly.
-        raise SummarizationError(f"Rate limited: {exc}", retryable=True) from exc
+        raise SummarizationError(f"Rate limited: {exc}", retryable=True, rate_limited=True) from exc
     except anthropic.APIConnectionError as exc:
         # Transient network-level failure, unrelated to the request itself.
         raise SummarizationError(f"Connection error: {exc}", retryable=True) from exc
@@ -595,7 +607,9 @@ def summarize_transcript(
         # transient; 4xx other than that reflects a bad request/auth
         # problem that will recur identically on retry.
         retryable = exc.status_code >= 500 or exc.status_code == 429
-        raise SummarizationError(f"API error ({exc.status_code}): {exc.message}", retryable=retryable) from exc
+        raise SummarizationError(
+            f"API error ({exc.status_code}): {exc.message}", retryable=retryable, rate_limited=exc.status_code == 429
+        ) from exc
     except anthropic.AnthropicError as exc:
         # Catch-all for anything not already covered above (e.g. a
         # credential-resolution failure at client construction, which is
@@ -687,12 +701,14 @@ def summarize_fallback(transcript_body: str, *, model: str, max_output_tokens: i
             output_format=FallbackSummaryOutput,
         )
     except anthropic.RateLimitError as exc:
-        raise SummarizationError(f"Rate limited: {exc}", retryable=True) from exc
+        raise SummarizationError(f"Rate limited: {exc}", retryable=True, rate_limited=True) from exc
     except anthropic.APIConnectionError as exc:
         raise SummarizationError(f"Connection error: {exc}", retryable=True) from exc
     except anthropic.APIStatusError as exc:
         retryable = exc.status_code >= 500 or exc.status_code == 429
-        raise SummarizationError(f"API error ({exc.status_code}): {exc.message}", retryable=retryable) from exc
+        raise SummarizationError(
+            f"API error ({exc.status_code}): {exc.message}", retryable=retryable, rate_limited=exc.status_code == 429
+        ) from exc
     except anthropic.AnthropicError as exc:
         raise SummarizationError(f"Anthropic SDK error: {exc}", retryable=False) from exc
     except pydantic.ValidationError as exc:

@@ -671,6 +671,7 @@ def test_summarize_eligible_ignores_non_ok_index_entries(monkeypatch):
 
 
 def test_summarize_eligible_isolates_a_per_video_failure(monkeypatch):
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 1)
     written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
 
     def _raise(*a, **k):
@@ -848,34 +849,96 @@ def test_summarize_eligible_uses_a_fallback_summary_on_the_last_retryable_attemp
     assert report.total_output_tokens == 20
 
 
-def test_summarize_eligible_does_not_use_fallback_before_the_last_attempt(monkeypatch):
-    """Every earlier attempt still gets a real shot at the normal,
-    per-point-cited format first - fallback is last-resort only. Uses a
-    fallback_eligible failure so this test isolates the "not the last
-    attempt yet" gate specifically, not the eligibility gate."""
-    body = summary_store.strip_frontmatter(TRANSCRIPT_MARKDOWN)
-    current_hash = summary_store.transcript_hash(body)
+def test_summarize_eligible_uses_fallback_only_after_every_immediate_attempt_is_exhausted(monkeypatch):
+    """Retries now happen immediately within a single summarize_eligible()
+    call, in one pass, rather than one attempt per external run - every
+    immediate attempt still gets a real shot at the normal, per-point-cited
+    format first, and fallback is invoked exactly once, only after all of
+    them have failed."""
     monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 3)
-    existing_summaries = {"abc123XYZde": _existing_error(current_hash, attempts=1, retryable=True)}
     written = _stub_drive(
         monkeypatch,
         index=_INDEX_ONE_VIDEO,
         transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN},
-        existing_summaries=existing_summaries,
     )
 
+    attempt_calls = []
+
     def _raise(*a, **k):
+        attempt_calls.append(1)
         raise SummarizationError("grounding failed", retryable=True, fallback_eligible=True)
 
     monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
     fallback_calls = []
-    monkeypatch.setattr(summary_store, "summarize_fallback", lambda *a, **k: fallback_calls.append(1))
+
+    def _fallback(*a, **k):
+        fallback_calls.append(1)
+        return "fallback text", Usage(input_tokens=10, output_tokens=5)
+
+    monkeypatch.setattr(summary_store, "summarize_fallback", _fallback)
 
     report = summary_store.summarize_eligible("folder-id")
 
-    assert fallback_calls == []
+    assert len(attempt_calls) == 3
+    assert len(fallback_calls) == 1
+    assert report.summarized == 1
+    assert report.failed == 0
+    assert written["abc123XYZde.json"]["status"] == "ok"
+    assert written["abc123XYZde.json"]["fallback_summary"] is True
+    assert written["abc123XYZde.json"]["attempts"] == 3
+
+
+def test_summarize_eligible_retries_immediately_in_one_pass_and_then_succeeds(monkeypatch):
+    """Retries happen right here, within one summarize_eligible() call - a
+    video whose first two attempts fail but third succeeds must not need
+    to be summarized again on a later run to reach that success."""
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 3)
+    written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+
+    calls = []
+
+    def _flaky(*a, **k):
+        calls.append(1)
+        if len(calls) < 3:
+            raise SummarizationError("transient", retryable=True)
+        return (
+            ResolvedSummary(video_type="Bullish", summary="ok", points=[]),
+            Usage(input_tokens=100, output_tokens=50),
+            False,
+        )
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _flaky)
+    slept = []
+    monkeypatch.setattr(summary_store.time, "sleep", lambda seconds: slept.append(seconds))
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert len(calls) == 3
+    assert slept == []  # no rate limit involved - no delay between immediate retries
+    assert report.summarized == 1
+    assert report.failed == 0
+    assert written["abc123XYZde.json"]["status"] == "ok"
+    assert written["abc123XYZde.json"]["attempts"] == 3
+
+
+def test_summarize_eligible_pauses_only_for_rate_limited_retries(monkeypatch):
+    """A rate limit is the one retryable failure where an immediate,
+    zero-delay retry is actively counterproductive - it gets a short fixed
+    pause instead, still within the same in-process retry pass."""
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 2)
+    _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+
+    def _raise(*a, **k):
+        raise SummarizationError("rate limited", retryable=True, rate_limited=True)
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _raise)
+    slept = []
+    monkeypatch.setattr(summary_store.time, "sleep", lambda seconds: slept.append(seconds))
+
+    report = summary_store.summarize_eligible("folder-id")
+
+    assert slept == [summary_store._RATE_LIMIT_RETRY_DELAY_SECONDS]
     assert report.failed == 1
-    assert written["abc123XYZde.json"]["status"] == "error"
 
 
 def test_summarize_eligible_does_not_use_fallback_for_a_non_retryable_failure(monkeypatch):
@@ -1186,6 +1249,7 @@ def test_summarize_eligible_conservatively_charges_reserved_estimate_for_possibl
     _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
     monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model, video_types, video_type_descriptions: 500)
     monkeypatch.setattr(summary_store.settings, "summary_max_output_tokens", 200)
+    monkeypatch.setattr(summary_store.settings, "summary_max_attempts_per_video", 1)
 
     def _raise(*a, **k):
         raise SummarizationError("schema validation failed", retryable=True, possibly_billed=True)

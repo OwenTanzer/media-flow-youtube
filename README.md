@@ -637,44 +637,52 @@ bumps the `PROMPT_VERSION` constant in `app/summarize.py`), deliberately
 re-summarizes everything, resetting the attempt count below since it's a
 new unit of work.
 
-A failure isn't retried unconditionally forever. Each failure is classified
-`retryable` or not: rate limits, connection errors, transient malformed
-output, and failed point validation are retryable; a safety refusal is
-not, since it's deterministic for the same input and retrying just burns
-budget for a guaranteed repeat. A retryable failure keeps being retried on
-subsequent runs (`attempts` incrementing each time) until it succeeds or
-hits `SUMMARY_MAX_ATTEMPTS_PER_VIDEO` (default `3`), at which point it
-stops being retried until something changes (the transcript hash, model,
-or prompt version). A run's `SummaryReport` (logged by
-`discover_and_process.py`) includes a `retried` count - videos this run
-that had a prior non-`ok` attempt for the same transcript/model/prompt -
-separate from the `failed` count of this run's own outcomes.
+A failure isn't retried unconditionally forever, and retrying doesn't wait
+for a future run. Each failure is classified `retryable` or not: rate
+limits, connection errors, transient malformed output, and failed point
+validation are retryable; a safety refusal is not, since it's deterministic
+for the same input and retrying just burns budget for a guaranteed repeat.
+A retryable failure is retried immediately, in the same call to
+`summarize_eligible()`, up to `SUMMARY_MAX_ATTEMPTS_PER_VIDEO` (default
+`3`) attempts in one pass - there's no waiting between attempts except a
+short fixed pause (`_RATE_LIMIT_RETRY_DELAY_SECONDS`, 5 seconds) before an
+attempt that follows a rate limit specifically, since an immediate
+zero-delay retry right after a 429 tends to prolong the throttling rather
+than resolve it. Every other retryable failure (a transient connection
+blip, a citation that failed grounding) retries at once. A run's
+`SummaryReport` (logged by `discover_and_process.py`) includes a `retried`
+count - videos this run whose first attempt wasn't its only one - separate
+from the `failed` count of this run's own final outcomes.
 
-A retryable failure also records `next_retry_at`
-(`generated_at` + `SUMMARY_RETRY_BACKOFF_SECONDS`, default `900`) and isn't
-eligible again until that time passes - without this, a transient failure
-would otherwise be retried again on the very next invocation regardless of
-how recently it just failed. A non-retryable failure has no
-`next_retry_at` at all, since it isn't retried regardless of elapsed time.
+Only once every immediate attempt is exhausted (or a non-retryable failure
+ends the loop early) does a video fall through to the rare, genuinely
+deferred outcome: a `status: "error"` artifact recording `attempts` and
+`next_retry_at` (`generated_at` + `SUMMARY_RETRY_BACKOFF_SECONDS`, default
+`900`), not eligible again until that time passes. This is meant as a last
+resort for a persistent provider-level problem that survives every
+immediate attempt in this run - it is no longer the normal path a
+transient failure takes to eventually succeed. A non-retryable failure has
+no `next_retry_at` at all, since it isn't retried regardless of elapsed
+time.
 
-**Fallback summary on the last attempt.** Some speakers - meandering,
-conversational, non-linear delivery - make the per-point timestamp
-citation genuinely hard to ground even when the model clearly understood
-the content; a video like that can otherwise exhaust its retry budget and
-sit permanently as `status: "error"` with no usable output at all. When a
-retryable failure happens on a video's *last* allowed attempt, one extra
-call is made for a much simpler ask - a plain 2-3 paragraph prose summary
-of the video as a whole, with no per-line citation to get wrong. If that
-succeeds, the artifact is written as `status: "ok"` with an empty `points`
-list, `"fallback_summary": true`, and the summary text itself prefixed
-with a `⚠️` marker so it reads as visually distinct anywhere it's
-displayed, not just via that field. A non-retryable failure (e.g. a
-safety refusal) skips the fallback attempt entirely - the simpler prompt
-would very likely be refused for the same reason and isn't worth the
-extra call. If the fallback call itself fails, the video falls through to
-the normal `status: "error"` artifact exactly as it would have otherwise -
-this is a best-effort extra attempt, not a guarantee every video
-eventually gets a summary.
+**Fallback summary once every immediate attempt fails.** Some speakers -
+meandering, conversational, non-linear delivery - make the per-point
+timestamp citation genuinely hard to ground even when the model clearly
+understood the content; a video like that can otherwise exhaust its retry
+budget and sit permanently as `status: "error"` with no usable output at
+all. Once a video's immediate attempts are exhausted and the last failure
+is retryable, one extra call is made for a much simpler ask - a plain 2-3
+paragraph prose summary of the video as a whole, with no per-line citation
+to get wrong. If that succeeds, the artifact is written as `status: "ok"`
+with an empty `points` list, `"fallback_summary": true`, and the summary
+text itself prefixed with a `⚠️` marker so it reads as visually distinct
+anywhere it's displayed, not just via that field. A non-retryable failure
+(e.g. a safety refusal) skips the fallback attempt entirely - the simpler
+prompt would very likely be refused for the same reason and isn't worth
+the extra call. If the fallback call itself fails, the video falls through
+to the normal `status: "error"` artifact exactly as it would have
+otherwise - this is a best-effort extra attempt, not a guarantee every
+video eventually gets a summary.
 
 A genuine, still-broken auth/credential problem is handled differently
 from a per-video failure, deliberately - two ways:
@@ -773,10 +781,10 @@ silently retry internally for up to ~30 minutes (2 retries, each up to a
 10-minute timeout) - comfortably long enough to run past
 `DISCOVERY_LOCK_TTL_SECONDS`'s default 30-minute window with no chance to
 renew the lock in between. The app's own outer retry loop
-(`SUMMARY_MAX_ATTEMPTS_PER_VIDEO`, across scheduled runs, with the lock
-renewed before each attempt) is the sole retry authority instead - the
-same fix already applied to the Webshare proxy's internal retries in
-`app/youtube.py`.
+(`SUMMARY_MAX_ATTEMPTS_PER_VIDEO`, retried immediately within the same run,
+with the lock renewed before each attempt) is the sole retry authority
+instead - the same fix already applied to the Webshare proxy's internal
+retries in `app/youtube.py`.
 
 ## Insight dashboard (optional)
 
