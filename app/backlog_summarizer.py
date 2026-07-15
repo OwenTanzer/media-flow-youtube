@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -73,9 +74,18 @@ def _write(folder_id: str, video_id: str, artifact: dict) -> None:
     drive.upload_text_file(folder_id, f"{video_id}.json", json.dumps(artifact, indent=2, sort_keys=True), mime_type="application/json")
 
 
-def _run_one(job: _Job) -> tuple[str, str, int, int, float, str | None]:
-    """Return video id, outcome, actual usage, cost, and an optional error."""
+def _run_one(job: _Job) -> tuple[str, str, int, int, float, str | None, bool]:
+    """Return video id, outcome, actual usage, cost, an optional error, and
+    usage_known - False only for a failure where the API call may still
+    have been billed (exc.possibly_billed) but the actual token counts
+    couldn't be recovered (exc.usage is None), so the 0 tokens/cost
+    recorded here would otherwise misrepresent a genuine unknown as a
+    confirmed zero. summarize_backlog()'s ledger entry carries this flag
+    through so the admin cost/usage summary can count these as a distinct
+    "unknown billed" bucket instead of silently folding a guessed zero into
+    its total."""
     input_tokens = output_tokens = 0
+    usage_known = True
     try:
         output, usage, points_truncated = summarize_transcript(
             job.body, model=settings.summary_model, max_output_tokens=settings.summary_max_output_tokens,
@@ -85,6 +95,8 @@ def _run_one(job: _Job) -> tuple[str, str, int, int, float, str | None]:
         if exc.usage:
             input_tokens += exc.usage.input_tokens
             output_tokens += exc.usage.output_tokens
+        elif exc.possibly_billed:
+            usage_known = False
         cost = estimate_cost_usd(settings.summary_model, input_tokens, output_tokens) or 0.0
         # This per-attempt usage is also recorded in the usage ledger below
         # (app/usage_ledger.py) - that's what the admin cost/usage summary
@@ -94,10 +106,13 @@ def _run_one(job: _Job) -> tuple[str, str, int, int, float, str | None]:
         # info about this artifact's own most recent attempt.
         artifact = {
             **job.base, "status": "error", "message": str(exc),
-            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens, "estimated_cost_usd": cost},
+            "usage": {
+                "input_tokens": input_tokens, "output_tokens": output_tokens, "estimated_cost_usd": cost,
+                "usage_known": usage_known,
+            },
         }
         _write(job.summaries_folder_id, job.video_id, artifact)
-        return job.video_id, "failed", input_tokens, output_tokens, cost, str(exc)
+        return job.video_id, "failed", input_tokens, output_tokens, cost, str(exc), usage_known
 
     input_tokens += usage.input_tokens
     output_tokens += usage.output_tokens
@@ -111,12 +126,12 @@ def _run_one(job: _Job) -> tuple[str, str, int, int, float, str | None]:
         points.append(item)
     artifact = {
         **job.base, "status": "ok", "video_type": output.video_type, "summary": output.summary, "points": points,
-        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens, "estimated_cost_usd": cost},
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens, "estimated_cost_usd": cost, "usage_known": True},
     }
     if points_truncated:
         artifact["points_truncated"] = True
     _write(job.summaries_folder_id, job.video_id, artifact)
-    return job.video_id, "structured", input_tokens, output_tokens, cost, None
+    return job.video_id, "structured", input_tokens, output_tokens, cost, None, True
 
 
 def summarize_backlog(folder_id: str) -> SummaryReport:
@@ -166,29 +181,35 @@ def summarize_backlog(folder_id: str) -> SummaryReport:
         jobs.append(_Job(video_id, body, video_types, descriptions, base, summaries_folder))
 
     report.eligible = len(jobs)
-    # Collected here (in this one calling thread, after pool.map() has
-    # already drained every worker) and appended to the usage ledger in a
-    # single call below - never one append call per worker thread, which
-    # would race itself writing the same Drive file concurrently (see
-    # usage_ledger.append_entries()'s docstring).
-    ledger_entries: list[dict] = []
+    # Appended one attempt at a time, right after that attempt finishes -
+    # not collected and written once at the end - so a crash partway
+    # through a large backlog only loses the ledger entries for whatever
+    # hadn't completed yet, not every entry from every job this run already
+    # billed and wrote a summary artifact for. Each call is still made from
+    # this one thread (pool.map() yields results to its caller in this
+    # thread, not from the worker threads themselves), so this never races
+    # itself the way one append call issued directly from each worker
+    # thread would (see usage_ledger.append_entries()'s own locking, which
+    # additionally guards against a *different* concurrently-running
+    # summarize_backlog.py invocation).
     with ThreadPoolExecutor(max_workers=settings.summary_worker_concurrency) as pool:
-        for video_id, outcome, ins, outs, cost, error in pool.map(_run_one, jobs):
+        for video_id, outcome, ins, outs, cost, error, usage_known in pool.map(_run_one, jobs):
             report.input_tokens += ins
             report.output_tokens += outs
             report.estimated_cost_usd += cost
-            ledger_entries.append({
+            usage_ledger.append_entries(folder_id, [{
+                "attempt_id": uuid.uuid4().hex,
                 "video_id": video_id,
                 "outcome": "ok" if outcome == "structured" else "error",
                 "input_tokens": ins,
                 "output_tokens": outs,
                 "estimated_cost_usd": cost,
+                "usage_known": usage_known,
                 "recorded_at": datetime.now(timezone.utc).isoformat(),
-            })
+            }])
             if outcome == "structured":
                 report.summarized += 1
             else:
                 report.failed += 1
                 report.failures.append((video_id, error or "summary failed"))
-    usage_ledger.append_entries(folder_id, ledger_entries)
     return report

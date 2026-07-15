@@ -971,12 +971,42 @@ would therefore undercount real spend (the earlier attempt's tokens are
 gone) and would make "failed attempts" mean "videos currently in a failed
 state" rather than the number of attempts that actually failed over time.
 `app/backlog_summarizer.py` instead appends one ledger entry per attempt -
-success or failure - in a single batched write after each run (see
-`app/insights_store.py`'s `CostUsageSummary`), so retries and forced
-re-summarizations are each counted separately and the totals never
-decrease. The one gap: attempts made before this ledger existed aren't
-retroactively included, so totals only cover spend since this tracking
-shipped.
+success or failure - immediately after that attempt finishes, not batched
+until the end of the run, so a crash partway through a large backlog only
+loses whatever hadn't completed yet, not every entry the run had already
+billed and written a summary artifact for. `app/insights_store.py`'s
+`CostUsageSummary` sums the ledger, so retries and forced re-summarizations
+are each counted separately and the totals never decrease. The one gap:
+attempts made before this ledger existed aren't retroactively included, so
+totals only cover spend since this tracking shipped.
+
+Two more edge cases the ledger design handles explicitly:
+
+- **Concurrent writers.** `summarize_backlog.py` deliberately runs without
+  the discovery lock (see "Scheduled channel discovery" above), so two
+  overlapping invocations are possible. Appending under a dedicated
+  advisory lock (`_usage_ledger_lock.json`, reusing `app/job_lock.py`'s
+  lock mechanics with its own filename - a short TTL, since this is a
+  single small JSON read+write, not a long batch) prevents one run's
+  entries from silently clobbering another's in the read-modify-write.
+  Each entry also carries a unique `attempt_id`, so a duplicate append
+  (the same entry submitted twice) is skipped rather than double-counted.
+- **Unknown billing.** A failure can be `possibly_billed` without a
+  recoverable token count (see `SummarizationError` in `app/summarize.py`)
+  - e.g. the SDK's schema validation raising before a response is
+  accessible. Recording that as a confirmed zero would be actively
+  misleading, so it's flagged `"usage_known": false` in the ledger entry
+  instead, counted in the panel's failed-attempts total but excluded from
+  the token/cost sums - shown as a distinct "N attempt(s) may have been
+  billed but usage couldn't be recovered" caveat when nonzero, rather than
+  silently folded into an under-counted total.
+
+A corrupt `_usage_ledger.json` (unparseable, or not a JSON list) fails
+closed on the write path: `append_entries()` refuses to overwrite it and
+logs an error, rather than silently discarding whatever history it still
+held. The dashboard's read path degrades gracefully instead (an all-zero
+cost/usage summary plus a load error), consistent with how every other
+malformed-data case in `app/insights_store.py` is handled.
 
 Minor insight points are shown alongside major ones by default (major
 points bold, minor visually de-emphasized) with a "Show minor points"

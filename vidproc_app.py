@@ -206,6 +206,12 @@ def render_cost_usage_summary(cost_usage: CostUsageSummary) -> None:
         "re-summarizations each count separately, so these numbers never decrease). Only "
         "covers attempts since this tracking shipped - earlier spend isn't included."
     )
+    if cost_usage.unknown_billed_attempts:
+        st.caption(
+            f"{cost_usage.unknown_billed_attempts} failed attempt(s) may have been billed but their exact "
+            "usage couldn't be recovered - excluded from the totals above rather than counted as zero, so "
+            "the real cost is at least this much higher."
+        )
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
 

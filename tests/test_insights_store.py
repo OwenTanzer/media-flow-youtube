@@ -292,3 +292,38 @@ def test_load_snapshot_cost_usage_ignores_malformed_ledger_entries(monkeypatch):
 def test_compute_cost_usage_with_empty_ledger_returns_zeroed_summary():
     summary = insights_store._compute_cost_usage([])
     assert summary == insights_store.CostUsageSummary()
+
+
+def test_load_snapshot_cost_usage_excludes_unknown_billed_attempts_from_totals(monkeypatch):
+    """A failed attempt with usage_known=False (possibly billed, actual
+    tokens unrecoverable) must count as an attempt but not contribute a
+    guessed-zero to the token/cost totals - it's tracked separately so the
+    admin panel can flag that the total is a floor."""
+    ledger = [
+        {"video_id": "vid1", "outcome": "ok", "input_tokens": 100, "output_tokens": 50, "estimated_cost_usd": 0.001},
+        {"video_id": "vid2", "outcome": "error", "input_tokens": 0, "output_tokens": 0, "estimated_cost_usd": 0.0, "usage_known": False},
+    ]
+    _stub(monkeypatch, channels=[], index={}, ledger=ledger)
+
+    snapshot = insights_store.load_snapshot("folder-id")
+
+    assert snapshot.cost_usage.total_attempts == 2
+    assert snapshot.cost_usage.successful_attempts == 1
+    assert snapshot.cost_usage.failed_attempts == 1
+    assert snapshot.cost_usage.unknown_billed_attempts == 1
+    assert snapshot.cost_usage.total_input_tokens == 100
+    assert snapshot.cost_usage.total_estimated_cost_usd == pytest.approx(0.001)
+
+
+def test_load_snapshot_degrades_gracefully_on_corrupt_usage_ledger(monkeypatch):
+    _stub(monkeypatch, channels=[], index={})
+
+    def _raise(folder_id):
+        raise insights_store.usage_ledger.UsageLedgerCorruptError("corrupt")
+
+    monkeypatch.setattr(insights_store.usage_ledger, "read_ledger", _raise)
+
+    snapshot = insights_store.load_snapshot("folder-id")
+
+    assert snapshot.cost_usage == insights_store.CostUsageSummary()
+    assert snapshot.load_errors == ["Usage ledger (_usage_ledger.json) could not be read."]

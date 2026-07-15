@@ -73,11 +73,20 @@ class CostUsageSummary:
 
     Only counts attempts recorded since the usage ledger started being
     written (i.e. since this feature shipped) - any Claude spend from
-    before that isn't included in these totals."""
+    before that isn't included in these totals.
+
+    unknown_billed_attempts counts failed attempts where the API call may
+    still have been billed (SummarizationError.possibly_billed) but the
+    actual token usage couldn't be recovered - app/backlog_summarizer.py
+    marks these "usage_known": False rather than recording a confirmed
+    zero. Their tokens/cost are deliberately excluded from the totals
+    below (a guessed zero would be worse than an explicit "unknown"), so
+    total_estimated_cost_usd is a floor when this is nonzero, not exact."""
 
     total_attempts: int = 0
     successful_attempts: int = 0
     failed_attempts: int = 0
+    unknown_billed_attempts: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_estimated_cost_usd: float = 0.0
@@ -174,6 +183,20 @@ def _compute_cost_usage(ledger_entries: list[dict]) -> CostUsageSummary:
     for entry in ledger_entries:
         if not isinstance(entry, dict):
             continue
+        outcome = entry.get("outcome")
+        if outcome not in ("ok", "error"):
+            continue
+
+        if entry.get("usage_known", True) is False:
+            # Billed status is genuinely unknown for this attempt (see
+            # SummarizationError.possibly_billed in app/summarize.py) -
+            # count the attempt, but don't fold a guessed zero into the
+            # token/cost totals below.
+            summary.total_attempts += 1
+            summary.failed_attempts += 1
+            summary.unknown_billed_attempts += 1
+            continue
+
         input_tokens = entry.get("input_tokens")
         output_tokens = entry.get("output_tokens")
         cost = entry.get("estimated_cost_usd")
@@ -181,9 +204,9 @@ def _compute_cost_usage(ledger_entries: list[dict]) -> CostUsageSummary:
             continue
 
         summary.total_attempts += 1
-        if entry.get("outcome") == "ok":
+        if outcome == "ok":
             summary.successful_attempts += 1
-        elif entry.get("outcome") == "error":
+        else:
             summary.failed_attempts += 1
         summary.total_input_tokens += input_tokens
         summary.total_output_tokens += output_tokens
@@ -243,7 +266,16 @@ def load_snapshot(folder_id: str) -> InsightsSnapshot:
 
         videos.append(insight)
 
-    cost_usage = _compute_cost_usage(usage_ledger.read_ledger(folder_id))
+    try:
+        ledger_entries = usage_ledger.read_ledger(folder_id)
+    except usage_ledger.UsageLedgerCorruptError as exc:
+        # A read-only display path (unlike append_entries(), which fails
+        # closed and refuses to write) - degrade to an all-zero summary
+        # rather than crashing the whole dashboard over a corrupt ledger.
+        logger.warning("Usage ledger could not be read: %s", exc)
+        load_errors.append("Usage ledger (_usage_ledger.json) could not be read.")
+        ledger_entries = []
+    cost_usage = _compute_cost_usage(ledger_entries)
 
     return InsightsSnapshot(
         videos=videos,
