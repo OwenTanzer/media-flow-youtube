@@ -3,9 +3,19 @@ import requests
 
 from app.channel_store import Channel
 from app.discovery import DiscoveryReport
+from app.group_store import Group
 from vidproc import admin
 
 VALID_CHANNEL_ID = "UC1234567890123456789012"  # UC + 22 chars
+
+
+def _stub_groups(monkeypatch, *, existing=()):
+    monkeypatch.setattr(admin.group_store, "read_groups", lambda folder_id: list(existing))
+    written = {}
+    monkeypatch.setattr(
+        admin.group_store, "write_groups", lambda folder_id, groups: written.setdefault("groups", groups)
+    )
+    return written
 
 
 def test_check_admin_token_accepts_matching_token():
@@ -23,24 +33,52 @@ def test_check_admin_token_rejects_when_nothing_configured():
     assert admin.check_admin_token("", "") is False
 
 
-def test_resolve_group_selection_returns_an_existing_group_verbatim():
-    assert admin.resolve_group_selection("Google", "") == "Google"
+def test_resolve_group_selection_returns_an_existing_group_verbatim(monkeypatch):
+    written = _stub_groups(monkeypatch)
+    assert admin.resolve_group_selection("folder-id", "Google", "", []) == "Google"
+    assert "groups" not in written  # no Drive write for an existing group
 
 
-def test_resolve_group_selection_creates_a_new_group_when_explicitly_chosen():
-    assert admin.resolve_group_selection(admin.NEW_GROUP_OPTION, "Crypto") == "Crypto"
+def test_resolve_group_selection_creates_a_new_group_when_explicitly_chosen(monkeypatch):
+    written = _stub_groups(monkeypatch)
+    result = admin.resolve_group_selection("folder-id", admin.NEW_GROUP_OPTION, "Crypto", ["Market Update"])
+    assert result == "Crypto"
+    assert written["groups"] == [Group(name="Crypto", video_types=["Market Update"])]
 
 
-def test_resolve_group_selection_strips_the_new_group_name():
-    assert admin.resolve_group_selection(admin.NEW_GROUP_OPTION, "  Crypto  ") == "Crypto"
+def test_create_group_strips_name_and_video_types(monkeypatch):
+    written = _stub_groups(monkeypatch)
+    group = admin.create_group("folder-id", "  Crypto  ", ["  Market Update  ", "  "])
+    assert group == Group(name="Crypto", video_types=["Market Update"])
+    assert written["groups"] == [group]
 
 
-def test_resolve_group_selection_rejects_a_blank_new_group_name():
-    """Regression test for the whole point of this function: "create a
-    new group" with nothing typed isn't a valid choice - it must not
-    silently fall back to some default group."""
-    with pytest.raises(ValueError, match="Enter a name for the new group"):
-        admin.resolve_group_selection(admin.NEW_GROUP_OPTION, "   ")
+def test_create_group_rejects_a_blank_name(monkeypatch):
+    _stub_groups(monkeypatch)
+    with pytest.raises(ValueError, match="Group name is required"):
+        admin.create_group("folder-id", "   ", ["Tutorial"])
+
+
+def test_create_group_rejects_no_non_blank_video_types(monkeypatch):
+    """Regression test for the whole point of this function: a new group
+    with no video types isn't a valid choice - it must not silently fall
+    back to the finance-flavored default categories."""
+    _stub_groups(monkeypatch)
+    with pytest.raises(ValueError, match="At least one video type is required"):
+        admin.create_group("folder-id", "Crypto", ["  ", ""])
+
+
+def test_create_group_rejects_an_already_registered_name(monkeypatch):
+    _stub_groups(monkeypatch, existing=[Group(name="Google", video_types=["Tutorial"])])
+    with pytest.raises(ValueError, match="'Google' is already registered"):
+        admin.create_group("folder-id", "Google", ["Something"])
+
+
+def test_create_group_preserves_existing_groups(monkeypatch):
+    existing_group = Group(name="Google", video_types=["Tutorial"])
+    written = _stub_groups(monkeypatch, existing=[existing_group])
+    admin.create_group("folder-id", "Crypto", ["Market Update"])
+    assert written["groups"] == [existing_group, Group(name="Crypto", video_types=["Market Update"])]
 
 
 def _stub(monkeypatch, *, existing, lock_token="the-token", backfill_report=None, feed_ok=True):

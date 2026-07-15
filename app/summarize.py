@@ -21,11 +21,13 @@ logger = logging.getLogger("media_flow.summarize")
 # changes. Deliberately a code constant, not an env var - drifting it
 # independently of the prompt text would corrupt the idempotency check in
 # summary_store.needs_summarization().
-PROMPT_VERSION = "v6"
+PROMPT_VERSION = "v7"
 
-# Convenience tuple for callers/tests - must be kept in sync with
-# ModelSummaryOutput.video_type's Literal values below.
-VIDEO_TYPES = ("Post-Market Update", "Thesis Piece", "Analytic Overview", "Pre-Market Brief")
+# Used when a video's group has no video_types configured at all (see
+# app/group_store.py) - preserves the original, pre-group-configuration
+# classification taxonomy so a deployment with no groups.json set up
+# behaves exactly as it did before groups could configure this themselves.
+FALLBACK_VIDEO_TYPES = ["Post-Market Update", "Pre-Market Brief", "Thesis Piece", "Analytic Overview"]
 
 # Upper bound on how many points the model may return, scaling with video
 # length but never exceeding _MAX_POINTS_CEILING - without this, a very
@@ -41,7 +43,8 @@ def _max_points_for_duration(duration_seconds: int) -> int:
     return max(1, min(_MAX_POINTS_CEILING, duration_seconds // _POINT_INTERVAL_SECONDS))
 
 
-def _build_system_prompt(max_points: int) -> str:
+def _build_system_prompt(max_points: int, video_types: list[str]) -> str:
+    types_list = ", ".join(f'"{t}"' for t in video_types)
     return f"""You are extracting structured, timestamped insights from a YouTube video transcript.
 
 Identify the transcript-supported major and minor points made in the video. Include at most {max_points} points - however many major/minor points are actually present in the video's substantive content, up to that limit. A short, thin video may have only one or two points; a long, information-dense video may have many, up to {max_points}. Do not pad the list to hit a target count. If the video's substantive content exceeds {max_points} distinguishable points, select only the {max_points} most significant ones (favoring "major" points over "minor" ones) rather than trying to cram in everything - do not omit real content to keep the list short otherwise.
@@ -60,12 +63,7 @@ Many videos (livestreams especially) revisit the same topic more than once - e.g
 Be concise and factual. State uncertainty explicitly (e.g. "the speaker suggests..." vs "the speaker states...") rather than presenting an inference as a stated fact. Do not include information not supported by the transcript text.
 
 Also provide:
-- "video_type": classify the video as exactly one of "Post-Market Update", "Pre-Market Brief", "Thesis Piece", or "Analytic Overview".
-  - "Post-Market Update": a recap/review of a trading session or period that has already happened.
-  - "Pre-Market Brief": forward-looking commentary or a plan for a session/period that hasn't happened yet.
-  - "Thesis Piece": an in-depth case for or against a single specific idea, asset, or claim.
-  - "Analytic Overview": a broader technical/analytical walkthrough across multiple assets or topics, not tied to a single specific thesis or session (e.g. a live multi-asset chart-reading session).
-  If more than one could apply, pick whichever describes the video's primary purpose.
+- "video_type": classify the video as exactly one of {types_list}. If more than one could apply, pick whichever describes the video's primary purpose.
 - "summary": one to three sentences summarizing the video as a whole.
 """
 
@@ -225,9 +223,11 @@ class SummaryPoint(BaseModel):
     source_anchor: str = Field(min_length=1)
 
 
-class ModelSummaryOutput(BaseModel):
-    """Only the fields the model is trusted to produce. Everything else in
-    the persisted artifact (title, author, url, source ids, hash, model,
+class _ModelSummaryOutputBase(BaseModel):
+    """Every field the model is trusted to produce except video_type,
+    which is bound dynamically per call by _build_model_output_schema()
+    below - see that function's docstring. Everything else in the
+    persisted artifact (title, author, url, source ids, hash, model,
     prompt_version, display timestamps, usage, status) is filled in or
     derived by application code from the known source artifact - see
     summary_store.py. In particular, points' timestamp_seconds and the
@@ -239,9 +239,21 @@ class ModelSummaryOutput(BaseModel):
     default rules despite the output contract requiring actual timestamped
     insights, so without these an empty summary would be accepted as "ok"."""
 
-    video_type: Literal["Post-Market Update", "Thesis Piece", "Analytic Overview", "Pre-Market Brief"]
     summary: str = Field(min_length=1)
     points: list[SummaryPoint] = Field(min_length=1)
+
+
+def _build_model_output_schema(video_types: list[str]) -> type[_ModelSummaryOutputBase]:
+    """Builds a ModelSummaryOutput schema whose video_type field is a
+    Literal constrained to exactly this call's video_types (see
+    app/group_store.py - each dashboard group configures its own
+    classification categories, so this can no longer be a single fixed
+    class with a hardcoded Literal). Rebuilt per call rather than cached,
+    since video_types varies by the video's group."""
+
+    return pydantic.create_model(
+        "ModelSummaryOutput", __base__=_ModelSummaryOutputBase, video_type=(Literal[tuple(video_types)], ...)
+    )
 
 
 class FallbackSummaryOutput(BaseModel):
@@ -312,13 +324,16 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
     return (input_tokens / 1_000_000) * input_price + (output_tokens / 1_000_000) * output_price
 
 
-def count_prompt_tokens(transcript_body: str, *, model: str) -> int:
+def count_prompt_tokens(transcript_body: str, *, model: str, video_types: list[str] | None = None) -> int:
     """Real input token count for this exact prompt (system prompt + output
     schema overhead + the transcript itself) via the Anthropic token-
     counting endpoint - used to reserve accurate per-run budget before a
     call, replacing an earlier chars-per-token heuristic that both
     excluded the system prompt/schema and wasn't a true upper bound either
-    way.
+    way. video_types (the video's group's configured classification
+    categories - see app/group_store.py) affects the exact prompt text and
+    output schema, and so the real token count too; defaults to
+    FALLBACK_VIDEO_TYPES when not given.
 
     A genuine, still-broken credential problem (AuthenticationError /
     PermissionDeniedError - the key is present but invalid/expired/lacks
@@ -338,14 +353,15 @@ def count_prompt_tokens(transcript_body: str, *, model: str) -> int:
     video with no durable retry state, the way an unconditional re-raise
     would."""
 
+    video_types = video_types or FALLBACK_VIDEO_TYPES
     max_points = _max_points_for_duration(_max_transcript_seconds(transcript_body))
     try:
         client = anthropic.Anthropic(max_retries=_CLIENT_MAX_RETRIES)
         result = client.messages.count_tokens(
             model=model,
-            system=_build_system_prompt(max_points),
+            system=_build_system_prompt(max_points, video_types),
             messages=[{"role": "user", "content": transcript_body}],
-            output_format=ModelSummaryOutput,
+            output_format=_build_model_output_schema(video_types),
         )
     except (anthropic.AuthenticationError, anthropic.PermissionDeniedError):
         raise
@@ -504,7 +520,7 @@ def _select_significant_points(points: list[ResolvedPoint], max_points: int) -> 
 
 
 def summarize_transcript(
-    transcript_body: str, *, model: str, max_output_tokens: int
+    transcript_body: str, *, model: str, max_output_tokens: int, video_types: list[str] | None = None
 ) -> tuple[ResolvedSummary, Usage, bool]:
     """Calls Claude to produce a ResolvedSummary for one transcript (the
     model itself produces a ModelSummaryOutput; _resolve_points() verifies
@@ -513,18 +529,26 @@ def summarize_transcript(
     output - never raises a raw SDK exception, so callers don't need to know
     the SDK's exception hierarchy. Returns (output, usage, points_truncated) -
     points_truncated is True if _select_significant_points() had to drop
-    points to enforce the length-based cap."""
+    points to enforce the length-based cap.
 
+    video_types is the video's group's configured classification categories
+    (see app/group_store.py) - defaults to FALLBACK_VIDEO_TYPES
+    when not given. summary_store.summarize_eligible() always resolves and
+    passes the real per-video value; the default here exists for callers
+    (and tests) that don't care about this dimension."""
+
+    video_types = video_types or FALLBACK_VIDEO_TYPES
     max_points = _max_points_for_duration(_max_transcript_seconds(transcript_body))
+    output_schema = _build_model_output_schema(video_types)
 
     try:
         client = anthropic.Anthropic(max_retries=_CLIENT_MAX_RETRIES)
         response = client.messages.parse(
             model=model,
             max_tokens=max_output_tokens,
-            system=_build_system_prompt(max_points),
+            system=_build_system_prompt(max_points, video_types),
             messages=[{"role": "user", "content": transcript_body}],
-            output_format=ModelSummaryOutput,
+            output_format=output_schema,
         )
     except anthropic.RateLimitError as exc:
         # Transient - the same request will very likely succeed shortly.

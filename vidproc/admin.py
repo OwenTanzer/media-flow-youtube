@@ -14,10 +14,11 @@ from dataclasses import dataclass
 
 import requests
 
-from app import channel_store, discovery, job_lock
+from app import channel_store, discovery, group_store, job_lock
 from app.channel_store import Channel
 from app.config import settings
 from app.discovery import DiscoveryReport
+from app.group_store import Group
 
 logger = logging.getLogger("media_flow.vidproc_admin")
 
@@ -67,23 +68,51 @@ def check_admin_token(entered: str, configured: str | None) -> bool:
     return secrets.compare_digest(entered, configured)
 
 
-def resolve_group_selection(selected: str, new_group_name: str) -> str:
+def create_group(folder_id: str, name: str, video_types: list[str]) -> Group:
+    """Registers a new group in groups.json with its own video_type
+    classification categories (see app/group_store.py, app/summarize.py) -
+    every dashboard group needs its own list, since the finance-flavored
+    default categories (see summarize.FALLBACK_VIDEO_TYPES) don't make
+    sense for e.g. a "Google" group's product/tutorial content.
+
+    Raises ValueError for a blank name, no non-blank video_types, or a
+    name that's already registered."""
+
+    name = name.strip()
+    if not name:
+        raise ValueError("Group name is required.")
+    cleaned_types = [t.strip() for t in video_types if t.strip()]
+    if not cleaned_types:
+        raise ValueError(f"At least one video type is required for the new group {name!r}.")
+
+    existing = group_store.read_groups(folder_id)
+    if any(g.name == name for g in existing):
+        raise ValueError(f"Group {name!r} is already registered.")
+
+    new_group = Group(name=name, video_types=cleaned_types)
+    group_store.write_groups(folder_id, [*existing, new_group])
+    return new_group
+
+
+def resolve_group_selection(folder_id: str, selected: str, new_group_name: str, new_group_video_types: list[str]) -> str:
     """Resolves the admin panel's group selectbox into the actual `group`
     value to pass to add_channel_and_backfill(). Picking an existing
-    group from the selectbox returns it verbatim - a new group is only
-    ever created when NEW_GROUP_OPTION was explicitly selected, making
-    that a conscious choice rather than something a typo in a free-text
-    field could trigger by accident.
+    group from the selectbox returns it verbatim, with no Drive write - a
+    new group is only ever created when NEW_GROUP_OPTION was explicitly
+    selected, making that (and specifying its video_types) a conscious
+    choice rather than something a typo in a free-text field could
+    trigger by accident.
 
-    Raises ValueError if NEW_GROUP_OPTION was selected but new_group_name
-    is blank - "create a new group" with no name isn't a valid choice."""
+    When NEW_GROUP_OPTION is selected, this creates the group (see
+    create_group() - same ValueError cases apply: blank name, no
+    non-blank video_types, or an already-registered name) before
+    returning its name, so the group exists by the time
+    add_channel_and_backfill() references it."""
 
     if selected != NEW_GROUP_OPTION:
         return selected
-    new_group_name = new_group_name.strip()
-    if not new_group_name:
-        raise ValueError("Enter a name for the new group, or pick an existing one from the list instead.")
-    return new_group_name
+    new_group = create_group(folder_id, new_group_name, new_group_video_types)
+    return new_group.name
 
 
 def add_channel_and_backfill(

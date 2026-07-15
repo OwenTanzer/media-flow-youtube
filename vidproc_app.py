@@ -232,15 +232,23 @@ def render_admin_panel(folder_id: str, channels: list) -> None:
         "Group", options=[*groups_for_channels(channels), NEW_GROUP_OPTION], key="admin-channel-group-choice"
     )
     new_group_name = ""
+    new_group_video_types_raw = ""
     if group_choice == NEW_GROUP_OPTION:
         new_group_name = st.text_input("New group name", key="admin-channel-new-group")
+        new_group_video_types_raw = st.text_input(
+            "Video types for this new group, comma-separated",
+            key="admin-channel-new-group-video-types",
+            help='e.g. "Short Showcase, Tutorial" - the classification categories used when summarizing '
+            "videos in this group (see the Finance group's own categories for an example).",
+        )
 
     languages_raw = st.text_input("Languages, comma-separated (optional)", key="admin-channel-languages")
 
     if st.button("Add channel", key="admin-add-channel"):
         languages = languages_raw.split(",") if languages_raw.strip() else None
+        new_group_video_types = new_group_video_types_raw.split(",") if new_group_video_types_raw.strip() else []
         try:
-            group = resolve_group_selection(group_choice, new_group_name)
+            group = resolve_group_selection(folder_id, group_choice, new_group_name, new_group_video_types)
             result = add_channel_and_backfill(
                 folder_id,
                 channel_id=channel_id,

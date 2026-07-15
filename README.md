@@ -494,13 +494,45 @@ Claude only produces `video_type`, `summary`, and each point's
 `importance`, `main_point`, `explanation`, `source_timestamp`, and
 `source_anchor`, constrained by a JSON schema (`output_config.format`) so
 the response is always valid JSON with no Markdown fences or surrounding
-prose. `video_type` is one of exactly four categories - `"Post-Market Update"`,
-`"Pre-Market Brief"`, `"Thesis Piece"`, or `"Analytic Overview"` - enforced
-by the schema itself (a `Literal`, not a free-text field), so an
-unrecognized classification is rejected the same way a missing field
-would be. Every string field and the `points` list itself also require at
-least one character/item, since an empty response is otherwise
-schema-valid despite not being a usable summary.
+prose. `video_type`'s allowed categories are **per-group**, not fixed -
+see "Per-group video types (groups.json)" below - but still enforced by
+the schema itself for whichever group applies (a `Literal` built
+dynamically per call, not a free-text field), so an unrecognized
+classification is rejected the same way a missing field would be. Every
+string field and the `points` list itself also require at least one
+character/item, since an empty response is otherwise schema-valid
+despite not being a usable summary.
+
+### Per-group video types (groups.json)
+
+Each dashboard group (see "group" in `channels.json` above) has its own
+`video_type` classification taxonomy - the finance-flavored default
+categories (`"Post-Market Update"`, `"Pre-Market Brief"`, `"Thesis
+Piece"`, `"Analytic Overview"`) don't make sense for, say, a "Google"
+group's product/tutorial content. Configure this in `groups.json` in the
+same Drive folder:
+
+```json
+{
+  "version": 1,
+  "groups": [
+    {"name": "Finance", "video_types": ["Post-Market Update", "Pre-Market Brief", "Thesis Piece", "Analytic Overview"]},
+    {"name": "Google", "video_types": ["Short Showcase", "Tutorial"]}
+  ]
+}
+```
+
+A group with no entry here (or an empty `video_types` list) falls back
+to `DEFAULT_GROUP`'s (Finance's) configured list, and finally to the
+hardcoded default categories above if neither has anything configured at
+all - so a deployment with no `groups.json` set up behaves exactly as it
+did before this feature existed. The Admin tab's "+ Create a new group"
+flow (see "Admin panel" below) requires specifying at least one video
+type up front, so a new group is never left unconfigured by accident.
+
+Changing a group's `video_types` only affects videos summarized
+*afterward* - it's not retroactive, and doesn't itself force
+re-summarization of anything already archived.
 
 **`timestamp_seconds` is never trusted from the model at all - not even as
 a self-reported number.** An earlier version asked the model to compute
@@ -778,7 +810,10 @@ explicit "+ Create a new group..." option - not free text. Creating a
 new top-level tab is therefore always a conscious choice: picking an
 existing group can never accidentally spawn a new one via a typo (e.g.
 "Goggle" vs "Google"), since choosing that option requires separately
-typing and confirming the new group's name.
+typing and confirming the new group's name - and its `video_types` (see
+"Per-group video types (groups.json)" above): a new group can't be
+created without specifying at least one classification category up
+front, so it's never left unconfigured.
 
 This is a shared-secret bearer token compared with a constant-time
 check (`secrets.compare_digest`), not a real user/password auth system -
@@ -907,7 +942,8 @@ app/
   youtube.py        URL parsing, transcript fetch, oEmbed title lookup, Markdown rendering
   drive.py          Drive upload/read + generic Drive file helpers
   queue_store.py    queue.json read/write helpers (plain URLs or {"url","languages","first_seen_at"} entries)
-  channel_store.py  channels.json read helper (the discovery source registry)
+  channel_store.py  channels.json read/write helper (the discovery source registry)
+  group_store.py    groups.json read/write helper (each group's video_type classification categories)
   discovery.py      RSS feed fetch/parse + discover_and_enqueue(): queues unseen uploads
   job_lock.py       Drive-based advisory lock preventing overlapping discovery runs
   summarize.py      Claude model call: transcript -> structured, schema-validated summary

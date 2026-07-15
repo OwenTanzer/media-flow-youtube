@@ -16,7 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from . import drive
+from . import channel_store, drive, group_store
+from .channel_store import DEFAULT_GROUP, resolve_group
 from .config import settings
 from .summarize import (
     PROMPT_VERSION,
@@ -315,6 +316,16 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
     index = drive.read_index(folder_id)
     ok_entries = [(video_id, entry) for video_id, entry in index.items() if entry.get("status") == "ok"]
 
+    # Resolved once per run, not per video - each video's channel_id maps
+    # to its channels.json group, and each group maps to its configured
+    # video_types (app/group_store.py), the classification categories
+    # used to build that video's system prompt/output schema. A video
+    # whose channel_id is missing or doesn't match any configured channel
+    # falls back to DEFAULT_GROUP, same as the dashboard (app/insights_store.py)
+    # treats an unresolvable channel_id.
+    group_by_channel_id = {c.channel_id: resolve_group(c) for c in channel_store.read_channels(folder_id)}
+    groups = group_store.read_groups(folder_id)
+
     eligible = 0
     skipped_current = 0
     summarized = 0
@@ -347,6 +358,9 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
         if markdown is None:
             logger.warning("Transcript file for %s (%r) is missing; skipping.", video_id, filename)
             continue
+
+        group_name = group_by_channel_id.get(entry.get("channel_id"), DEFAULT_GROUP)
+        video_types = group_store.get_video_types(groups, group_name, DEFAULT_GROUP)
 
         full_body = strip_frontmatter(markdown)
         # Hash the complete transcript, before any truncation - otherwise a
@@ -435,7 +449,7 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
         # SummarizationError instead, so a blip on this endpoint doesn't
         # abort the whole run and skip every remaining video.
         try:
-            input_tokens_estimate = count_prompt_tokens(model_input, model=settings.summary_model)
+            input_tokens_estimate = count_prompt_tokens(model_input, model=settings.summary_model, video_types=video_types)
         except SummarizationError as exc:
             failed += 1
             failures.append((video_id, str(exc)))
@@ -483,7 +497,10 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
 
         try:
             model_output, usage, points_truncated = summarize_transcript(
-                model_input, model=settings.summary_model, max_output_tokens=settings.summary_max_output_tokens
+                model_input,
+                model=settings.summary_model,
+                max_output_tokens=settings.summary_max_output_tokens,
+                video_types=video_types,
             )
         except SummarizationError as exc:
             failures.append((video_id, str(exc)))

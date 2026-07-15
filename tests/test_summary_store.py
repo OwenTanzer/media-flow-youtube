@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 import pytest
 
 from app import summary_store
+from app.channel_store import Channel
+from app.group_store import Group
 from app.summarize import ResolvedPoint, ResolvedSummary, SummarizationError, Usage
 
 
@@ -152,7 +154,7 @@ def _stub_drive(monkeypatch, *, index, transcripts, existing_summaries=None):
     monkeypatch.setattr(summary_store.drive, "upload_text_file", _upload_text_file)
     # A small, fixed, real-looking token count by default - individual
     # tests override this via monkeypatch when they care about the value.
-    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model: 100)
+    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model, video_types: 100)
     return written
 
 
@@ -300,6 +302,78 @@ _INDEX_ONE_VIDEO = {
 }
 
 
+def test_summarize_eligible_resolves_video_types_from_the_videos_channel_and_group(monkeypatch):
+    """Regression test for the whole point of per-group video_types: a
+    video's channel_id must resolve to its channels.json group, and that
+    group's configured video_types (app/group_store.py) is what actually
+    gets passed to the model call - not always the fallback list."""
+    index_with_channel = {"abc123XYZde": {**_INDEX_ONE_VIDEO["abc123XYZde"], "channel_id": "UC_google"}}
+    _stub_drive(monkeypatch, index=index_with_channel, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+    monkeypatch.setattr(
+        summary_store.channel_store,
+        "read_channels",
+        lambda folder_id: [Channel("UC_google", "Google Channel", group="Google")],
+    )
+    monkeypatch.setattr(
+        summary_store.group_store,
+        "read_groups",
+        lambda folder_id: [Group(name="Google", video_types=["Tutorial", "Short Showcase"])],
+    )
+
+    captured = {}
+
+    def _fake_summarize_transcript(body, model, max_output_tokens, video_types):
+        captured["video_types"] = video_types
+        return (
+            ResolvedSummary(
+                video_type="Tutorial",
+                summary="S.",
+                points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)],
+            ),
+            Usage(input_tokens=1, output_tokens=1),
+            False,
+        )
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _fake_summarize_transcript)
+
+    summary_store.summarize_eligible("folder-id")
+
+    assert captured["video_types"] == ["Tutorial", "Short Showcase"]
+
+
+def test_summarize_eligible_falls_back_to_default_group_video_types_for_an_unresolvable_channel(monkeypatch):
+    """A video whose channel_id is missing or doesn't match any configured
+    channel falls back to DEFAULT_GROUP's video_types, same as the
+    dashboard (app/insights_store.py) treats an unresolvable channel_id."""
+    _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
+    monkeypatch.setattr(summary_store.channel_store, "read_channels", lambda folder_id: [])
+    monkeypatch.setattr(
+        summary_store.group_store,
+        "read_groups",
+        lambda folder_id: [Group(name=summary_store.DEFAULT_GROUP, video_types=["Custom Finance Type"])],
+    )
+
+    captured = {}
+
+    def _fake_summarize_transcript(body, model, max_output_tokens, video_types):
+        captured["video_types"] = video_types
+        return (
+            ResolvedSummary(
+                video_type="Custom Finance Type",
+                summary="S.",
+                points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)],
+            ),
+            Usage(input_tokens=1, output_tokens=1),
+            False,
+        )
+
+    monkeypatch.setattr(summary_store, "summarize_transcript", _fake_summarize_transcript)
+
+    summary_store.summarize_eligible("folder-id")
+
+    assert captured["video_types"] == ["Custom Finance Type"]
+
+
 def test_summarize_eligible_summarizes_a_newly_eligible_video(monkeypatch):
     written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
 
@@ -309,7 +383,7 @@ def test_summarize_eligible_summarizes_a_newly_eligible_video(monkeypatch):
         points=[ResolvedPoint(importance="major", main_point="Point", explanation="Because.", timestamp_seconds=0)],
     )
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=10, output_tokens=5), False)
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens, video_types: (output, Usage(input_tokens=10, output_tokens=5), False)
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -353,7 +427,7 @@ def test_summarize_eligible_surfaces_video_published_at_from_the_index(monkeypat
     monkeypatch.setattr(
         summary_store,
         "summarize_transcript",
-        lambda body, model, max_output_tokens: (output, Usage(input_tokens=10, output_tokens=5), False),
+        lambda body, model, max_output_tokens, video_types: (output, Usage(input_tokens=10, output_tokens=5), False),
     )
 
     summary_store.summarize_eligible("folder-id")
@@ -378,7 +452,7 @@ def test_summarize_eligible_surfaces_channel_id_from_the_index(monkeypatch):
     monkeypatch.setattr(
         summary_store,
         "summarize_transcript",
-        lambda body, model, max_output_tokens: (output, Usage(input_tokens=10, output_tokens=5), False),
+        lambda body, model, max_output_tokens, video_types: (output, Usage(input_tokens=10, output_tokens=5), False),
     )
 
     summary_store.summarize_eligible("folder-id")
@@ -445,7 +519,7 @@ def test_summarize_eligible_hash_reflects_content_beyond_the_truncation_cutoff(m
     )
     output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens, video_types: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -583,7 +657,7 @@ def test_summarize_eligible_counts_a_retry_and_increments_attempts(monkeypatch):
     )
     output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens, video_types: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -786,7 +860,7 @@ def test_summarize_eligible_stops_at_max_videos_per_run(monkeypatch):
 
     output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens, video_types: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -844,7 +918,7 @@ def test_summarize_eligible_stops_on_budget_when_remaining_headroom_runs_out(mon
         for i in range(2)
     }
     _stub_drive(monkeypatch, index=index, transcripts={f"vid{i}.md": TRANSCRIPT_MARKDOWN for i in range(2)})
-    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model: 100)
+    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model, video_types: 100)
     monkeypatch.setattr(summary_store.settings, "summary_max_output_tokens", 100)
     # One call's reserved cost (100 input + 100 output tokens) is ~$0.0006 -
     # comfortably under this cap on its own, but two calls' worth isn't.
@@ -854,7 +928,7 @@ def test_summarize_eligible_stops_on_budget_when_remaining_headroom_runs_out(mon
     monkeypatch.setattr(
         summary_store,
         "summarize_transcript",
-        lambda body, model, max_output_tokens: (output, Usage(input_tokens=100, output_tokens=100), False),
+        lambda body, model, max_output_tokens, video_types: (output, Usage(input_tokens=100, output_tokens=100), False),
     )
 
     report = summary_store.summarize_eligible("folder-id")
@@ -889,7 +963,7 @@ def test_summarize_eligible_calls_on_progress_before_model_call_and_before_write
     _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
     output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens, video_types: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     calls = []
@@ -909,7 +983,7 @@ def test_summarize_eligible_does_not_write_if_lock_is_lost_before_the_write(monk
     written = _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
     output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
-        summary_store, "summarize_transcript", lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False)
+        summary_store, "summarize_transcript", lambda body, model, max_output_tokens, video_types: (output, Usage(input_tokens=1, output_tokens=1), False)
     )
 
     calls = []
@@ -978,7 +1052,7 @@ def test_summarize_eligible_conservatively_charges_reserved_estimate_for_possibl
     failures like this could otherwise let real spend exceed the
     configured cap with nothing to show for it in our own totals."""
     _stub_drive(monkeypatch, index=_INDEX_ONE_VIDEO, transcripts={"A Title [abc123XYZde].md": TRANSCRIPT_MARKDOWN})
-    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model: 500)
+    monkeypatch.setattr(summary_store, "count_prompt_tokens", lambda body, model, video_types: 500)
     monkeypatch.setattr(summary_store.settings, "summary_max_output_tokens", 200)
 
     def _raise(*a, **k):
@@ -1069,7 +1143,7 @@ def test_summarize_eligible_records_points_truncated_flag(monkeypatch):
     monkeypatch.setattr(
         summary_store,
         "summarize_transcript",
-        lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), True),
+        lambda body, model, max_output_tokens, video_types: (output, Usage(input_tokens=1, output_tokens=1), True),
     )
 
     summary_store.summarize_eligible("folder-id")
@@ -1085,7 +1159,7 @@ def test_summarize_eligible_omits_points_truncated_flag_when_not_truncated(monke
     monkeypatch.setattr(
         summary_store,
         "summarize_transcript",
-        lambda body, model, max_output_tokens: (output, Usage(input_tokens=1, output_tokens=1), False),
+        lambda body, model, max_output_tokens, video_types: (output, Usage(input_tokens=1, output_tokens=1), False),
     )
 
     summary_store.summarize_eligible("folder-id")
