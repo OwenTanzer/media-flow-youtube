@@ -23,6 +23,14 @@ import streamlit as st
 
 from app.config import ConfigError, settings
 from app.insights_store import InsightsSnapshot, load_snapshot
+from vidproc.admin import (
+    NEW_GROUP_OPTION,
+    ChannelAlreadyExistsError,
+    add_channel_and_backfill,
+    admin_flash_for,
+    check_admin_token,
+    resolve_group_selection,
+)
 from vidproc.render import render_detail, render_empty_state, render_feed_card, render_notice
 from vidproc.state import (
     channel_filter_options,
@@ -49,7 +57,7 @@ _refresh_lock = threading.Lock()
 _last_cache_clear_at = 0.0
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Loading video insights...")
 def _load_snapshot_cached(folder_id: str) -> InsightsSnapshot:
     return load_snapshot(folder_id)
 
@@ -68,8 +76,12 @@ def _try_clear_snapshot_cache() -> bool:
 
 
 def render_unavailable_state() -> None:
-    st.set_page_config(page_title="Video Insights", layout="wide")
-    st.markdown(CHROME_CSS, unsafe_allow_html=True)
+    # Does not call st.set_page_config() - main() already calls it exactly
+    # once, unconditionally, before either try/except that can reach this
+    # function. Streamlit raises if set_page_config() runs twice in one
+    # script execution, which would otherwise turn the snapshot-load
+    # failure path below into an unhandled exception of its own - exactly
+    # what that path exists to prevent.
     st.markdown(
         """<div style="max-width:640px;margin:80px auto;text-align:center;font-family:'Crimson Text',Georgia,serif">
 <h2>This dashboard is temporarily unavailable.</h2>
@@ -88,6 +100,10 @@ def _init_session_state() -> None:
     # its own scope.
     st.session_state.setdefault("selected_video_id_by_group", {})  # group -> video_id
     st.session_state.setdefault("show_minor_points", True)
+    # Resets on every new Streamlit session (e.g. a hard page reload opens
+    # a fresh session) - there's no persistent auth token/cookie, so the
+    # admin token must be re-entered each session. See vidproc/admin.py.
+    st.session_state.setdefault("admin_authenticated", False)
 
 
 def render_header(snapshot: InsightsSnapshot) -> None:
@@ -168,7 +184,92 @@ def render_group(group: str, snapshot: InsightsSnapshot) -> None:
             st.rerun()
 
 
+def render_admin_panel(folder_id: str, channels: list) -> None:
+    """Password(-token)-gated panel for adding a channel without editing
+    channels.json directly in Drive. Only reachable at all if
+    VIDPROC_ADMIN_TOKEN is configured - see main()'s tab list below and
+    app/config.py. `channels` (the current snapshot's channel list) is
+    needed to populate the group selectbox below with every existing
+    group - see NEW_GROUP_OPTION."""
+
+    if not st.session_state.admin_authenticated:
+        st.markdown(
+            "<div class='vidproc-meta-text'>Enter the admin token to manage channels.</div>",
+            unsafe_allow_html=True,
+        )
+        token_input = st.text_input("Admin token", type="password", key="admin-token-input")
+        if st.button("Unlock", key="admin-unlock"):
+            if check_admin_token(token_input, settings.vidproc_admin_token):
+                st.session_state.admin_authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect token.")
+        return
+
+    if st.button("Lock", key="admin-lock"):
+        st.session_state.admin_authenticated = False
+        st.rerun()
+
+    # Set by a prior "Add channel" click, right before its own st.rerun()
+    # below - without stashing it in session_state across that rerun, the
+    # result of a successful add would flash and vanish immediately
+    # instead of actually being visible on the page the rerun lands on.
+    flash = st.session_state.pop("admin_flash", None)
+    if flash is not None:
+        level, message = flash
+        getattr(st, level)(message)
+
+    st.markdown("<div class='vidproc-meta-text'>Add a channel</div>", unsafe_allow_html=True)
+    channel_id = st.text_input("Channel ID (UC...)", key="admin-channel-id")
+    name = st.text_input("Display name", key="admin-channel-name")
+    enabled = st.checkbox("Enabled", value=True, key="admin-channel-enabled")
+
+    # Existing groups only, plus an explicit "create new" option - picking
+    # an existing group can never spawn a new tab, so a new one only ever
+    # gets created as a conscious choice, not via a free-text typo of an
+    # existing group's name.
+    group_choice = st.selectbox(
+        "Group", options=[*groups_for_channels(channels), NEW_GROUP_OPTION], key="admin-channel-group-choice"
+    )
+    new_group_name = ""
+    if group_choice == NEW_GROUP_OPTION:
+        new_group_name = st.text_input("New group name", key="admin-channel-new-group")
+
+    languages_raw = st.text_input("Languages, comma-separated (optional)", key="admin-channel-languages")
+
+    if st.button("Add channel", key="admin-add-channel"):
+        languages = languages_raw.split(",") if languages_raw.strip() else None
+        try:
+            group = resolve_group_selection(group_choice, new_group_name)
+            result = add_channel_and_backfill(
+                folder_id,
+                channel_id=channel_id,
+                name=name,
+                enabled=enabled,
+                group=group,
+                languages=languages,
+            )
+        except (ChannelAlreadyExistsError, ValueError) as exc:
+            st.error(str(exc))
+        except Exception:  # noqa: BLE001
+            # Same public-boundary principle as main()'s snapshot load below -
+            # log the real exception server-side, show only a generic message.
+            logger.exception("Failed to add channel via admin panel")
+            st.error("Something went wrong adding the channel - check the server logs.")
+        else:
+            st.session_state.admin_flash = admin_flash_for(result)
+            _load_snapshot_cached.clear()
+            st.rerun()
+
+
 def main() -> None:
+    # Called exactly once, unconditionally, before anything else - both
+    # ConfigError below and a later snapshot-load failure route through
+    # render_unavailable_state(), which relies on this having already run
+    # (see its docstring/comment).
+    st.set_page_config(page_title="Video Insights", layout="wide")
+    st.markdown(CHROME_CSS, unsafe_allow_html=True)
+
     try:
         folder_id = settings.require_drive_folder_id()
         settings.require_oauth_credentials()
@@ -176,8 +277,6 @@ def main() -> None:
         render_unavailable_state()
         return
 
-    st.set_page_config(page_title="Video Insights", layout="wide")
-    st.markdown(CHROME_CSS, unsafe_allow_html=True)
     _init_session_state()
 
     try:
@@ -196,10 +295,14 @@ def main() -> None:
     render_header(snapshot)
 
     groups = groups_for_channels(snapshot.channels)
-    tabs = st.tabs(groups)
+    show_admin = bool(settings.vidproc_admin_token)
+    tabs = st.tabs([*groups, "Admin"] if show_admin else groups)
     for tab, group in zip(tabs, groups):
         with tab:
             render_group(group, snapshot)
+    if show_admin:
+        with tabs[-1]:
+            render_admin_panel(folder_id, snapshot.channels)
 
 
 if __name__ == "__main__":

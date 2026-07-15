@@ -133,6 +133,15 @@ def test_summary_max_cost_usd_per_run_rejects_invalid_values(monkeypatch, value)
         _settings_with(monkeypatch)
 
 
+def test_vidproc_admin_token_defaults_to_none(monkeypatch):
+    monkeypatch.delenv("VIDPROC_ADMIN_TOKEN", raising=False)
+    assert _settings_with(monkeypatch).vidproc_admin_token is None
+
+
+def test_vidproc_admin_token_reads_from_env(monkeypatch):
+    assert _settings_with(monkeypatch, VIDPROC_ADMIN_TOKEN="some-secret").vidproc_admin_token == "some-secret"
+
+
 def test_summary_bulk_read_max_workers_defaults_to_eight(monkeypatch):
     assert _settings_with(monkeypatch).summary_bulk_read_max_workers == 8
 

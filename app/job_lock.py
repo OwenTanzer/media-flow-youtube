@@ -5,6 +5,15 @@ stops a second concurrent invocation of the same job, not a full
 distributed compare-and-swap (out of scope; see README's concurrency
 invariant section).
 
+Every writer of queue.json/_index.json must acquire this same lock, not
+a lock of its own - a distinct lock only serializes a caller against
+itself, but does nothing to stop it from racing a *different* writer of
+the same underlying file. (An earlier version of backfill_new_channels.py
+took out its own independent lock for exactly this reason and was wrong:
+it could still interleave with discover_and_process.py's batch checkpoint
+on queue.json and silently lose or resurrect entries. See that script and
+vidproc/admin.py for how they now share this lock instead.)
+
 acquire_lock()'s check-then-write is not atomic across processes, and
 Drive additionally permits duplicate filenames within one folder, so two
 near-simultaneous invocations could otherwise both believe they hold the

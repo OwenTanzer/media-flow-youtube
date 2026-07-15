@@ -77,3 +77,42 @@ def test_read_channels_dry_run_returns_empty_without_touching_drive(monkeypatch)
 
     assert channel_store.read_channels("folder-id") == []
     assert not called
+
+
+def _capture_upload(monkeypatch):
+    written = {}
+
+    def _upload(folder_id, filename, content, **kwargs):
+        written["folder_id"] = folder_id
+        written["filename"] = filename
+        written["content"] = json.loads(content)
+
+    monkeypatch.setattr(channel_store.drive, "upload_text_file", _upload)
+    return written
+
+
+def test_write_channels_round_trips_through_read_channels(monkeypatch):
+    written = _capture_upload(monkeypatch)
+    channels = [
+        channel_store.Channel("UC_a", "Channel A", True, ["en", "es"], "Google"),
+        channel_store.Channel("UC_b", "Channel B", False, None, None),
+    ]
+
+    channel_store.write_channels("folder-id", channels)
+
+    assert written["filename"] == channel_store.CHANNELS_FILENAME
+    assert written["folder_id"] == "folder-id"
+
+    monkeypatch.setattr(channel_store.settings, "dry_run", False)
+    monkeypatch.setattr(channel_store.drive, "download_text", lambda folder_id, filename: json.dumps(written["content"]))
+    assert channel_store.read_channels("folder-id") == channels
+
+
+def test_write_channels_omits_absent_languages_and_group(monkeypatch):
+    written = _capture_upload(monkeypatch)
+
+    channel_store.write_channels("folder-id", [channel_store.Channel("UC_a", "Channel A")])
+
+    entry = written["content"]["channels"][0]
+    assert "languages" not in entry
+    assert "group" not in entry

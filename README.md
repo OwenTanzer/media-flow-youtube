@@ -341,7 +341,11 @@ its own via each channel's public RSS feed.
   group (currently just `"Google"`) need to set it explicitly.
 
 No deployment is needed to add, remove, enable, or disable a channel —
-just edit `channels.json` in Drive, same as `queue.json`.
+just edit `channels.json` in Drive, same as `queue.json`. Alternatively,
+if `VIDPROC_ADMIN_TOKEN` is set (see "Insight dashboard" below), the
+dashboard's token-gated **Admin** tab can add a channel through a form
+and immediately backfill its current RSS feed, without touching Drive
+directly.
 
 ### 2. Deploy `discover_and_process.py` as a Railway Cron Job
 
@@ -385,6 +389,28 @@ sub-second true race at the Drive API level is not fully eliminated.
 flight, you don't have to wait out the TTL — just delete
 `_discovery_lock.json` from the Drive folder and the next run will
 acquire the lock immediately.
+
+### Backfilling a newly added channel
+
+A channel just added to `channels.json` gets its currently-visible RSS
+feed queued the same way as any other channel the next time
+`discover_and_process.py` runs (up to `DISCOVERY_LOCK_TTL_SECONDS`/the
+cron schedule away) — no separate step is strictly required. If you'd
+rather not wait, run `python backfill_new_channels.py` once: it finds
+every enabled channel with zero videos anywhere in `_index.json` or
+`queue.json` yet (i.e. never discovered at all) and queues whatever's
+currently in that channel's feed. Idempotent — a channel already
+backfilled is skipped on rerun.
+
+It shares `discover_and_process.py`'s own `_discovery_lock.json` rather
+than a lock of its own — both write the same `queue.json`, and a
+distinct lock would only serialize this script against itself while
+doing nothing to stop it from interleaving with (and silently corrupting)
+a concurrently-running `discover_and_process.py`. It does **not** wait
+for that lock, though: if `discover_and_process.py` is already running,
+this exits immediately rather than blocking — that run (or the next one)
+will pick up the new channel regardless, so running this never
+introduces a waiting period of its own.
 
 ### Livestreams
 
@@ -727,7 +753,7 @@ this is the public-facing failure state, not a bug.
 
 ### How it reads data
 
-Everything is assembled read-only from the same three Drive-hosted
+The feed itself is assembled read-only from the same three Drive-hosted
 sources the pipeline already writes - `channels.json`, `_index.json`, and
 each video's `summaries/<video_id>.json` - via `app/insights_store.py`. No
 new Drive capability was needed: `_index.json` already enumerates every
@@ -736,6 +762,53 @@ directly. A video only appears once it has a `status: "ok"` summary
 artifact; a video that's never been summarized, or whose summarization
 recorded `status: "error"`, is counted in a small "N pending" note in the
 header rather than shown as a broken feed item.
+
+The one exception is the optional Admin tab below, which writes to
+`channels.json`.
+
+### Admin panel (optional)
+
+Set `VIDPROC_ADMIN_TOKEN` to enable an **Admin** tab alongside the
+group tabs, with a form to register a new channel (channel ID, display
+name, enabled, group, languages) without editing `channels.json`
+directly. Unset (the default), the tab doesn't appear at all.
+
+The group field is a selectbox of every group currently in use, plus an
+explicit "+ Create a new group..." option - not free text. Creating a
+new top-level tab is therefore always a conscious choice: picking an
+existing group can never accidentally spawn a new one via a typo (e.g.
+"Goggle" vs "Google"), since choosing that option requires separately
+typing and confirming the new group's name.
+
+This is a shared-secret bearer token compared with a constant-time
+check (`secrets.compare_digest`), not a real user/password auth system -
+appropriate for a single-operator tool, but the entry form has no
+rate-limiting or lockout, so generate a long random value rather than a
+memorable password:
+
+```
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Unlocking sets a per-session flag only (`st.session_state`, no cookie or
+persistent token) - a hard page reload opens a fresh Streamlit session
+and requires the token again.
+
+A channel ID is validated against YouTube's `UC` + 22-character shape and
+preflight-checked against its actual RSS feed (`app/discovery.py`'s
+`fetch_channel_feed()`) *before* anything is written - a bad ID is
+rejected outright rather than being permanently persisted only to fail
+later. Once that passes, the channel is written via
+`app/channel_store.py`'s `write_channels()`, then `backfill_new_channels()`
+(see "Backfilling a newly added channel" above) attempts an immediate
+backfill of its current RSS feed under the same `_discovery_lock.json`
+`discover_and_process.py` uses. This never blocks the admin panel,
+though: if that lock is already held, the channel is still added
+immediately and the panel reports the backfill as deferred to the next
+`discover_and_process.py` run, rather than waiting for the lock to free
+up. A backfill that fails outright (as opposed to being deferred) is
+reported as "channel added, backfill failed" - distinct from total
+failure, since the channel registration itself already succeeded.
 
 Channel grouping is resolved via `channel_id` (see "Transcript
 summarization" above) - a video whose `channel_id` doesn't match any
@@ -853,5 +926,6 @@ Dockerfile.vidproc  dedicated build for the vidproc Railway service (isolated fr
 batch_runner.py     standalone entrypoint for a separate Railway Cron Job service
 discover_and_process.py  standalone entrypoint: discover -> process queue -> summarize eligible transcripts
 backfill_channel_ids.py  one-off script: recover channel_id for pre-existing summaries
+backfill_new_channels.py  one-off/rerunnable script: backfill a newly-added channel's current RSS feed, decoupled from discover_and_process.py's lock
 get_refresh_token.py  one-time local script to mint the Drive OAuth refresh token
 ```

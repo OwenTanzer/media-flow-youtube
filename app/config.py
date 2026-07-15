@@ -138,6 +138,15 @@ class Settings:
                 "sanity cap on simultaneous Drive connections/OAuth-refreshed clients."
             )
 
+        # Gates the dashboard's channel-admin panel (vidproc/admin.py) -
+        # unset by default, which simply hides that panel entirely rather
+        # than exposing an unlockable dead end. This is a shared-secret
+        # bearer token compared with a constant-time check, not a
+        # memorable password - generate it the same way as API_KEY (e.g.
+        # `python -c "import secrets; print(secrets.token_urlsafe(32))"`),
+        # since there's no rate-limiting or lockout on the entry form.
+        self.vidproc_admin_token: str | None = _env("VIDPROC_ADMIN_TOKEN")
+
     def require_oauth_credentials(self) -> OAuthCredentials:
         missing = [
             name
