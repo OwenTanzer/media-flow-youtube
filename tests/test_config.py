@@ -149,6 +149,16 @@ def test_youtube_data_api_key_reads_from_env(monkeypatch):
     assert _settings_with(monkeypatch, YOUTUBE_DATA_API_KEY="some-key").youtube_data_api_key == "some-key"
 
 
+def test_summary_force_resummarize_video_ids_defaults_to_empty(monkeypatch):
+    monkeypatch.delenv("SUMMARY_FORCE_RESUMMARIZE_VIDEO_IDS", raising=False)
+    assert _settings_with(monkeypatch).summary_force_resummarize_video_ids == frozenset()
+
+
+def test_summary_force_resummarize_video_ids_parses_comma_separated_list(monkeypatch):
+    settings = _settings_with(monkeypatch, SUMMARY_FORCE_RESUMMARIZE_VIDEO_IDS=" video1, video2 ,video3")
+    assert settings.summary_force_resummarize_video_ids == frozenset({"video1", "video2", "video3"})
+
+
 def test_vidproc_admin_token_defaults_to_none(monkeypatch):
     monkeypatch.delenv("VIDPROC_ADMIN_TOKEN", raising=False)
     assert _settings_with(monkeypatch).vidproc_admin_token is None

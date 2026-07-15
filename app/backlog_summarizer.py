@@ -23,6 +23,7 @@ logger = logging.getLogger("media_flow.backlog_summarizer")
 class SummaryReport:
     eligible: int = 0
     skipped_current: int = 0
+    forced: int = 0
     summarized: int = 0
     failed: int = 0
     input_tokens: int = 0
@@ -52,17 +53,20 @@ def _read_artifact(folder_id: str, video_id: str) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def _is_current(existing: dict | None, source_hash: str, taxonomy_fingerprint: str) -> bool:
-    """Only a successful matching artifact suppresses work.
+def _has_completed_summary(existing: dict | None) -> bool:
+    """A completed ("ok") summary is authoritative by default (issue #26):
+    once a video has one, a normal backlog run never regenerates or
+    overwrites it, even if the source transcript, model, prompt version, or
+    group taxonomy has since drifted from what produced it - replacing a
+    published result is expensive and risky enough that it must be a
+    deliberate choice, not an automatic side effect of this job running.
 
-    Error artifacts deliberately never suppress the next run.
-    """
-    return bool(existing) and existing.get("status") == "ok" and (
-        existing.get("source_transcript_hash") == source_hash
-        and existing.get("model") == settings.summary_model
-        and existing.get("prompt_version") == PROMPT_VERSION
-        and existing.get("video_types_fingerprint") == taxonomy_fingerprint
-    )
+    A failed/incomplete artifact (status != "ok", including no artifact at
+    all) never suppresses work - those videos stay eligible every run.
+
+    The only way to regenerate a completed summary is the explicit,
+    targeted opt-in in summarize_backlog() (SUMMARY_FORCE_RESUMMARIZE_VIDEO_IDS)."""
+    return bool(existing) and existing.get("status") == "ok"
 
 
 def _write(folder_id: str, video_id: str, artifact: dict) -> None:
@@ -101,7 +105,11 @@ def _run_one(job: _Job) -> tuple[str, str, int, int, float, str | None]:
 
 
 def summarize_backlog(folder_id: str) -> SummaryReport:
-    """Drain all non-current summaries without a discovery lock or budget gate."""
+    """Drain videos with no completed summary yet, without a discovery lock
+    or budget gate. A completed ("ok") summary is authoritative and never
+    replaced by a normal run (issue #26) - see _has_completed_summary() -
+    except for video IDs explicitly listed in
+    SUMMARY_FORCE_RESUMMARIZE_VIDEO_IDS, a deliberate, targeted opt-in."""
     report = SummaryReport()
     if not os.environ.get("ANTHROPIC_API_KEY"):
         logger.info("ANTHROPIC_API_KEY is not set; skipping summarization.")
@@ -125,9 +133,14 @@ def summarize_backlog(folder_id: str) -> SummaryReport:
         body = strip_frontmatter(markdown)
         source_hash = transcript_hash(body)
         existing = _read_artifact(summaries_folder, video_id)
-        if _is_current(existing, source_hash, fingerprint):
+        forced = video_id in settings.summary_force_resummarize_video_ids
+        if _has_completed_summary(existing) and not forced:
+            logger.debug("Skipping %s: a completed summary already exists.", video_id)
             report.skipped_current += 1
             continue
+        if forced and _has_completed_summary(existing):
+            logger.info("Force-resummarizing %s: explicitly requested via SUMMARY_FORCE_RESUMMARIZE_VIDEO_IDS.", video_id)
+            report.forced += 1
         if len(body) > settings.summary_max_transcript_chars:
             body = body[: settings.summary_max_transcript_chars]
         base = {"video_id": video_id, "source_drive_file_id": entry.get("drive_file_id"),

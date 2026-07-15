@@ -1,12 +1,125 @@
+import json
+
 from app import backlog_summarizer as worker
 from app.summarize import ResolvedPoint, ResolvedSummary, SummarizationError, Usage
 
+_SUMMARIES_FOLDER = "summaries-folder-id"
 
-def test_only_current_success_suppresses_work():
-    base = {"source_transcript_hash": "sha256:x", "model": worker.settings.summary_model,
-            "prompt_version": worker.PROMPT_VERSION, "video_types_fingerprint": "types"}
-    assert worker._is_current({**base, "status": "ok"}, "sha256:x", "types") is True
-    assert worker._is_current({**base, "status": "error", "attempts": 99, "next_retry_at": "2099-01-01T00:00:00+00:00"}, "sha256:x", "types") is False
+
+def _stub_backlog(monkeypatch, *, index, artifacts=None, markdown_by_filename=None, force_ids=()):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(worker.settings, "summary_force_resummarize_video_ids", frozenset(force_ids))
+    monkeypatch.setattr(worker.drive, "read_index", lambda folder_id: index)
+    monkeypatch.setattr(worker.group_store, "read_groups", lambda folder_id: [])
+    monkeypatch.setattr(worker.channel_store, "read_channels", lambda folder_id: [])
+    monkeypatch.setattr(worker.drive, "get_or_create_folder", lambda folder_id, name: _SUMMARIES_FOLDER)
+
+    artifacts = artifacts or {}
+    markdown_by_filename = markdown_by_filename or {}
+
+    def _download_text(folder_id, filename):
+        if folder_id == _SUMMARIES_FOLDER:
+            video_id = filename[: -len(".json")]
+            return json.dumps(artifacts[video_id]) if video_id in artifacts else None
+        return markdown_by_filename.get(filename)
+
+    monkeypatch.setattr(worker.drive, "download_text", _download_text)
+
+
+def test_completed_summary_suppresses_work_regardless_of_drift():
+    """Issue #26: a completed summary is authoritative even if the fields
+    that would have mattered under the old drift-based check (source hash,
+    model, prompt version, taxonomy fingerprint) have since changed."""
+    stale = {
+        "status": "ok",
+        "source_transcript_hash": "sha256:old",
+        "model": "some-other-model",
+        "prompt_version": "old-version",
+        "video_types_fingerprint": "old-types",
+    }
+    assert worker._has_completed_summary(stale) is True
+
+
+def test_failed_or_missing_summary_does_not_suppress_work():
+    assert worker._has_completed_summary(
+        {"status": "error", "attempts": 99, "next_retry_at": "2099-01-01T00:00:00+00:00"}
+    ) is False
+    assert worker._has_completed_summary(None) is False
+
+
+def test_summarize_backlog_skips_video_with_completed_summary(monkeypatch):
+    index = {"video1": {"status": "ok", "filename": "video1.md"}}
+    markdown = {"video1.md": "---\nauthor: Someone\n---\n\n[00:00] transcript"}
+    artifacts = {"video1": {"status": "ok", "summary": "existing summary"}}
+    _stub_backlog(monkeypatch, index=index, artifacts=artifacts, markdown_by_filename=markdown)
+    called = []
+    monkeypatch.setattr(worker, "summarize_transcript", lambda *a, **k: called.append(1))
+
+    report = worker.summarize_backlog("folder-id")
+
+    assert not called
+    assert report.eligible == 0
+    assert report.skipped_current == 1
+    assert report.forced == 0
+
+
+def test_summarize_backlog_processes_video_with_failed_summary(monkeypatch):
+    index = {"video1": {"status": "ok", "filename": "video1.md"}}
+    markdown = {"video1.md": "---\nauthor: Someone\n---\n\n[00:00] transcript"}
+    artifacts = {"video1": {"status": "error", "message": "boom"}}
+    _stub_backlog(monkeypatch, index=index, artifacts=artifacts, markdown_by_filename=markdown)
+    output = ResolvedSummary(video_type="Type", summary="Summary", points=[])
+    monkeypatch.setattr(worker, "summarize_transcript", lambda *a, **k: (output, Usage(input_tokens=1, output_tokens=1), False))
+
+    report = worker.summarize_backlog("folder-id")
+
+    assert report.eligible == 1
+    assert report.skipped_current == 0
+    assert report.summarized == 1
+
+
+def test_summarize_backlog_processes_video_with_no_summary_yet(monkeypatch):
+    index = {"video1": {"status": "ok", "filename": "video1.md"}}
+    markdown = {"video1.md": "---\nauthor: Someone\n---\n\n[00:00] transcript"}
+    _stub_backlog(monkeypatch, index=index, artifacts={}, markdown_by_filename=markdown)
+    output = ResolvedSummary(video_type="Type", summary="Summary", points=[])
+    monkeypatch.setattr(worker, "summarize_transcript", lambda *a, **k: (output, Usage(input_tokens=1, output_tokens=1), False))
+
+    report = worker.summarize_backlog("folder-id")
+
+    assert report.eligible == 1
+    assert report.skipped_current == 0
+    assert report.summarized == 1
+
+
+def test_summarize_backlog_force_resummarizes_explicitly_listed_video(monkeypatch):
+    """Issue #26's deliberate opt-in: a completed summary is only replaced
+    when its video ID is explicitly listed via
+    SUMMARY_FORCE_RESUMMARIZE_VIDEO_IDS."""
+    index = {
+        "video1": {"status": "ok", "filename": "video1.md"},
+        "video2": {"status": "ok", "filename": "video2.md"},
+    }
+    markdown = {
+        "video1.md": "---\nauthor: Someone\n---\n\n[00:00] transcript one",
+        "video2.md": "---\nauthor: Someone\n---\n\n[00:00] transcript two",
+    }
+    artifacts = {
+        "video1": {"status": "ok", "summary": "existing summary one"},
+        "video2": {"status": "ok", "summary": "existing summary two"},
+    }
+    _stub_backlog(
+        monkeypatch, index=index, artifacts=artifacts, markdown_by_filename=markdown, force_ids=["video1"]
+    )
+    output = ResolvedSummary(video_type="Type", summary="New summary", points=[])
+    monkeypatch.setattr(worker, "summarize_transcript", lambda *a, **k: (output, Usage(input_tokens=1, output_tokens=1), False))
+
+    report = worker.summarize_backlog("folder-id")
+
+    assert report.eligible == 1
+    assert report.forced == 1
+    assert report.summarized == 1
+    assert report.skipped_current == 1
 
 
 def test_one_structured_attempt_records_a_failure_without_fallback(monkeypatch):
