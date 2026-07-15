@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 
-from . import channel_store, drive, summary_store
+from . import channel_store, drive, summary_store, usage_ledger
 from .channel_store import Channel, DEFAULT_GROUP, resolve_group
 
 logger = logging.getLogger("media_flow.insights_store")
@@ -58,10 +58,46 @@ class VideoInsight:
 
 
 @dataclass
+class CostUsageSummary:
+    """Lifetime Claude spend/usage, aggregated from the append-only usage
+    ledger (app/usage_ledger.py) - one entry per summarization attempt,
+    success or failure, never overwritten. This is deliberately not
+    computed from the current summary artifacts themselves: those are
+    overwritten in place on a retry or an explicit
+    SUMMARY_FORCE_RESUMMARIZE_VIDEO_IDS replacement, so counting only what's
+    currently on an artifact would undercount real spend (a failed attempt
+    followed by a successful retry, or a forced re-summarization, would
+    silently drop the earlier attempt's usage) and would make "failed
+    attempts" mean "currently-failed videos" rather than the number of
+    attempts that actually failed over time.
+
+    Only counts attempts recorded since the usage ledger started being
+    written (i.e. since this feature shipped) - any Claude spend from
+    before that isn't included in these totals.
+
+    unknown_billed_attempts counts failed attempts where the API call may
+    still have been billed (SummarizationError.possibly_billed) but the
+    actual token usage couldn't be recovered - app/backlog_summarizer.py
+    marks these "usage_known": False rather than recording a confirmed
+    zero. Their tokens/cost are deliberately excluded from the totals
+    below (a guessed zero would be worse than an explicit "unknown"), so
+    total_estimated_cost_usd is a floor when this is nonzero, not exact."""
+
+    total_attempts: int = 0
+    successful_attempts: int = 0
+    failed_attempts: int = 0
+    unknown_billed_attempts: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_estimated_cost_usd: float = 0.0
+
+
+@dataclass
 class InsightsSnapshot:
     videos: list[VideoInsight]
     channels: list[Channel]
     pending_count: int  # status "ok" in the index with no ok summary yet (never summarized, or status: "error")
+    cost_usage: CostUsageSummary = field(default_factory=CostUsageSummary)
     load_errors: list[str] = field(default_factory=list)
     generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -142,6 +178,42 @@ def _build_video_insight(
     )
 
 
+def _compute_cost_usage(ledger_entries: list[dict]) -> CostUsageSummary:
+    summary = CostUsageSummary()
+    for entry in ledger_entries:
+        if not isinstance(entry, dict):
+            continue
+        outcome = entry.get("outcome")
+        if outcome not in ("ok", "error"):
+            continue
+
+        if entry.get("usage_known", True) is False:
+            # Billed status is genuinely unknown for this attempt (see
+            # SummarizationError.possibly_billed in app/summarize.py) -
+            # count the attempt, but don't fold a guessed zero into the
+            # token/cost totals below.
+            summary.total_attempts += 1
+            summary.failed_attempts += 1
+            summary.unknown_billed_attempts += 1
+            continue
+
+        input_tokens = entry.get("input_tokens")
+        output_tokens = entry.get("output_tokens")
+        cost = entry.get("estimated_cost_usd")
+        if not isinstance(input_tokens, int) or not isinstance(output_tokens, int) or not isinstance(cost, (int, float)):
+            continue
+
+        summary.total_attempts += 1
+        if outcome == "ok":
+            summary.successful_attempts += 1
+        else:
+            summary.failed_attempts += 1
+        summary.total_input_tokens += input_tokens
+        summary.total_output_tokens += output_tokens
+        summary.total_estimated_cost_usd += cost
+    return summary
+
+
 def load_snapshot(folder_id: str) -> InsightsSnapshot:
     """Never raises for expected failure modes - a missing/malformed
     channels.json, a missing/failed/malformed individual summary artifact
@@ -194,9 +266,21 @@ def load_snapshot(folder_id: str) -> InsightsSnapshot:
 
         videos.append(insight)
 
+    try:
+        ledger_entries = usage_ledger.read_ledger(folder_id)
+    except usage_ledger.UsageLedgerCorruptError as exc:
+        # A read-only display path (unlike append_entries(), which fails
+        # closed and refuses to write) - degrade to an all-zero summary
+        # rather than crashing the whole dashboard over a corrupt ledger.
+        logger.warning("Usage ledger could not be read: %s", exc)
+        load_errors.append("Usage ledger (_usage_ledger.json) could not be read.")
+        ledger_entries = []
+    cost_usage = _compute_cost_usage(ledger_entries)
+
     return InsightsSnapshot(
         videos=videos,
         channels=channels,
         pending_count=pending_count,
+        cost_usage=cost_usage,
         load_errors=load_errors,
     )

@@ -37,7 +37,7 @@ def _artifact(**overrides) -> dict:
     return base
 
 
-def _stub(monkeypatch, *, channels, index, summaries=None):
+def _stub(monkeypatch, *, channels, index, summaries=None, ledger=None):
     monkeypatch.setattr(insights_store.channel_store, "read_channels", lambda folder_id: channels)
     monkeypatch.setattr(insights_store.drive, "read_index", lambda folder_id: index)
     summaries = summaries or {}
@@ -46,6 +46,7 @@ def _stub(monkeypatch, *, channels, index, summaries=None):
         "read_summaries_bulk",
         lambda folder_id, video_ids: {vid: summaries[vid] for vid in video_ids if vid in summaries},
     )
+    monkeypatch.setattr(insights_store.usage_ledger, "read_ledger", lambda folder_id: ledger or [])
 
 
 def test_load_snapshot_happy_path_resolves_group_and_channel_name(monkeypatch):
@@ -135,6 +136,7 @@ def test_load_snapshot_missing_channels_json_yields_empty_list_not_a_crash(monke
         lambda folder_id: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     monkeypatch.setattr(insights_store.drive, "read_index", lambda folder_id: {})
+    monkeypatch.setattr(insights_store.usage_ledger, "read_ledger", lambda folder_id: [])
 
     snapshot = insights_store.load_snapshot("folder-id")
 
@@ -237,3 +239,91 @@ def test_load_snapshot_missing_video_published_at_is_none(monkeypatch):
     assert snapshot.videos[0].video_published_at is None
     # generated_at is still parsed - it's the sort fallback for undated videos.
     assert snapshot.videos[0].generated_at == datetime(2026, 7, 11, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def test_load_snapshot_cost_usage_aggregates_ledger_entries(monkeypatch):
+    ledger = [
+        {"video_id": "vid1", "outcome": "ok", "input_tokens": 1000, "output_tokens": 200, "estimated_cost_usd": 0.01},
+        {"video_id": "vid2", "outcome": "error", "input_tokens": 500, "output_tokens": 0, "estimated_cost_usd": 0.002},
+    ]
+    _stub(monkeypatch, channels=[], index={}, ledger=ledger)
+
+    snapshot = insights_store.load_snapshot("folder-id")
+
+    assert snapshot.cost_usage.total_attempts == 2
+    assert snapshot.cost_usage.successful_attempts == 1
+    assert snapshot.cost_usage.failed_attempts == 1
+    assert snapshot.cost_usage.total_input_tokens == 1500
+    assert snapshot.cost_usage.total_output_tokens == 200
+    assert snapshot.cost_usage.total_estimated_cost_usd == pytest.approx(0.012)
+
+
+def test_load_snapshot_cost_usage_counts_every_retry_attempt_separately(monkeypatch):
+    """Issue: a summary artifact is overwritten in place on retry, so its
+    current state alone can't distinguish "one attempt" from "several" -
+    the ledger records each attempt as its own entry, so a video retried
+    after an earlier failure must have both attempts' usage counted, not
+    just whatever the artifact currently shows."""
+    ledger = [
+        {"video_id": "vid1", "outcome": "error", "input_tokens": 400, "output_tokens": 0, "estimated_cost_usd": 0.004},
+        {"video_id": "vid1", "outcome": "ok", "input_tokens": 400, "output_tokens": 150, "estimated_cost_usd": 0.006},
+    ]
+    _stub(monkeypatch, channels=[], index={}, ledger=ledger)
+
+    snapshot = insights_store.load_snapshot("folder-id")
+
+    assert snapshot.cost_usage.total_attempts == 2
+    assert snapshot.cost_usage.successful_attempts == 1
+    assert snapshot.cost_usage.failed_attempts == 1
+    assert snapshot.cost_usage.total_input_tokens == 800
+    assert snapshot.cost_usage.total_estimated_cost_usd == pytest.approx(0.01)
+
+
+def test_load_snapshot_cost_usage_ignores_malformed_ledger_entries(monkeypatch):
+    ledger = [{"video_id": "vid1", "outcome": "ok"}, "not a dict", {"video_id": "vid2", "outcome": "ok", "input_tokens": 10, "output_tokens": 5, "estimated_cost_usd": 0.001}]
+    _stub(monkeypatch, channels=[], index={}, ledger=ledger)
+
+    snapshot = insights_store.load_snapshot("folder-id")
+
+    assert snapshot.cost_usage.total_attempts == 1
+    assert snapshot.cost_usage.total_input_tokens == 10
+
+
+def test_compute_cost_usage_with_empty_ledger_returns_zeroed_summary():
+    summary = insights_store._compute_cost_usage([])
+    assert summary == insights_store.CostUsageSummary()
+
+
+def test_load_snapshot_cost_usage_excludes_unknown_billed_attempts_from_totals(monkeypatch):
+    """A failed attempt with usage_known=False (possibly billed, actual
+    tokens unrecoverable) must count as an attempt but not contribute a
+    guessed-zero to the token/cost totals - it's tracked separately so the
+    admin panel can flag that the total is a floor."""
+    ledger = [
+        {"video_id": "vid1", "outcome": "ok", "input_tokens": 100, "output_tokens": 50, "estimated_cost_usd": 0.001},
+        {"video_id": "vid2", "outcome": "error", "input_tokens": 0, "output_tokens": 0, "estimated_cost_usd": 0.0, "usage_known": False},
+    ]
+    _stub(monkeypatch, channels=[], index={}, ledger=ledger)
+
+    snapshot = insights_store.load_snapshot("folder-id")
+
+    assert snapshot.cost_usage.total_attempts == 2
+    assert snapshot.cost_usage.successful_attempts == 1
+    assert snapshot.cost_usage.failed_attempts == 1
+    assert snapshot.cost_usage.unknown_billed_attempts == 1
+    assert snapshot.cost_usage.total_input_tokens == 100
+    assert snapshot.cost_usage.total_estimated_cost_usd == pytest.approx(0.001)
+
+
+def test_load_snapshot_degrades_gracefully_on_corrupt_usage_ledger(monkeypatch):
+    _stub(monkeypatch, channels=[], index={})
+
+    def _raise(folder_id):
+        raise insights_store.usage_ledger.UsageLedgerCorruptError("corrupt")
+
+    monkeypatch.setattr(insights_store.usage_ledger, "read_ledger", _raise)
+
+    snapshot = insights_store.load_snapshot("folder-id")
+
+    assert snapshot.cost_usage == insights_store.CostUsageSummary()
+    assert snapshot.load_errors == ["Usage ledger (_usage_ledger.json) could not be read."]

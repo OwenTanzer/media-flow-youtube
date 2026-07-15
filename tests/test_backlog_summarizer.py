@@ -122,6 +122,61 @@ def test_summarize_backlog_force_resummarizes_explicitly_listed_video(monkeypatc
     assert report.skipped_current == 1
 
 
+def test_summarize_backlog_appends_a_ledger_entry_per_attempt_immediately(monkeypatch):
+    """The usage ledger (app/usage_ledger.py) - not the overwritten-in-place
+    summary artifact - is what the admin cost/usage summary sums, since it's
+    append-only and survives retries/forced re-summarization. Each attempt
+    is appended in its own call, right after that attempt finishes, so a
+    crash partway through a run doesn't lose every entry (see
+    summarize_backlog()'s docstring/comment on this)."""
+    index = {
+        "video1": {"status": "ok", "filename": "video1.md"},
+        "video2": {"status": "ok", "filename": "video2.md"},
+    }
+    markdown = {
+        "video1.md": "---\nauthor: Someone\n---\n\n[00:00] transcript one",
+        "video2.md": "---\nauthor: Someone\n---\n\n[00:00] transcript two",
+    }
+    _stub_backlog(monkeypatch, index=index, artifacts={}, markdown_by_filename=markdown)
+
+    def _summarize(body, **kwargs):
+        if "one" in body:
+            return ResolvedSummary(video_type="Type", summary="ok", points=[]), Usage(input_tokens=10, output_tokens=5), False
+        raise SummarizationError("boom", usage=Usage(input_tokens=8, output_tokens=0))
+
+    monkeypatch.setattr(worker, "summarize_transcript", _summarize)
+    appended_calls = []
+    monkeypatch.setattr(worker.usage_ledger, "append_entries", lambda folder_id, entries: appended_calls.append(entries))
+
+    worker.summarize_backlog("folder-id")
+
+    # One call per attempt, each with exactly one entry - never batched.
+    assert len(appended_calls) == 2
+    assert all(len(call) == 1 for call in appended_calls)
+    entries = {call[0]["video_id"]: call[0] for call in appended_calls}
+    assert entries["video1"]["outcome"] == "ok"
+    assert entries["video1"]["input_tokens"] == 10
+    assert entries["video1"]["usage_known"] is True
+    assert entries["video2"]["outcome"] == "error"
+    assert entries["video2"]["input_tokens"] == 8
+    assert "recorded_at" in entries["video1"]
+    assert "attempt_id" in entries["video1"]
+    assert entries["video1"]["attempt_id"] != entries["video2"]["attempt_id"]
+
+
+def test_summarize_backlog_does_not_append_to_ledger_when_nothing_ran(monkeypatch):
+    index = {"video1": {"status": "ok", "filename": "video1.md"}}
+    artifacts = {"video1": {"status": "ok", "summary": "existing"}}
+    markdown = {"video1.md": "---\nauthor: Someone\n---\n\n[00:00] transcript"}
+    _stub_backlog(monkeypatch, index=index, artifacts=artifacts, markdown_by_filename=markdown)
+    appended_calls = []
+    monkeypatch.setattr(worker.usage_ledger, "append_entries", lambda folder_id, entries: appended_calls.append(entries))
+
+    worker.summarize_backlog("folder-id")
+
+    assert appended_calls == []
+
+
 def test_one_structured_attempt_records_a_failure_without_fallback(monkeypatch):
     job = worker._Job("video", "[00:00] transcript", ["Type"], {}, {"video_id": "video"}, "summaries")
     structured_calls = []
@@ -134,12 +189,58 @@ def test_one_structured_attempt_records_a_failure_without_fallback(monkeypatch):
     monkeypatch.setattr(worker, "summarize_transcript", _structured)
     monkeypatch.setattr(worker, "_write", lambda *args: written.append(args[-1]))
 
-    _, outcome, _, _, _, error = worker._run_one(job)
+    _, outcome, _, _, _, error, usage_known = worker._run_one(job)
 
     assert outcome == "failed"
     assert error == "bad structured output"
     assert len(structured_calls) == 1
     assert written[0]["status"] == "error"
+    assert usage_known is True  # no possibly_billed flag - a confirmed, not unknown, zero
+    assert written[0]["usage"] == {"input_tokens": 0, "output_tokens": 0, "estimated_cost_usd": 0.0, "usage_known": True}
+
+
+def test_failed_attempt_with_unknown_possibly_billed_usage_is_flagged(monkeypatch):
+    """A failure where the API call may have been billed but the actual
+    usage couldn't be recovered (SummarizationError.possibly_billed, no
+    exc.usage) must be flagged usage_known=False - recording a confirmed
+    zero here would misrepresent a genuine unknown as verified spend."""
+    job = worker._Job("video", "[00:00] transcript", ["Type"], {}, {"video_id": "video"}, "summaries")
+    written = []
+
+    def _structured(*args, **kwargs):
+        raise SummarizationError("schema validation error", possibly_billed=True)
+
+    monkeypatch.setattr(worker, "summarize_transcript", _structured)
+    monkeypatch.setattr(worker, "_write", lambda *args: written.append(args[-1]))
+
+    *_, usage_known = worker._run_one(job)
+
+    assert usage_known is False
+    assert written[0]["usage"]["usage_known"] is False
+
+
+def test_failed_attempt_with_billed_usage_persists_it_on_the_artifact(monkeypatch):
+    """Issue: a failed attempt (e.g. a safety refusal) can still have
+    consumed real tokens - that usage must be persisted on the error
+    artifact too, not just successful ones, so the admin cost/usage summary
+    (app/insights_store.py's CostUsageSummary) accounts for the spend."""
+    job = worker._Job("video", "[00:00] transcript", ["Type"], {}, {"video_id": "video"}, "summaries")
+    written = []
+
+    def _structured(*args, **kwargs):
+        raise SummarizationError("refused", usage=Usage(input_tokens=100, output_tokens=10))
+
+    monkeypatch.setattr(worker, "summarize_transcript", _structured)
+    monkeypatch.setattr(worker, "_write", lambda *args: written.append(args[-1]))
+
+    video_id, outcome, input_tokens, output_tokens, cost, error, usage_known = worker._run_one(job)
+
+    assert outcome == "failed"
+    assert input_tokens == 100
+    assert output_tokens == 10
+    assert cost > 0
+    assert usage_known is True
+    assert written[0]["usage"] == {"input_tokens": 100, "output_tokens": 10, "estimated_cost_usd": cost, "usage_known": True}
 
 
 def test_unanchored_point_is_persisted_without_timestamp(monkeypatch):

@@ -52,38 +52,45 @@ logger = logging.getLogger("media_flow.job_lock")
 LOCK_FILENAME = "_discovery_lock.json"
 
 
-def _read_lock(folder_id: str) -> tuple[datetime | None, str | None]:
+def _read_lock(folder_id: str, lock_filename: str = LOCK_FILENAME) -> tuple[datetime | None, str | None]:
     """Returns (acquired_at, token) for the current lock file, or (None,
     None) if it doesn't exist or isn't readable."""
 
-    text = drive.download_text(folder_id, LOCK_FILENAME)
+    text = drive.download_text(folder_id, lock_filename)
     if text is None:
         return None, None
     try:
         payload = json.loads(text)
         return datetime.fromisoformat(payload["acquired_at"]), payload.get("token")
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-        logger.warning("Existing lock file in folder %s is unreadable; treating it as stale.", folder_id)
+        logger.warning("Existing lock file %s in folder %s is unreadable; treating it as stale.", lock_filename, folder_id)
         return None, None
 
 
-def acquire_lock(folder_id: str, ttl_seconds: int) -> str | None:
+def acquire_lock(folder_id: str, ttl_seconds: int, lock_filename: str = LOCK_FILENAME) -> str | None:
     """Returns a lock token (an opaque string to pass to release_lock) if
     acquired - either no lock existed, or the existing one is older than
     ttl_seconds and treated as a crashed prior run. Returns None without
     acting if a fresh lock is already held, or if a concurrent writer is
-    detected immediately after this call writes its own lock."""
+    detected immediately after this call writes its own lock.
+
+    lock_filename defaults to the discovery lock (LOCK_FILENAME) every
+    existing caller uses - pass a different name to serialize a distinct
+    resource independently (see app/usage_ledger.py's dedicated lock,
+    which deliberately must not couple to discovery: summarize_backlog.py
+    runs without the discovery lock by design, see its own docstring)."""
 
     if settings.dry_run:
         return "dry-run-lock-token"
 
-    acquired_at, _ = _read_lock(folder_id)
+    acquired_at, _ = _read_lock(folder_id, lock_filename)
     if acquired_at is not None:
         age_seconds = (datetime.now(timezone.utc) - acquired_at).total_seconds()
         if age_seconds < ttl_seconds:
             return None
         logger.warning(
-            "Lock in folder %s is %.0fs old (ttl %ds) - treating the prior run as crashed and proceeding.",
+            "Lock %s in folder %s is %.0fs old (ttl %ds) - treating the prior run as crashed and proceeding.",
+            lock_filename,
             folder_id,
             age_seconds,
             ttl_seconds,
@@ -91,27 +98,28 @@ def acquire_lock(folder_id: str, ttl_seconds: int) -> str | None:
 
     token = uuid.uuid4().hex
     payload = json.dumps({"acquired_at": datetime.now(timezone.utc).isoformat(), "token": token})
-    drive.upload_text_file(folder_id, LOCK_FILENAME, payload, mime_type="application/json")
+    drive.upload_text_file(folder_id, lock_filename, payload, mime_type="application/json")
 
-    file_ids = drive.list_file_ids(folder_id, LOCK_FILENAME)
+    file_ids = drive.list_file_ids(folder_id, lock_filename)
     if len(file_ids) != 1:
         logger.error(
-            "Lock acquisition for folder %s raced with a concurrent writer (%d lock "
+            "Lock acquisition for %s in folder %s raced with a concurrent writer (%d lock "
             "files present); backing off without proceeding.",
+            lock_filename,
             folder_id,
             len(file_ids),
         )
         return None
 
-    _, confirmed_token = _read_lock(folder_id)
+    _, confirmed_token = _read_lock(folder_id, lock_filename)
     if confirmed_token != token:
-        logger.error("Lost the acquire race for folder %s's lock to a concurrent run; backing off.", folder_id)
+        logger.error("Lost the acquire race for folder %s's %s lock to a concurrent run; backing off.", folder_id, lock_filename)
         return None
 
     return token
 
 
-def renew_lock(folder_id: str, token: str) -> bool:
+def renew_lock(folder_id: str, token: str, lock_filename: str = LOCK_FILENAME) -> bool:
     """Rewrites the lock with a fresh acquired_at timestamp, keeping the
     same token, so a long-running batch (see BATCH_SIZE_THRESHOLD/
     BATCH_COOLDOWN_SECONDS in app/batch.py) doesn't have its own lease
@@ -131,11 +139,12 @@ def renew_lock(folder_id: str, token: str) -> bool:
     if settings.dry_run:
         return True
 
-    _, current_token = _read_lock(folder_id)
+    _, current_token = _read_lock(folder_id, lock_filename)
     if current_token != token:
         logger.error(
-            "Cannot renew the lock in folder %s: it no longer belongs to this run "
+            "Cannot renew the %s lock in folder %s: it no longer belongs to this run "
             "(expected token %r, found %r). Another run may already be in progress.",
+            lock_filename,
             folder_id,
             token,
             current_token,
@@ -143,13 +152,14 @@ def renew_lock(folder_id: str, token: str) -> bool:
         return False
 
     payload = json.dumps({"acquired_at": datetime.now(timezone.utc).isoformat(), "token": token})
-    drive.upload_text_file(folder_id, LOCK_FILENAME, payload, mime_type="application/json")
+    drive.upload_text_file(folder_id, lock_filename, payload, mime_type="application/json")
 
-    _, confirmed_token = _read_lock(folder_id)
+    _, confirmed_token = _read_lock(folder_id, lock_filename)
     if confirmed_token != token:
         logger.error(
-            "Lost the lock in folder %s to a concurrent run immediately after renewing - a takeover "
+            "Lost the %s lock in folder %s to a concurrent run immediately after renewing - a takeover "
             "landed between the ownership check and the write.",
+            lock_filename,
             folder_id,
         )
         return False
@@ -157,20 +167,21 @@ def renew_lock(folder_id: str, token: str) -> bool:
     return True
 
 
-def release_lock(folder_id: str, token: str) -> None:
+def release_lock(folder_id: str, token: str, lock_filename: str = LOCK_FILENAME) -> None:
     """Only deletes the lock file if it still belongs to this token, so a
     run that outlives its own TTL can't delete a different run's lease."""
 
     if settings.dry_run:
         return
 
-    _, current_token = _read_lock(folder_id)
+    _, current_token = _read_lock(folder_id, lock_filename)
     if current_token is None:
         return
     if current_token != token:
         logger.warning(
-            "Not releasing the lock in folder %s: it belongs to a different run than the one releasing it.",
+            "Not releasing the %s lock in folder %s: it belongs to a different run than the one releasing it.",
+            lock_filename,
             folder_id,
         )
         return
-    drive.delete_file(folder_id, LOCK_FILENAME)
+    drive.delete_file(folder_id, lock_filename)
