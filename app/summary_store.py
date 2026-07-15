@@ -429,10 +429,6 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
         if prior_attempts > 0:
             retried += 1
 
-        if summarized + failed >= settings.summary_max_videos_per_run:
-            stopped_on_budget = True
-            break
-
         generated_at_dt = datetime.now(timezone.utc)
         base_fields = {
             "video_id": video_id,

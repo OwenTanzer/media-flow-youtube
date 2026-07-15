@@ -1039,7 +1039,11 @@ def test_summarize_eligible_falls_through_to_the_original_error_when_fallback_al
     assert written_artifact["message"] == "grounding failed"
 
 
-def test_summarize_eligible_stops_at_max_videos_per_run(monkeypatch):
+def test_summarize_eligible_drains_the_whole_backlog_regardless_of_video_count(monkeypatch):
+    """There is no cap on the number of videos a run processes - only the
+    real token/cost budgets (checked separately) can stop a run early. A
+    backlog of many pending videos must never be left partially done just
+    because of how many of them there are."""
     index = {
         f"vid{i}": {
             "status": "ok",
@@ -1048,10 +1052,9 @@ def test_summarize_eligible_stops_at_max_videos_per_run(monkeypatch):
             "title": f"Title {i}",
             "url": f"https://www.youtube.com/watch?v=vid{i}",
         }
-        for i in range(3)
+        for i in range(25)
     }
-    _stub_drive(monkeypatch, index=index, transcripts={f"vid{i}.md": TRANSCRIPT_MARKDOWN for i in range(3)})
-    monkeypatch.setattr(summary_store.settings, "summary_max_videos_per_run", 1)
+    _stub_drive(monkeypatch, index=index, transcripts={f"vid{i}.md": TRANSCRIPT_MARKDOWN for i in range(25)})
 
     output = ResolvedSummary(video_type="Analytic Overview", summary="S.", points=[ResolvedPoint(importance="major", main_point="P", explanation="E", timestamp_seconds=0)])
     monkeypatch.setattr(
@@ -1060,8 +1063,8 @@ def test_summarize_eligible_stops_at_max_videos_per_run(monkeypatch):
 
     report = summary_store.summarize_eligible("folder-id")
 
-    assert report.summarized == 1
-    assert report.stopped_on_budget is True
+    assert report.summarized == 25
+    assert report.stopped_on_budget is False
 
 
 def test_summarize_eligible_skips_a_video_whose_own_worst_case_exceeds_the_entire_cap(monkeypatch):
