@@ -50,7 +50,7 @@ _refresh_lock = threading.Lock()
 _last_cache_clear_at = 0.0
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Loading video insights...")
 def _load_snapshot_cached(folder_id: str) -> InsightsSnapshot:
     return load_snapshot(folder_id)
 
@@ -69,8 +69,12 @@ def _try_clear_snapshot_cache() -> bool:
 
 
 def render_unavailable_state() -> None:
-    st.set_page_config(page_title="Video Insights", layout="wide")
-    st.markdown(CHROME_CSS, unsafe_allow_html=True)
+    # Does not call st.set_page_config() - main() already calls it exactly
+    # once, unconditionally, before either try/except that can reach this
+    # function. Streamlit raises if set_page_config() runs twice in one
+    # script execution, which would otherwise turn the snapshot-load
+    # failure path below into an unhandled exception of its own - exactly
+    # what that path exists to prevent.
     st.markdown(
         """<div style="max-width:640px;margin:80px auto;text-align:center;font-family:'Crimson Text',Georgia,serif">
 <h2>This dashboard is temporarily unavailable.</h2>
@@ -238,6 +242,13 @@ def render_admin_panel(folder_id: str) -> None:
 
 
 def main() -> None:
+    # Called exactly once, unconditionally, before anything else - both
+    # ConfigError below and a later snapshot-load failure route through
+    # render_unavailable_state(), which relies on this having already run
+    # (see its docstring/comment).
+    st.set_page_config(page_title="Video Insights", layout="wide")
+    st.markdown(CHROME_CSS, unsafe_allow_html=True)
+
     try:
         folder_id = settings.require_drive_folder_id()
         settings.require_oauth_credentials()
@@ -245,8 +256,6 @@ def main() -> None:
         render_unavailable_state()
         return
 
-    st.set_page_config(page_title="Video Insights", layout="wide")
-    st.markdown(CHROME_CSS, unsafe_allow_html=True)
     _init_session_state()
 
     try:
