@@ -608,11 +608,14 @@ def summarize_eligible(folder_id: str, on_progress: Callable[[], None] | None = 
                             "importance": point.importance,
                             "main_point": point.main_point,
                             "explanation": point.explanation,
-                            "timestamp_seconds": point.timestamp_seconds,
-                            # Derived in application code, never trusted from
-                            # the model - guarantees it can't disagree with
-                            # timestamp_seconds.
-                            "timestamp": format_timestamp(point.timestamp_seconds),
+                            **(
+                                {
+                                    "timestamp_seconds": point.timestamp_seconds,
+                                    "timestamp": format_timestamp(point.timestamp_seconds),
+                                }
+                                if point.timestamp_seconds is not None
+                                else {}
+                            ),
                         }
                         for point in model_output.points
                     ],

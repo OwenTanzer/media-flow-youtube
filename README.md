@@ -437,8 +437,8 @@ them immediately, exactly as before this existed.
 > `discover_and_process.py`. It reads successful transcripts and writes only
 > independent `summaries/<video_id>.json` artifacts, so it does not acquire
 > the discovery/queue Drive lock. It runs up to four summaries concurrently;
-> each eligible video gets exactly three structured attempts followed by one
-> loose fallback. Failed artifacts are eligible again on the next worker run.
+> each eligible video gets one structured attempt. Failed artifacts are
+> eligible again on the next worker run.
 > There is no token-count preflight, per-run budget gate, retry timestamp, or
 > permanent attempt-count lockout.
 
@@ -496,9 +496,7 @@ stable `channels.json` ID, not the free-text `author` name embedded in the
 transcript - a downstream consumer that needs to reliably match a summary
 back to its channel registry entry (e.g. the Streamlit dashboard, issue #8)
 should join on `channel_id`, not `author`.
-This is the normal shape - see "Idempotency and retries" below for the
-one exception (a fallback plain-prose summary, with `points: []` and
-`video_type: null`, used only after a video exhausts its retry budget).
+This is the only artifact shape written by the current summary worker.
 Claude only produces `video_type`, `summary`, and each point's
 `importance`, `main_point`, `explanation`, `source_timestamp`, and
 `source_anchor`, constrained by a JSON schema (`output_config.format`) so
@@ -674,7 +672,7 @@ transient failure takes to eventually succeed. A non-retryable failure has
 no `next_retry_at` at all, since it isn't retried regardless of elapsed
 time.
 
-**Fallback summary once every immediate attempt fails.** Some speakers -
+**Legacy summary-store fallback behavior (not used by `summarize_backlog.py`).** Some speakers -
 meandering, conversational, non-linear delivery - make the per-point
 timestamp citation genuinely hard to ground even when the model clearly
 understood the content; a video like that can otherwise exhaust its retry

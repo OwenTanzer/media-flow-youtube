@@ -21,7 +21,7 @@ logger = logging.getLogger("media_flow.summarize")
 # changes. Deliberately a code constant, not an env var - drifting it
 # independently of the prompt text would corrupt the idempotency check in
 # summary_store.needs_summarization().
-PROMPT_VERSION = "v7"
+PROMPT_VERSION = "v8"
 
 # Used when a video's group has no video_types configured at all (see
 # app/group_store.py) - preserves the original, pre-group-configuration
@@ -313,7 +313,9 @@ class ResolvedPoint:
     importance: Literal["major", "minor"]
     main_point: str
     explanation: str
-    timestamp_seconds: int
+    # None means the point remains useful, but its citation was not grounded
+    # well enough to expose a viewer-facing timestamp.
+    timestamp_seconds: int | None
 
 
 @dataclass
@@ -464,30 +466,12 @@ def _parse_source_timestamp(raw: str) -> int | None:
 
 
 def _resolve_points(points: list[SummaryPoint], transcript_body: str) -> list[ResolvedPoint]:
-    """Verifies each point's cited evidence against the transcript and
-    computes its real timestamp_seconds - the model never computes or
-    reports this number itself; it only cites a literal transcript line
-    (source_timestamp) and a short excerpt from it (source_anchor). Raises
-    ValueError - a content/grounding failure Pydantic's schema check alone
-    can't catch, same as the old range check - if:
+    """Resolve timestamps only when their cited anchor is grounded.
 
-      - source_timestamp doesn't parse as a "[H:MM:SS]"/"[MM:SS]" value;
-      - that exact value isn't one of the transcript's own real line
-        timestamps (strict equality, not "in range" - the model must cite
-        a real line, not merely land on a plausible-sounding number); or
-      - fewer than _ANCHOR_WORD_OVERLAP_THRESHOLD of source_anchor's
-        significant (non-stopword) words appear within _ANCHOR_WINDOW_LINES
-        lines of that timestamp - a fuzzy check, not exact-substring
-        containment, since the model reliably finds the right real line but
-        doesn't reliably reproduce raw ASR caption text byte-for-byte even
-        when told to; see _ANCHOR_WORD_OVERLAP_THRESHOLD's own comment.
-
-    Points are deliberately *not* required to be in chronological order:
-    real videos (livestreams especially) revisit the same topic more than
-    once, and a strict ordering requirement rejected genuinely well-formed
-    output for that content - see _select_significant_points() for the
-    actual bound that matters for long videos (a cap on point count, not
-    their order)."""
+    An unparseable timestamp, non-existent transcript line, or weak anchor
+    suppresses that point's timestamp but never discards the point or its
+    otherwise structured summary.
+    """
 
     indexed = _index_transcript_lines(transcript_body)
     # Transcript timestamps are truncated to whole seconds
@@ -503,40 +487,27 @@ def _resolve_points(points: list[SummaryPoint], transcript_body: str) -> list[Re
     resolved: list[ResolvedPoint] = []
     for point in points:
         seconds = _parse_source_timestamp(point.source_timestamp)
-        if seconds is None:
-            raise ValueError(
-                f"source_timestamp {point.source_timestamp!r} is not a valid [H:MM:SS]/[MM:SS] "
-                f"value for point {point.main_point!r}."
-            )
-        line_indices = line_indices_by_second.get(seconds)
-        if line_indices is None:
-            raise ValueError(
-                f"source_timestamp {point.source_timestamp!r} ({seconds}s) is not one of the "
-                f"transcript's own line timestamps for point {point.main_point!r}."
-            )
-
-        anchor_words = _significant_words(point.source_anchor)
-        best_overlap = 0.0
-        for line_index in line_indices:
-            window_start = max(0, line_index - _ANCHOR_WINDOW_LINES)
-            window_end = min(len(indexed), line_index + _ANCHOR_WINDOW_LINES + 1)
-            window_text = " ".join(text for _, text in indexed[window_start:window_end])
-            window_words = _significant_words(window_text)
-            overlap = len(anchor_words & window_words) / len(anchor_words) if anchor_words else 0.0
-            best_overlap = max(best_overlap, overlap)
-        if best_overlap < _ANCHOR_WORD_OVERLAP_THRESHOLD:
-            raise ValueError(
-                f"source_anchor {point.source_anchor!r} has only {best_overlap:.0%} word overlap with "
-                f"content within {_ANCHOR_WINDOW_LINES} line(s) of {point.source_timestamp!r} "
-                f"(need >= {_ANCHOR_WORD_OVERLAP_THRESHOLD:.0%}) for point {point.main_point!r}."
-            )
+        line_indices = line_indices_by_second.get(seconds) if seconds is not None else None
+        timestamp_seconds: int | None = None
+        if line_indices:
+            anchor_words = _significant_words(point.source_anchor)
+            best_overlap = 0.0
+            for line_index in line_indices:
+                window_start = max(0, line_index - _ANCHOR_WINDOW_LINES)
+                window_end = min(len(indexed), line_index + _ANCHOR_WINDOW_LINES + 1)
+                window_text = " ".join(text for _, text in indexed[window_start:window_end])
+                window_words = _significant_words(window_text)
+                overlap = len(anchor_words & window_words) / len(anchor_words) if anchor_words else 0.0
+                best_overlap = max(best_overlap, overlap)
+            if best_overlap >= _ANCHOR_WORD_OVERLAP_THRESHOLD:
+                timestamp_seconds = seconds
 
         resolved.append(
             ResolvedPoint(
                 importance=point.importance,
                 main_point=point.main_point,
                 explanation=point.explanation,
-                timestamp_seconds=seconds,
+                timestamp_seconds=timestamp_seconds,
             )
         )
     return resolved
@@ -657,15 +628,7 @@ def summarize_transcript(
             fallback_eligible=True,
         )
 
-    try:
-        resolved_points = _resolve_points(response.parsed_output.points, transcript_body)
-    except ValueError as exc:
-        # The core citation/grounding failure this whole mechanism exists
-        # for - fallback_eligible=True since a plain-prose fallback has no
-        # per-line citation to fail this same way.
-        raise SummarizationError(
-            f"Model output failed validation: {exc}", retryable=True, usage=response_usage, fallback_eligible=True
-        ) from exc
+    resolved_points = _resolve_points(response.parsed_output.points, transcript_body)
 
     selected_points, points_truncated = _select_significant_points(resolved_points, max_points)
     output = ResolvedSummary(

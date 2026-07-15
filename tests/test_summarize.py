@@ -321,16 +321,15 @@ def test_resolve_points_accepts_a_paraphrased_anchor_with_enough_word_overlap():
     assert resolved[0].timestamp_seconds == 10
 
 
-def test_resolve_points_rejects_anchor_outside_the_window():
+def test_resolve_points_omits_timestamp_for_anchor_outside_the_window():
     # "thanks"/"watching" only occur on [00:40], 4 lines from the cited
     # [00:00] - outside the +-2 line window, and not incidentally present
     # in any line within it.
     points = [_point(source_timestamp="[00:00]", source_anchor="thanks for watching")]
-    with pytest.raises(ValueError, match="word overlap"):
-        summarize._resolve_points(points, RICH_BODY)
+    assert summarize._resolve_points(points, RICH_BODY)[0].timestamp_seconds is None
 
 
-def test_resolve_points_rejects_an_anchor_describing_unrelated_content_in_range():
+def test_resolve_points_omits_timestamp_for_unrelated_anchor():
     """A citation that lands on a real timestamp but describes content
     from elsewhere must still be rejected - word overlap catches this the
     same way exact-substring matching did, it just tolerates paraphrase of
@@ -339,8 +338,7 @@ def test_resolve_points_rejects_an_anchor_describing_unrelated_content_in_range(
     +-2 line window, so citing [00:10] with that content is exactly this
     case - a real timestamp, but the wrong one for this evidence."""
     points = [_point(source_timestamp="[00:10]", source_anchor="thanks for watching")]
-    with pytest.raises(ValueError, match="word overlap"):
-        summarize._resolve_points(points, RICH_BODY)
+    assert summarize._resolve_points(points, RICH_BODY)[0].timestamp_seconds is None
 
 
 def test_resolve_points_anchor_match_is_case_and_whitespace_insensitive():
@@ -349,25 +347,22 @@ def test_resolve_points_anchor_match_is_case_and_whitespace_insensitive():
     assert resolved[0].timestamp_seconds == 10
 
 
-def test_resolve_points_rejects_unparseable_source_timestamp():
+def test_resolve_points_omits_timestamp_for_unparseable_source_timestamp():
     points = [_point(source_timestamp="not a timestamp")]
-    with pytest.raises(ValueError, match="not a valid"):
-        summarize._resolve_points(points, SAMPLE_BODY)
+    assert summarize._resolve_points(points, SAMPLE_BODY)[0].timestamp_seconds is None
 
 
-def test_resolve_points_rejects_a_timestamp_that_is_not_a_real_transcript_line():
+def test_resolve_points_omits_timestamp_for_non_transcript_line():
     # 999s isn't anywhere in SAMPLE_BODY (only 0s and 5s exist) - this is
     # the strict-equality replacement for the old "out of range" check,
     # and also rejects a plausible-looking but non-real in-range value.
     points = [_point(source_timestamp="[00:02]", source_anchor="hello")]
-    with pytest.raises(ValueError, match="not one of the transcript's own line timestamps"):
-        summarize._resolve_points(points, SAMPLE_BODY)
+    assert summarize._resolve_points(points, SAMPLE_BODY)[0].timestamp_seconds is None
 
 
-def test_resolve_points_rejects_anchor_text_that_does_not_appear_at_all():
+def test_resolve_points_omits_timestamp_for_missing_anchor_text():
     points = [_point(source_timestamp="[00:05]", source_anchor="something never said")]
-    with pytest.raises(ValueError, match="word overlap"):
-        summarize._resolve_points(points, SAMPLE_BODY)
+    assert summarize._resolve_points(points, SAMPLE_BODY)[0].timestamp_seconds is None
 
 
 def test_significant_words_strips_stopwords_and_punctuation():
@@ -380,13 +375,12 @@ def test_significant_words_strips_stopwords_and_punctuation():
     }
 
 
-def test_resolve_points_rejects_anchor_with_only_stopwords():
+def test_resolve_points_omits_timestamp_for_stopword_only_anchor():
     """An anchor with no significant words at all (e.g. just filler) can
     never be considered grounded - dividing by zero significant words
     must not be treated as 100% overlap."""
     points = [_point(source_timestamp="[00:05]", source_anchor="the a an")]
-    with pytest.raises(ValueError, match="word overlap"):
-        summarize._resolve_points(points, SAMPLE_BODY)
+    assert summarize._resolve_points(points, SAMPLE_BODY)[0].timestamp_seconds is None
 
 
 def test_resolve_points_accepts_nonchronological_order():
@@ -499,10 +493,7 @@ def test_summarize_transcript_success(monkeypatch):
     assert points_truncated is False
 
 
-def test_summarize_transcript_raises_on_invalid_points(monkeypatch):
-    """The model can return a well-typed but ungrounded citation - Pydantic
-    alone can't catch this, since it only validates the string shape, not
-    whether the cited line and excerpt are real."""
+def test_summarize_transcript_keeps_invalidly_anchored_points_without_timestamp(monkeypatch):
     bad_output = _model_output(
         video_type="Analytic Overview",
         summary="S.",
@@ -510,14 +501,9 @@ def test_summarize_transcript_raises_on_invalid_points(monkeypatch):
     )
     monkeypatch.setattr(summarize.anthropic, "Anthropic", _fake_client(_FakeParsedMessage(bad_output)))
 
-    with pytest.raises(summarize.SummarizationError) as exc_info:
-        summarize.summarize_transcript(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
-    assert exc_info.value.retryable is True
-    assert exc_info.value.usage is not None
-    # A grounding/citation failure is exactly the case summarize_fallback()
-    # exists for - the fallback prompt has no per-line citation to fail
-    # this same way.
-    assert exc_info.value.fallback_eligible is True
+    output, usage, _ = summarize.summarize_transcript(SAMPLE_BODY, model="claude-haiku-4-5", max_output_tokens=1024)
+    assert output.points[0].timestamp_seconds is None
+    assert usage.input_tokens > 0
 
 
 def test_summarize_transcript_raises_on_refusal(monkeypatch):
