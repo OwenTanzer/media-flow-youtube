@@ -773,6 +773,13 @@ group tabs, with a form to register a new channel (channel ID, display
 name, enabled, group, languages) without editing `channels.json`
 directly. Unset (the default), the tab doesn't appear at all.
 
+The group field is a selectbox of every group currently in use, plus an
+explicit "+ Create a new group..." option - not free text. Creating a
+new top-level tab is therefore always a conscious choice: picking an
+existing group can never accidentally spawn a new one via a typo (e.g.
+"Goggle" vs "Google"), since choosing that option requires separately
+typing and confirming the new group's name.
+
 This is a shared-secret bearer token compared with a constant-time
 check (`secrets.compare_digest`), not a real user/password auth system -
 appropriate for a single-operator tool, but the entry form has no

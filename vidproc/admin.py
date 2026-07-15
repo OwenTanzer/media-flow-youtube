@@ -21,6 +21,14 @@ from app.discovery import DiscoveryReport
 
 logger = logging.getLogger("media_flow.vidproc_admin")
 
+# The admin panel's group selectbox shows this alongside every existing
+# group (see vidproc/state.py's groups_for_channels()) - picking an
+# existing group from that list can never spawn a new tab, so a new one
+# is only ever created by explicitly choosing this option. Without it, a
+# free-text group field would let a typo of an existing group name
+# (e.g. "Goggle" vs "Google") silently create a whole new top-level tab.
+NEW_GROUP_OPTION = "+ Create a new group..."
+
 # YouTube's stable "UC..." channel ID: "UC" + 22 URL-safe base64-ish
 # characters, 24 total. Not a airtight guarantee the channel exists (the
 # RSS preflight fetch below is what actually confirms that), but catches
@@ -57,6 +65,25 @@ def check_admin_token(entered: str, configured: str | None) -> bool:
     if not configured:
         return False
     return secrets.compare_digest(entered, configured)
+
+
+def resolve_group_selection(selected: str, new_group_name: str) -> str:
+    """Resolves the admin panel's group selectbox into the actual `group`
+    value to pass to add_channel_and_backfill(). Picking an existing
+    group from the selectbox returns it verbatim - a new group is only
+    ever created when NEW_GROUP_OPTION was explicitly selected, making
+    that a conscious choice rather than something a typo in a free-text
+    field could trigger by accident.
+
+    Raises ValueError if NEW_GROUP_OPTION was selected but new_group_name
+    is blank - "create a new group" with no name isn't a valid choice."""
+
+    if selected != NEW_GROUP_OPTION:
+        return selected
+    new_group_name = new_group_name.strip()
+    if not new_group_name:
+        raise ValueError("Enter a name for the new group, or pick an existing one from the list instead.")
+    return new_group_name
 
 
 def add_channel_and_backfill(

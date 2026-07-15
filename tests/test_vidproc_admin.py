@@ -23,6 +23,26 @@ def test_check_admin_token_rejects_when_nothing_configured():
     assert admin.check_admin_token("", "") is False
 
 
+def test_resolve_group_selection_returns_an_existing_group_verbatim():
+    assert admin.resolve_group_selection("Google", "") == "Google"
+
+
+def test_resolve_group_selection_creates_a_new_group_when_explicitly_chosen():
+    assert admin.resolve_group_selection(admin.NEW_GROUP_OPTION, "Crypto") == "Crypto"
+
+
+def test_resolve_group_selection_strips_the_new_group_name():
+    assert admin.resolve_group_selection(admin.NEW_GROUP_OPTION, "  Crypto  ") == "Crypto"
+
+
+def test_resolve_group_selection_rejects_a_blank_new_group_name():
+    """Regression test for the whole point of this function: "create a
+    new group" with nothing typed isn't a valid choice - it must not
+    silently fall back to some default group."""
+    with pytest.raises(ValueError, match="Enter a name for the new group"):
+        admin.resolve_group_selection(admin.NEW_GROUP_OPTION, "   ")
+
+
 def _stub(monkeypatch, *, existing, lock_token="the-token", backfill_report=None, feed_ok=True):
     monkeypatch.setattr(admin.channel_store, "read_channels", lambda folder_id: existing)
     written = {}

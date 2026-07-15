@@ -23,7 +23,14 @@ import streamlit as st
 
 from app.config import ConfigError, settings
 from app.insights_store import InsightsSnapshot, load_snapshot
-from vidproc.admin import ChannelAlreadyExistsError, add_channel_and_backfill, admin_flash_for, check_admin_token
+from vidproc.admin import (
+    NEW_GROUP_OPTION,
+    ChannelAlreadyExistsError,
+    add_channel_and_backfill,
+    admin_flash_for,
+    check_admin_token,
+    resolve_group_selection,
+)
 from vidproc.render import render_detail, render_empty_state, render_feed_card, render_notice
 from vidproc.state import (
     channel_filter_options,
@@ -177,11 +184,13 @@ def render_group(group: str, snapshot: InsightsSnapshot) -> None:
             st.rerun()
 
 
-def render_admin_panel(folder_id: str) -> None:
+def render_admin_panel(folder_id: str, channels: list) -> None:
     """Password(-token)-gated panel for adding a channel without editing
     channels.json directly in Drive. Only reachable at all if
     VIDPROC_ADMIN_TOKEN is configured - see main()'s tab list below and
-    app/config.py."""
+    app/config.py. `channels` (the current snapshot's channel list) is
+    needed to populate the group selectbox below with every existing
+    group - see NEW_GROUP_OPTION."""
 
     if not st.session_state.admin_authenticated:
         st.markdown(
@@ -214,12 +223,24 @@ def render_admin_panel(folder_id: str) -> None:
     channel_id = st.text_input("Channel ID (UC...)", key="admin-channel-id")
     name = st.text_input("Display name", key="admin-channel-name")
     enabled = st.checkbox("Enabled", value=True, key="admin-channel-enabled")
-    group = st.text_input("Group (optional)", key="admin-channel-group")
+
+    # Existing groups only, plus an explicit "create new" option - picking
+    # an existing group can never spawn a new tab, so a new one only ever
+    # gets created as a conscious choice, not via a free-text typo of an
+    # existing group's name.
+    group_choice = st.selectbox(
+        "Group", options=[*groups_for_channels(channels), NEW_GROUP_OPTION], key="admin-channel-group-choice"
+    )
+    new_group_name = ""
+    if group_choice == NEW_GROUP_OPTION:
+        new_group_name = st.text_input("New group name", key="admin-channel-new-group")
+
     languages_raw = st.text_input("Languages, comma-separated (optional)", key="admin-channel-languages")
 
     if st.button("Add channel", key="admin-add-channel"):
         languages = languages_raw.split(",") if languages_raw.strip() else None
         try:
+            group = resolve_group_selection(group_choice, new_group_name)
             result = add_channel_and_backfill(
                 folder_id,
                 channel_id=channel_id,
@@ -281,7 +302,7 @@ def main() -> None:
             render_group(group, snapshot)
     if show_admin:
         with tabs[-1]:
-            render_admin_panel(folder_id)
+            render_admin_panel(folder_id, snapshot.channels)
 
 
 if __name__ == "__main__":
