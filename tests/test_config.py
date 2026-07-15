@@ -112,6 +112,14 @@ def test_summary_settings_defaults(monkeypatch):
     assert settings.summary_max_transcript_chars == 400000
     assert settings.summary_max_total_tokens_per_run == 500000
     assert settings.summary_max_cost_usd_per_run == 2.0
+    assert settings.summary_worker_concurrency == 4
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "17"])
+def test_summary_worker_concurrency_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("SUMMARY_WORKER_CONCURRENCY", value)
+    with pytest.raises(ConfigError, match="SUMMARY_WORKER_CONCURRENCY"):
+        _settings_with(monkeypatch)
 
 
 @pytest.mark.parametrize(

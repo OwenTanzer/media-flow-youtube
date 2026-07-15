@@ -20,7 +20,6 @@ from app import job_lock
 from app.batch import run_batch
 from app.config import ConfigError, settings
 from app.discovery import discover_and_enqueue
-from app.summary_store import summarize_eligible
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("media_flow.discover_and_process")
@@ -74,23 +73,6 @@ def main() -> int:
         for r in results:
             if r.status != "ok":
                 logger.info("  %s (%s): %s", r.video_id or r.url, r.status, r.message)
-
-        summary_report = summarize_eligible(folder_id, on_progress=_renew_lock)
-        logger.info(
-            "Summarization: %d eligible, %d already current, %d summarized, %d failed, %d retried "
-            "(~%d input / ~%d output tokens, ~$%.4f estimated)%s.",
-            summary_report.eligible,
-            summary_report.skipped_current,
-            summary_report.summarized,
-            summary_report.failed,
-            summary_report.retried,
-            summary_report.total_input_tokens,
-            summary_report.total_output_tokens,
-            summary_report.total_estimated_cost_usd,
-            " - stopped early on a per-run budget" if summary_report.stopped_on_budget else "",
-        )
-        for video_id, message in summary_report.failures:
-            logger.warning("  summarization failure - %s: %s", video_id, message)
 
         return 0
     finally:
