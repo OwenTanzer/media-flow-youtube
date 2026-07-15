@@ -22,12 +22,12 @@ single small service on Railway.
   folder, keyed by video ID, so you always know what's been tried and
   where to find it.
 - `discover_and_process.py` — optionally, poll a set of YouTube channels
-  (configured in `channels.json`, also in Drive) for new uploads via
-  their public RSS feeds, queue the ones not seen before, process the
-  queue, and then turn each successful transcript into a structured,
-  timestamped Claude-generated summary (`summaries/<video_id>.json`), all
-  in one scheduled run. See "Scheduled channel discovery" and "Transcript
-  summarization" below.
+  (configured in `channels.json`, also in Drive) for new uploads via the
+  YouTube Data API (or public RSS feeds as a fallback), queue the ones not
+  seen before, process the queue, and then turn each successful transcript
+  into a structured, timestamped Claude-generated summary
+  (`summaries/<video_id>.json`), all in one scheduled run. See "Scheduled
+  channel discovery" and "Transcript summarization" below.
 - Missing/disabled captions, unavailable videos, and IP blocks are all
   caught and reported as a `status` field — the service never crashes on
   a single bad video.
@@ -306,7 +306,36 @@ between runs — no idle web process needed.
 
 Instead of (or as well as) manually editing `queue.json`, you can point
 the app at a set of YouTube channels and have it discover new uploads on
-its own via each channel's public RSS feed.
+its own, via either the official YouTube Data API or each channel's public
+RSS feed.
+
+### Discovery source: YouTube Data API vs RSS (issue #24)
+
+Public RSS feeds are the default and require no extra credentials, but
+they've proven unreliable in production for several channels (404/500
+responses even though the channel is fine). Setting `YOUTUBE_DATA_API_KEY`
+switches `discover_and_process.py` to the official YouTube Data API's
+uploads-playlist flow instead, **exclusively** - RSS is only ever used as
+the fallback while that key is unset, never alongside the API for the same
+channel.
+
+How it works: for each configured channel, `app/youtube_data_api.py`
+resolves `contentDetails.relatedPlaylists.uploads` via `channels.list`
+(cached forever afterward in `_uploads_playlists.json` in the Drive
+folder, so this only costs one quota unit per channel, ever), then polls
+that playlist via `playlistItems.list` - which is ordered newest-first, so
+polling stops as soon as an already-known video ID is seen. Steady-state
+hourly polling therefore costs exactly one `playlistItems.list` unit per
+channel per run; a brand-new channel with no known videos yet pages
+through its full upload history. With ~12 channels polled hourly this is
+far under the default 10,000-unit daily quota.
+
+To enable it: enable YouTube Data API v3 for a Google Cloud project
+([API library](https://console.cloud.google.com/apis/library/youtube.googleapis.com)),
+create an API key ([credentials](https://console.cloud.google.com/apis/credentials) -
+a separate, simpler credential from the `GOOGLE_OAUTH_*` ones used for
+Drive), and set `YOUTUBE_DATA_API_KEY` on the production
+`discover-and-process` Railway service.
 
 ### 1. Create `channels.json` in the Drive folder
 

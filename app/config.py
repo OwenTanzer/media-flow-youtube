@@ -69,6 +69,12 @@ class Settings:
                 f"TRANSCRIPT_FETCH_MAX_ATTEMPTS must be a positive integer, got {self.transcript_fetch_max_attempts}."
             )
 
+        # When set, discovery.py uses the YouTube Data API's uploads-playlist
+        # flow exclusively instead of public RSS feeds (issue #24) - RSS is
+        # only used as a fallback while this is unset. See
+        # app/youtube_data_api.py.
+        self.youtube_data_api_key: str | None = _env("YOUTUBE_DATA_API_KEY")
+
         self.youtube_proxy_type: str | None = _env("YOUTUBE_PROXY_TYPE")
         self.webshare_proxy_username: str | None = _env("WEBSHARE_PROXY_USERNAME")
         self.webshare_proxy_password: str | None = _env("WEBSHARE_PROXY_PASSWORD")

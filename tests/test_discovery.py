@@ -70,6 +70,10 @@ def _stub_stores(monkeypatch, *, channels, index=None, queue=None):
     monkeypatch.setattr(discovery.drive, "read_index", lambda folder_id: index or {})
     monkeypatch.setattr(discovery.queue_store, "read_queue", lambda folder_id: queue or [])
     monkeypatch.setattr(discovery, "_utcnow", lambda: FIXED_NOW)
+    # Default to the RSS path unless a test explicitly opts into the API path -
+    # keeps these tests deterministic regardless of the local/CI environment's
+    # actual YOUTUBE_DATA_API_KEY.
+    monkeypatch.setattr(discovery.settings, "youtube_data_api_key", None)
     written = {}
     monkeypatch.setattr(
         discovery.queue_store, "write_queue", lambda folder_id, entries: written.setdefault("entries", entries)
@@ -293,6 +297,108 @@ def test_backfill_new_channels_is_a_noop_when_nothing_needs_it(monkeypatch):
     assert report.channels_configured == 0
     assert report.newly_queued == 0
     assert "entries" not in written
+
+
+def test_discover_and_enqueue_uses_api_exclusively_when_key_is_set(monkeypatch):
+    """With YOUTUBE_DATA_API_KEY set, the API path is used and RSS is never
+    touched at all - no per-channel dual-fetch."""
+    channel = Channel("UC_a", "Channel A", enabled=True)
+    written = _stub_stores(monkeypatch, channels=[channel])
+    monkeypatch.setattr(discovery.settings, "youtube_data_api_key", "the-key")
+    monkeypatch.setattr(discovery.uploads_playlist_store, "read_cache", lambda folder_id: {"UC_a": "PL_a"})
+    rss_called = []
+    monkeypatch.setattr(discovery, "fetch_channel_feed", lambda channel_id: rss_called.append(channel_id))
+    monkeypatch.setattr(
+        discovery.youtube_data_api,
+        "fetch_uploads_playlist_videos",
+        lambda playlist_id, api_key, known_ids, channel_id: [
+            discovery.DiscoveredVideo("apivideo11", channel_id, "2026-07-01T00:00:00+00:00")
+        ],
+    )
+
+    report = discovery.discover_and_enqueue("folder-id")
+
+    assert not rss_called
+    assert written["entries"] == [
+        {
+            "url": "https://www.youtube.com/watch?v=apivideo11",
+            "first_seen_at": FIXED_NOW.isoformat(),
+            "channel_id": "UC_a",
+            "published_at": "2026-07-01T00:00:00+00:00",
+        }
+    ]
+    assert report.newly_queued == 1
+
+
+def test_discover_and_enqueue_uses_rss_when_key_is_unset(monkeypatch):
+    channel = Channel("UC_a", "Channel A", enabled=True)
+    written = _stub_stores(monkeypatch, channels=[channel])
+    monkeypatch.setattr(discovery.settings, "youtube_data_api_key", None)
+    api_called = []
+    monkeypatch.setattr(
+        discovery.youtube_data_api,
+        "fetch_uploads_playlist_videos",
+        lambda *a, **k: api_called.append(a),
+    )
+    monkeypatch.setattr(
+        discovery, "fetch_channel_feed", lambda channel_id: [discovery.DiscoveredVideo("rssvideo11", "UC_a", None)]
+    )
+
+    report = discovery.discover_and_enqueue("folder-id")
+
+    assert not api_called
+    assert written["entries"][0]["url"] == "https://www.youtube.com/watch?v=rssvideo11"
+    assert report.newly_queued == 1
+
+
+def test_discover_and_enqueue_resolves_and_caches_uploads_playlist_id(monkeypatch):
+    """A channel with no cached playlist ID gets resolved via the API and the
+    cache is persisted - but only once (subsequent runs shouldn't need
+    another channels.list call)."""
+    channel = Channel("UC_a", "Channel A", enabled=True)
+    written = _stub_stores(monkeypatch, channels=[channel])
+    monkeypatch.setattr(discovery.settings, "youtube_data_api_key", "the-key")
+    monkeypatch.setattr(discovery.uploads_playlist_store, "read_cache", lambda folder_id: {})
+    cache_written = {}
+    monkeypatch.setattr(
+        discovery.uploads_playlist_store, "write_cache", lambda folder_id, cache: cache_written.update(cache)
+    )
+    monkeypatch.setattr(discovery.youtube_data_api, "resolve_uploads_playlist_id", lambda channel_id, api_key: "PL_resolved")
+    monkeypatch.setattr(discovery.youtube_data_api, "fetch_uploads_playlist_videos", lambda *a, **k: [])
+
+    discovery.discover_and_enqueue("folder-id")
+
+    assert cache_written == {"UC_a": "PL_resolved"}
+
+
+def test_discover_and_enqueue_isolates_one_channels_api_failure(monkeypatch):
+    good = Channel("UC_good", "Good Channel", enabled=True)
+    bad = Channel("UC_bad", "Bad Channel", enabled=True)
+    written = _stub_stores(monkeypatch, channels=[bad, good])
+    monkeypatch.setattr(discovery.settings, "youtube_data_api_key", "the-key")
+    monkeypatch.setattr(
+        discovery.uploads_playlist_store, "read_cache", lambda folder_id: {"UC_good": "PL_good", "UC_bad": "PL_bad"}
+    )
+
+    def _fetch(playlist_id, api_key, known_ids, channel_id):
+        if channel_id == "UC_bad":
+            raise discovery.YouTubeDataApiError("quota exceeded")
+        return [discovery.DiscoveredVideo("goodvideo1", "UC_good", None)]
+
+    monkeypatch.setattr(discovery.youtube_data_api, "fetch_uploads_playlist_videos", _fetch)
+
+    report = discovery.discover_and_enqueue("folder-id")
+
+    assert written["entries"] == [
+        {
+            "url": "https://www.youtube.com/watch?v=goodvideo1",
+            "first_seen_at": FIXED_NOW.isoformat(),
+            "channel_id": "UC_good",
+        }
+    ]
+    assert report.newly_queued == 1
+    assert len(report.feed_failures) == 1
+    assert report.feed_failures[0][0] == "UC_bad"
 
 
 def test_backfill_new_channels_isolates_one_channels_feed_failure(monkeypatch):
