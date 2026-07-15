@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from . import channel_store, drive, group_store
+from . import channel_store, drive, group_store, usage_ledger
 from .channel_store import DEFAULT_GROUP, resolve_group
 from .config import settings
 from .summarize import PROMPT_VERSION, SummarizationError, estimate_cost_usd, strip_frontmatter, summarize_transcript, transcript_hash
@@ -86,10 +86,12 @@ def _run_one(job: _Job) -> tuple[str, str, int, int, float, str | None]:
             input_tokens += exc.usage.input_tokens
             output_tokens += exc.usage.output_tokens
         cost = estimate_cost_usd(settings.summary_model, input_tokens, output_tokens) or 0.0
-        # Persisted even on failure - a failed attempt still burns real
-        # tokens, and the admin cost/usage summary (app/insights_store.py's
-        # CostUsageSummary) needs to account for that spend too, not just
-        # successful summaries.
+        # This per-attempt usage is also recorded in the usage ledger below
+        # (app/usage_ledger.py) - that's what the admin cost/usage summary
+        # actually sums, since this artifact gets overwritten by any later
+        # attempt for this same video and would otherwise lose the prior
+        # attempt's usage. Kept here too only as convenient per-video debug
+        # info about this artifact's own most recent attempt.
         artifact = {
             **job.base, "status": "error", "message": str(exc),
             "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens, "estimated_cost_usd": cost},
@@ -164,14 +166,29 @@ def summarize_backlog(folder_id: str) -> SummaryReport:
         jobs.append(_Job(video_id, body, video_types, descriptions, base, summaries_folder))
 
     report.eligible = len(jobs)
+    # Collected here (in this one calling thread, after pool.map() has
+    # already drained every worker) and appended to the usage ledger in a
+    # single call below - never one append call per worker thread, which
+    # would race itself writing the same Drive file concurrently (see
+    # usage_ledger.append_entries()'s docstring).
+    ledger_entries: list[dict] = []
     with ThreadPoolExecutor(max_workers=settings.summary_worker_concurrency) as pool:
         for video_id, outcome, ins, outs, cost, error in pool.map(_run_one, jobs):
             report.input_tokens += ins
             report.output_tokens += outs
             report.estimated_cost_usd += cost
+            ledger_entries.append({
+                "video_id": video_id,
+                "outcome": "ok" if outcome == "structured" else "error",
+                "input_tokens": ins,
+                "output_tokens": outs,
+                "estimated_cost_usd": cost,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            })
             if outcome == "structured":
                 report.summarized += 1
             else:
                 report.failed += 1
                 report.failures.append((video_id, error or "summary failed"))
+    usage_ledger.append_entries(folder_id, ledger_entries)
     return report

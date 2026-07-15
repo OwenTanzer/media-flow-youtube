@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 
-from . import channel_store, drive, summary_store
+from . import channel_store, drive, summary_store, usage_ledger
 from .channel_store import Channel, DEFAULT_GROUP, resolve_group
 
 logger = logging.getLogger("media_flow.insights_store")
@@ -59,23 +59,28 @@ class VideoInsight:
 
 @dataclass
 class CostUsageSummary:
-    """Aggregate Claude spend/usage across every summary artifact this
-    snapshot has already fetched (app/backlog_summarizer.py persists a
-    "usage" block - input_tokens, output_tokens, estimated_cost_usd - on
-    both successful and failed attempts, since a failed one still burns
-    real tokens). Powers the admin panel's cost/usage summary without a
-    second Drive read pass."""
+    """Lifetime Claude spend/usage, aggregated from the append-only usage
+    ledger (app/usage_ledger.py) - one entry per summarization attempt,
+    success or failure, never overwritten. This is deliberately not
+    computed from the current summary artifacts themselves: those are
+    overwritten in place on a retry or an explicit
+    SUMMARY_FORCE_RESUMMARIZE_VIDEO_IDS replacement, so counting only what's
+    currently on an artifact would undercount real spend (a failed attempt
+    followed by a successful retry, or a forced re-summarization, would
+    silently drop the earlier attempt's usage) and would make "failed
+    attempts" mean "currently-failed videos" rather than the number of
+    attempts that actually failed over time.
 
-    total_summarized: int = 0  # artifacts with status "ok"
-    total_failed: int = 0  # artifacts with status "error"
+    Only counts attempts recorded since the usage ledger started being
+    written (i.e. since this feature shipped) - any Claude spend from
+    before that isn't included in these totals."""
+
+    total_attempts: int = 0
+    successful_attempts: int = 0
+    failed_attempts: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_estimated_cost_usd: float = 0.0
-    # Artifacts written before "usage" existed (or by the old, superseded
-    # summary_store.summarize_eligible() path, which nested these fields
-    # differently) - their tokens/cost simply aren't counted above, so this
-    # tells the admin panel its total is a floor, not exact, when nonzero.
-    videos_missing_usage_data: int = 0
 
 
 @dataclass
@@ -164,29 +169,22 @@ def _build_video_insight(
     )
 
 
-def _compute_cost_usage(artifacts: dict[str, dict]) -> CostUsageSummary:
+def _compute_cost_usage(ledger_entries: list[dict]) -> CostUsageSummary:
     summary = CostUsageSummary()
-    for artifact in artifacts.values():
-        if not isinstance(artifact, dict):
+    for entry in ledger_entries:
+        if not isinstance(entry, dict):
             continue
-        status = artifact.get("status")
-        if status == "ok":
-            summary.total_summarized += 1
-        elif status == "error":
-            summary.total_failed += 1
-        else:
+        input_tokens = entry.get("input_tokens")
+        output_tokens = entry.get("output_tokens")
+        cost = entry.get("estimated_cost_usd")
+        if not isinstance(input_tokens, int) or not isinstance(output_tokens, int) or not isinstance(cost, (int, float)):
             continue
 
-        usage = artifact.get("usage")
-        if not isinstance(usage, dict):
-            summary.videos_missing_usage_data += 1
-            continue
-        input_tokens = usage.get("input_tokens")
-        output_tokens = usage.get("output_tokens")
-        cost = usage.get("estimated_cost_usd")
-        if not isinstance(input_tokens, int) or not isinstance(output_tokens, int) or not isinstance(cost, (int, float)):
-            summary.videos_missing_usage_data += 1
-            continue
+        summary.total_attempts += 1
+        if entry.get("outcome") == "ok":
+            summary.successful_attempts += 1
+        elif entry.get("outcome") == "error":
+            summary.failed_attempts += 1
         summary.total_input_tokens += input_tokens
         summary.total_output_tokens += output_tokens
         summary.total_estimated_cost_usd += cost
@@ -245,10 +243,12 @@ def load_snapshot(folder_id: str) -> InsightsSnapshot:
 
         videos.append(insight)
 
+    cost_usage = _compute_cost_usage(usage_ledger.read_ledger(folder_id))
+
     return InsightsSnapshot(
         videos=videos,
         channels=channels,
         pending_count=pending_count,
-        cost_usage=_compute_cost_usage(artifacts),
+        cost_usage=cost_usage,
         load_errors=load_errors,
     )

@@ -954,21 +954,31 @@ for details/limitations).
 #### Cost & usage summary
 
 The Admin tab shows a **Cost & usage** panel above the channel form once
-unlocked: total summaries generated, failed attempts, total input/output
-tokens, and total estimated Claude spend, aggregated across every summary
-artifact in the archive (`app/insights_store.py`'s `CostUsageSummary`,
-computed for free from the same bulk read `load_snapshot()` already does -
-no extra Drive round trip). Failed attempts are counted too, since a
+unlocked: successful attempts, failed attempts, total input/output tokens,
+and total estimated Claude spend. Failed attempts are counted too, since a
 summarization attempt that ultimately fails (a safety refusal, unparseable
 output) still consumes billed tokens.
 
-`app/backlog_summarizer.py` persists a `"usage": {"input_tokens": ...,
-"output_tokens": ..., "estimated_cost_usd": ...}` block on every artifact
-it writes, success or failure, which is what this panel sums. Artifacts
-written before this existed have no such block, so their tokens/cost
-aren't counted - if any exist, the panel shows how many and notes the
-total is a floor (actual lifetime spend is at least that much), rather
-than silently under-reporting with no indication.
+These are lifetime totals from an **append-only usage ledger**
+(`_usage_ledger.json` in the Drive folder, written by `app/usage_ledger.py`),
+not a count derived from the current summary artifacts. That distinction
+matters because a summary artifact (`summaries/<video_id>.json`) is
+overwritten in place every time a video is (re)attempted - a failed attempt
+followed by a successful retry replaces the failure and its usage; an
+explicit `SUMMARY_FORCE_RESUMMARIZE_VIDEO_IDS` replacement replaces the
+previous successful usage. Counting only what's currently on an artifact
+would therefore undercount real spend (the earlier attempt's tokens are
+gone) and would make "failed attempts" mean "videos currently in a failed
+state" rather than the number of attempts that actually failed over time.
+`app/backlog_summarizer.py` instead appends one ledger entry per attempt -
+success or failure - in a single batched write after each run (see
+`app/insights_store.py`'s `CostUsageSummary`), so retries and forced
+re-summarizations are each counted separately and the totals never
+decrease. The one gap: attempts made before this ledger existed aren't
+retroactively included, so totals only cover spend since this tracking
+shipped.
+
+Minor insight points are shown alongside major ones by default (major
 points bold, minor visually de-emphasized) with a "Show minor points"
 toggle in the detail view to hide them - no point is ever permanently
 hidden.

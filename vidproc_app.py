@@ -187,25 +187,25 @@ def render_group(group: str, snapshot: InsightsSnapshot) -> None:
 
 
 def render_cost_usage_summary(cost_usage: CostUsageSummary) -> None:
-    """Aggregate Claude spend/usage across every summary artifact fetched
-    for this snapshot (app/insights_store.py's CostUsageSummary) - both
-    successful and failed summarization attempts count, since a failed one
-    still burns real tokens. Numbers before backlog_summarizer.py started
-    persisting a "usage" block on each artifact aren't counted (see
-    videos_missing_usage_data below), so this is a floor, not exact spend,
-    until enough of the archive has been (re)generated since."""
+    """Lifetime Claude spend/usage from the append-only usage ledger
+    (app/insights_store.py's CostUsageSummary, backed by
+    app/usage_ledger.py) - counts every summarization attempt, success or
+    failure, since a failed one still burns real tokens. Deliberately not
+    derived from the current summary artifacts: those are overwritten in
+    place on a retry or a forced re-summarization, which would silently
+    drop earlier attempts' usage and understate real spend."""
 
     st.markdown("<div class='vidproc-meta-text'>Cost &amp; usage (Claude summarization)</div>", unsafe_allow_html=True)
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Summaries generated", cost_usage.total_summarized)
-    col2.metric("Failed attempts", cost_usage.total_failed)
+    col1.metric("Successful attempts", cost_usage.successful_attempts)
+    col2.metric("Failed attempts", cost_usage.failed_attempts)
     col3.metric("Tokens (in / out)", f"{cost_usage.total_input_tokens:,} / {cost_usage.total_output_tokens:,}")
     col4.metric("Estimated cost", f"${cost_usage.total_estimated_cost_usd:,.4f}")
-    if cost_usage.videos_missing_usage_data:
-        st.caption(
-            f"{cost_usage.videos_missing_usage_data} artifact(s) predate per-video usage tracking and aren't "
-            "included above - actual lifetime spend is at least this much."
-        )
+    st.caption(
+        "Lifetime totals from every recorded summarization attempt (retries and forced "
+        "re-summarizations each count separately, so these numbers never decrease). Only "
+        "covers attempts since this tracking shipped - earlier spend isn't included."
+    )
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
 

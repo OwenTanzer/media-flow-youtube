@@ -122,6 +122,53 @@ def test_summarize_backlog_force_resummarizes_explicitly_listed_video(monkeypatc
     assert report.skipped_current == 1
 
 
+def test_summarize_backlog_appends_one_ledger_entry_per_attempt(monkeypatch):
+    """The usage ledger (app/usage_ledger.py) - not the overwritten-in-place
+    summary artifact - is what the admin cost/usage summary sums, since it's
+    append-only and survives retries/forced re-summarization."""
+    index = {
+        "video1": {"status": "ok", "filename": "video1.md"},
+        "video2": {"status": "ok", "filename": "video2.md"},
+    }
+    markdown = {
+        "video1.md": "---\nauthor: Someone\n---\n\n[00:00] transcript one",
+        "video2.md": "---\nauthor: Someone\n---\n\n[00:00] transcript two",
+    }
+    _stub_backlog(monkeypatch, index=index, artifacts={}, markdown_by_filename=markdown)
+
+    def _summarize(body, **kwargs):
+        if "one" in body:
+            return ResolvedSummary(video_type="Type", summary="ok", points=[]), Usage(input_tokens=10, output_tokens=5), False
+        raise SummarizationError("boom", usage=Usage(input_tokens=8, output_tokens=0))
+
+    monkeypatch.setattr(worker, "summarize_transcript", _summarize)
+    appended = []
+    monkeypatch.setattr(worker.usage_ledger, "append_entries", lambda folder_id, entries: appended.append(entries))
+
+    worker.summarize_backlog("folder-id")
+
+    assert len(appended) == 1
+    entries = {entry["video_id"]: entry for entry in appended[0]}
+    assert entries["video1"]["outcome"] == "ok"
+    assert entries["video1"]["input_tokens"] == 10
+    assert entries["video2"]["outcome"] == "error"
+    assert entries["video2"]["input_tokens"] == 8
+    assert "recorded_at" in entries["video1"]
+
+
+def test_summarize_backlog_does_not_append_to_ledger_when_nothing_ran(monkeypatch):
+    index = {"video1": {"status": "ok", "filename": "video1.md"}}
+    artifacts = {"video1": {"status": "ok", "summary": "existing"}}
+    markdown = {"video1.md": "---\nauthor: Someone\n---\n\n[00:00] transcript"}
+    _stub_backlog(monkeypatch, index=index, artifacts=artifacts, markdown_by_filename=markdown)
+    appended = []
+    monkeypatch.setattr(worker.usage_ledger, "append_entries", lambda folder_id, entries: appended.append(entries))
+
+    worker.summarize_backlog("folder-id")
+
+    assert appended == [[]]
+
+
 def test_one_structured_attempt_records_a_failure_without_fallback(monkeypatch):
     job = worker._Job("video", "[00:00] transcript", ["Type"], {}, {"video_id": "video"}, "summaries")
     structured_calls = []
