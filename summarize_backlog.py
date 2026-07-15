@@ -24,9 +24,9 @@ def main() -> int:
         return 1
     report = summarize_backlog(folder_id)
     logger.info(
-        "Summaries: %d eligible, %d current, %d structured, %d failed "
+        "Summaries: %d eligible, %d already completed (skipped), %d force-resummarized, %d structured, %d failed "
         "(~%d input / ~%d output tokens, ~$%.4f).",
-        report.eligible, report.skipped_current, report.summarized, report.failed,
+        report.eligible, report.skipped_current, report.forced, report.summarized, report.failed,
         report.input_tokens, report.output_tokens, report.estimated_cost_usd,
     )
     for video_id, message in report.failures:

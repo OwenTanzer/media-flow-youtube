@@ -133,6 +133,19 @@ class Settings:
                 f"SUMMARY_MAX_ATTEMPTS_PER_VIDEO must be a positive integer, got {self.summary_max_attempts_per_video}."
             )
 
+        # Explicit, targeted opt-in for regenerating a video whose summary
+        # already completed successfully (issue #26) - a comma-separated
+        # list of video IDs an operator sets for one run (then unsets) to
+        # force just those videos through summarize_backlog() again, e.g.
+        # after a deliberate prompt/model change they want re-applied to
+        # specific videos. Empty by default: a completed summary is
+        # otherwise never replaced merely because the normal backlog job
+        # runs, regardless of transcript/model/prompt/taxonomy drift - see
+        # app/backlog_summarizer.py's _has_completed_summary().
+        self.summary_force_resummarize_video_ids: frozenset[str] = frozenset(
+            video_id.strip() for video_id in _env("SUMMARY_FORCE_RESUMMARIZE_VIDEO_IDS", "").split(",") if video_id.strip()
+        )
+
         self.summary_retry_backoff_seconds: float = float(_env("SUMMARY_RETRY_BACKOFF_SECONDS", "900"))
         if self.summary_retry_backoff_seconds < 0 or not math.isfinite(self.summary_retry_backoff_seconds):
             raise ConfigError(

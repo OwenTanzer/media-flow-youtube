@@ -479,6 +479,22 @@ entries, and a failure summarizing one video never blocks transcript
 discovery or archiving, since it runs strictly after both of those
 complete.
 
+**Replacement policy (issue #26):** a video with a completed (`status:
+"ok"`) summary is skipped on every subsequent run, full stop - not just
+while its `source_transcript_hash`/`model`/`prompt_version`/taxonomy still
+match what produced it. A published summary is authoritative by default;
+the normal backlog job never silently regenerates or overwrites one, even
+after a transcript re-fetch, a `SUMMARY_MODEL` change, a `PROMPT_VERSION`
+bump, or an edited group's `video_types`. Only a `status: "error"` artifact
+(or no artifact at all) stays eligible every run. The only way to replace a
+completed summary is the explicit, targeted opt-in:
+`SUMMARY_FORCE_RESUMMARIZE_VIDEO_IDS` (see [`.env.example`](.env.example)) -
+a comma-separated video ID list set for one run, then unset again. Each run
+logs how many videos were skipped for already having a completed summary
+versus force-resummarized versus genuinely new/failed work, so queue status
+stays legible (`app/backlog_summarizer.py`'s `SummaryReport.skipped_current`
+vs. `.forced` vs. `.eligible`/`.failed`).
+
 ### Setup
 
 Set `ANTHROPIC_API_KEY` wherever the independent summary worker runs. This
@@ -660,6 +676,12 @@ guided to be 2-4 sentences rather than 1-3, favoring real specifics
 (numbers, reasoning, context) over terseness.
 
 ### Idempotency and retries
+
+> **This section describes `app/summary_store.py`'s `summarize_eligible()`,
+> which is not currently called anywhere (superseded by the simpler
+> `app/backlog_summarizer.py` described above) - kept for reference in case
+> that richer retry/fallback machinery is reinstated. For the worker
+> actually running in production, see "Replacement policy" above instead.
 
 A video is skipped only when a summary already exists with `status: "ok"`
 and its `source_transcript_hash`, `model`, and `prompt_version` all still
