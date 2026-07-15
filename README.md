@@ -951,7 +951,24 @@ purely driven by `channels.json` membership. Run
 already-archived summaries from before that field existed (see the script
 for details/limitations).
 
-Minor insight points are shown alongside major ones by default (major
+#### Cost & usage summary
+
+The Admin tab shows a **Cost & usage** panel above the channel form once
+unlocked: total summaries generated, failed attempts, total input/output
+tokens, and total estimated Claude spend, aggregated across every summary
+artifact in the archive (`app/insights_store.py`'s `CostUsageSummary`,
+computed for free from the same bulk read `load_snapshot()` already does -
+no extra Drive round trip). Failed attempts are counted too, since a
+summarization attempt that ultimately fails (a safety refusal, unparseable
+output) still consumes billed tokens.
+
+`app/backlog_summarizer.py` persists a `"usage": {"input_tokens": ...,
+"output_tokens": ..., "estimated_cost_usd": ...}` block on every artifact
+it writes, success or failure, which is what this panel sums. Artifacts
+written before this existed have no such block, so their tokens/cost
+aren't counted - if any exist, the panel shows how many and notes the
+total is a floor (actual lifetime spend is at least that much), rather
+than silently under-reporting with no indication.
 points bold, minor visually de-emphasized) with a "Show minor points"
 toggle in the detail view to hide them - no point is ever permanently
 hidden.

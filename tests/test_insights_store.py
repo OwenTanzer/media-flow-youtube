@@ -237,3 +237,52 @@ def test_load_snapshot_missing_video_published_at_is_none(monkeypatch):
     assert snapshot.videos[0].video_published_at is None
     # generated_at is still parsed - it's the sort fallback for undated videos.
     assert snapshot.videos[0].generated_at == datetime(2026, 7, 11, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def test_load_snapshot_cost_usage_aggregates_successful_and_failed_artifacts(monkeypatch):
+    ok_artifact = _artifact(usage={"input_tokens": 1000, "output_tokens": 200, "estimated_cost_usd": 0.01})
+    failed_artifact = {
+        "status": "error", "message": "boom",
+        "usage": {"input_tokens": 500, "output_tokens": 0, "estimated_cost_usd": 0.002},
+    }
+    _stub(
+        monkeypatch,
+        channels=[],
+        index={"vid1": {"status": "ok"}, "vid2": {"status": "ok"}},
+        summaries={"vid1": ok_artifact, "vid2": failed_artifact},
+    )
+
+    snapshot = insights_store.load_snapshot("folder-id")
+
+    assert snapshot.cost_usage.total_summarized == 1
+    assert snapshot.cost_usage.total_failed == 1
+    assert snapshot.cost_usage.total_input_tokens == 1500
+    assert snapshot.cost_usage.total_output_tokens == 200
+    assert snapshot.cost_usage.total_estimated_cost_usd == pytest.approx(0.012)
+    assert snapshot.cost_usage.videos_missing_usage_data == 0
+
+
+def test_load_snapshot_cost_usage_counts_artifacts_missing_usage_block(monkeypatch):
+    """Artifacts written before backlog_summarizer.py persisted "usage" (or
+    by the older, superseded summary_store.summarize_eligible() path) have
+    no usage data to count - they should be flagged as missing, not silently
+    treated as zero-cost."""
+    pre_migration_artifact = _artifact()
+    pre_migration_artifact.pop("usage", None)
+    _stub(
+        monkeypatch,
+        channels=[],
+        index={"vid1": {"status": "ok"}},
+        summaries={"vid1": pre_migration_artifact},
+    )
+
+    snapshot = insights_store.load_snapshot("folder-id")
+
+    assert snapshot.cost_usage.total_summarized == 1
+    assert snapshot.cost_usage.total_input_tokens == 0
+    assert snapshot.cost_usage.videos_missing_usage_data == 1
+
+
+def test_load_snapshot_cost_usage_ignores_pending_videos():
+    summary = insights_store._compute_cost_usage({})
+    assert summary == insights_store.CostUsageSummary()

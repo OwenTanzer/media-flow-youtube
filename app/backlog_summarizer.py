@@ -85,11 +85,21 @@ def _run_one(job: _Job) -> tuple[str, str, int, int, float, str | None]:
         if exc.usage:
             input_tokens += exc.usage.input_tokens
             output_tokens += exc.usage.output_tokens
-        _write(job.summaries_folder_id, job.video_id, {**job.base, "status": "error", "message": str(exc)})
-        return job.video_id, "failed", input_tokens, output_tokens, estimate_cost_usd(settings.summary_model, input_tokens, output_tokens) or 0.0, str(exc)
+        cost = estimate_cost_usd(settings.summary_model, input_tokens, output_tokens) or 0.0
+        # Persisted even on failure - a failed attempt still burns real
+        # tokens, and the admin cost/usage summary (app/insights_store.py's
+        # CostUsageSummary) needs to account for that spend too, not just
+        # successful summaries.
+        artifact = {
+            **job.base, "status": "error", "message": str(exc),
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens, "estimated_cost_usd": cost},
+        }
+        _write(job.summaries_folder_id, job.video_id, artifact)
+        return job.video_id, "failed", input_tokens, output_tokens, cost, str(exc)
 
     input_tokens += usage.input_tokens
     output_tokens += usage.output_tokens
+    cost = estimate_cost_usd(settings.summary_model, input_tokens, output_tokens) or 0.0
     points = []
     for point in output.points:
         item = {"importance": point.importance, "main_point": point.main_point, "explanation": point.explanation}
@@ -97,11 +107,14 @@ def _run_one(job: _Job) -> tuple[str, str, int, int, float, str | None]:
             item["timestamp_seconds"] = point.timestamp_seconds
             item["timestamp"] = format_timestamp(point.timestamp_seconds)
         points.append(item)
-    artifact = {**job.base, "status": "ok", "video_type": output.video_type, "summary": output.summary, "points": points}
+    artifact = {
+        **job.base, "status": "ok", "video_type": output.video_type, "summary": output.summary, "points": points,
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens, "estimated_cost_usd": cost},
+    }
     if points_truncated:
         artifact["points_truncated"] = True
     _write(job.summaries_folder_id, job.video_id, artifact)
-    return job.video_id, "structured", input_tokens, output_tokens, estimate_cost_usd(settings.summary_model, input_tokens, output_tokens) or 0.0, None
+    return job.video_id, "structured", input_tokens, output_tokens, cost, None
 
 
 def summarize_backlog(folder_id: str) -> SummaryReport:

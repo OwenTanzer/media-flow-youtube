@@ -23,7 +23,7 @@ import streamlit as st
 
 from app import group_store
 from app.config import ConfigError, settings
-from app.insights_store import InsightsSnapshot, load_snapshot
+from app.insights_store import CostUsageSummary, InsightsSnapshot, load_snapshot
 from vidproc.admin import (
     NEW_GROUP_OPTION,
     ChannelAlreadyExistsError,
@@ -186,13 +186,37 @@ def render_group(group: str, snapshot: InsightsSnapshot) -> None:
             st.rerun()
 
 
-def render_admin_panel(folder_id: str, channels: list) -> None:
+def render_cost_usage_summary(cost_usage: CostUsageSummary) -> None:
+    """Aggregate Claude spend/usage across every summary artifact fetched
+    for this snapshot (app/insights_store.py's CostUsageSummary) - both
+    successful and failed summarization attempts count, since a failed one
+    still burns real tokens. Numbers before backlog_summarizer.py started
+    persisting a "usage" block on each artifact aren't counted (see
+    videos_missing_usage_data below), so this is a floor, not exact spend,
+    until enough of the archive has been (re)generated since."""
+
+    st.markdown("<div class='vidproc-meta-text'>Cost &amp; usage (Claude summarization)</div>", unsafe_allow_html=True)
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Summaries generated", cost_usage.total_summarized)
+    col2.metric("Failed attempts", cost_usage.total_failed)
+    col3.metric("Tokens (in / out)", f"{cost_usage.total_input_tokens:,} / {cost_usage.total_output_tokens:,}")
+    col4.metric("Estimated cost", f"${cost_usage.total_estimated_cost_usd:,.4f}")
+    if cost_usage.videos_missing_usage_data:
+        st.caption(
+            f"{cost_usage.videos_missing_usage_data} artifact(s) predate per-video usage tracking and aren't "
+            "included above - actual lifetime spend is at least this much."
+        )
+    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+
+
+def render_admin_panel(folder_id: str, channels: list, cost_usage: CostUsageSummary) -> None:
     """Password(-token)-gated panel for adding a channel without editing
     channels.json directly in Drive. Only reachable at all if
     VIDPROC_ADMIN_TOKEN is configured - see main()'s tab list below and
     app/config.py. `channels` (the current snapshot's channel list) is
     needed to populate the group selectbox below with every existing
-    group - see NEW_GROUP_OPTION."""
+    group - see NEW_GROUP_OPTION. `cost_usage` is the same snapshot's
+    already-computed Claude spend/usage totals (see render_cost_usage_summary())."""
 
     if not st.session_state.admin_authenticated:
         st.markdown(
@@ -211,6 +235,8 @@ def render_admin_panel(folder_id: str, channels: list) -> None:
     if st.button("Lock", key="admin-lock"):
         st.session_state.admin_authenticated = False
         st.rerun()
+
+    render_cost_usage_summary(cost_usage)
 
     # Set by a prior "Add channel" click, right before its own st.rerun()
     # below - without stashing it in session_state across that rerun, the
@@ -351,7 +377,7 @@ def main() -> None:
             render_group(group, snapshot)
     if show_admin:
         with tabs[-1]:
-            render_admin_panel(folder_id, snapshot.channels)
+            render_admin_panel(folder_id, snapshot.channels, snapshot.cost_usage)
 
 
 if __name__ == "__main__":

@@ -140,6 +140,30 @@ def test_one_structured_attempt_records_a_failure_without_fallback(monkeypatch):
     assert error == "bad structured output"
     assert len(structured_calls) == 1
     assert written[0]["status"] == "error"
+    assert written[0]["usage"] == {"input_tokens": 0, "output_tokens": 0, "estimated_cost_usd": 0.0}
+
+
+def test_failed_attempt_with_billed_usage_persists_it_on_the_artifact(monkeypatch):
+    """Issue: a failed attempt (e.g. a safety refusal) can still have
+    consumed real tokens - that usage must be persisted on the error
+    artifact too, not just successful ones, so the admin cost/usage summary
+    (app/insights_store.py's CostUsageSummary) accounts for the spend."""
+    job = worker._Job("video", "[00:00] transcript", ["Type"], {}, {"video_id": "video"}, "summaries")
+    written = []
+
+    def _structured(*args, **kwargs):
+        raise SummarizationError("refused", usage=Usage(input_tokens=100, output_tokens=10))
+
+    monkeypatch.setattr(worker, "summarize_transcript", _structured)
+    monkeypatch.setattr(worker, "_write", lambda *args: written.append(args[-1]))
+
+    video_id, outcome, input_tokens, output_tokens, cost, error = worker._run_one(job)
+
+    assert outcome == "failed"
+    assert input_tokens == 100
+    assert output_tokens == 10
+    assert cost > 0
+    assert written[0]["usage"] == {"input_tokens": 100, "output_tokens": 10, "estimated_cost_usd": cost}
 
 
 def test_unanchored_point_is_persisted_without_timestamp(monkeypatch):
