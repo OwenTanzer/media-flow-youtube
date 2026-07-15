@@ -94,6 +94,50 @@ def create_group(folder_id: str, name: str, video_types: list[str]) -> Group:
     return new_group
 
 
+def update_group_video_types(folder_id: str, name: str, video_types: list[str]) -> Group:
+    """Replaces an existing group's video_types list in groups.json - the
+    editing half of create_group()/delete_group(). Does not rename
+    groups: a group's name is also the value channels.json's Channel.group
+    field stores directly (see app/channel_store.py), so renaming here
+    would silently orphan every channel still set to the old name rather
+    than updating them - out of scope for this function.
+
+    Raises ValueError for no non-blank video_types, or if name isn't
+    currently registered (use create_group() to add a new one)."""
+
+    cleaned_types = [t.strip() for t in video_types if t.strip()]
+    if not cleaned_types:
+        raise ValueError(f"At least one video type is required for group {name!r}.")
+
+    existing = group_store.read_groups(folder_id)
+    if not any(g.name == name for g in existing):
+        raise ValueError(f"Group {name!r} is not registered.")
+
+    updated_groups = [Group(name=g.name, video_types=cleaned_types) if g.name == name else g for g in existing]
+    group_store.write_groups(folder_id, updated_groups)
+    return next(g for g in updated_groups if g.name == name)
+
+
+def delete_group(folder_id: str, name: str) -> None:
+    """Removes a group's classification configuration from groups.json
+    entirely. Does not touch channels.json: any channel still set to this
+    group keeps that value, and just falls back to the default group's
+    video_types (or summarize.FALLBACK_VIDEO_TYPES) the next time it's
+    summarized, until the group is reconfigured or the channel is moved -
+    the same fallback behavior as a group that was never configured in
+    groups.json at all (see app/group_store.py's get_video_types()). The
+    dashboard's group tab itself isn't affected either - tabs are derived
+    from channels.json's group values (see vidproc/state.py), independent
+    of groups.json.
+
+    Raises ValueError if name isn't currently registered."""
+
+    existing = group_store.read_groups(folder_id)
+    if not any(g.name == name for g in existing):
+        raise ValueError(f"Group {name!r} is not registered.")
+    group_store.write_groups(folder_id, [g for g in existing if g.name != name])
+
+
 def resolve_group_selection(folder_id: str, selected: str, new_group_name: str, new_group_video_types: list[str]) -> str:
     """Resolves the admin panel's group selectbox into the actual `group`
     value to pass to add_channel_and_backfill(). Picking an existing

@@ -534,6 +534,15 @@ Changing a group's `video_types` only affects videos summarized
 *afterward* - it's not retroactive, and doesn't itself force
 re-summarization of anything already archived.
 
+An existing group's `video_types` can be edited or deleted later too, via
+the Admin tab's "Manage groups" section (an expander per group, with
+"Save" to replace its list and "Delete" to remove its configuration
+entirely) - see "Admin panel" below. Neither operation renames a group or
+touches `channels.json`: deleting a group's configuration just makes any
+channel still assigned to it fall back to the default group's
+`video_types` (or the hardcoded default) until it's reconfigured or the
+channel is moved to a different group.
+
 **`timestamp_seconds` is never trusted from the model at all - not even as
 a self-reported number.** An earlier version asked the model to compute
 `timestamp_seconds` directly and only range-checked the result, which let

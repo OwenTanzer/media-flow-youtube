@@ -21,6 +21,7 @@ import time
 
 import streamlit as st
 
+from app import group_store
 from app.config import ConfigError, settings
 from app.insights_store import InsightsSnapshot, load_snapshot
 from vidproc.admin import (
@@ -29,7 +30,9 @@ from vidproc.admin import (
     add_channel_and_backfill,
     admin_flash_for,
     check_admin_token,
+    delete_group,
     resolve_group_selection,
+    update_group_video_types,
 )
 from vidproc.render import render_detail, render_empty_state, render_feed_card, render_notice
 from vidproc.state import (
@@ -268,6 +271,41 @@ def render_admin_panel(folder_id: str, channels: list) -> None:
             st.session_state.admin_flash = admin_flash_for(result)
             _load_snapshot_cached.clear()
             st.rerun()
+
+    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='vidproc-meta-text'>Manage groups</div>", unsafe_allow_html=True)
+    existing_groups = group_store.read_groups(folder_id)
+    if not existing_groups:
+        render_empty_state("No groups configured yet - new ones are created via the form above.")
+    for group in existing_groups:
+        with st.expander(group.name):
+            types_raw = st.text_input(
+                "Video types, comma-separated",
+                value=", ".join(group.video_types),
+                key=f"group-types-{group.name}",
+            )
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Save", key=f"group-save-{group.name}"):
+                    try:
+                        update_group_video_types(folder_id, group.name, types_raw.split(","))
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.success(f"Updated {group.name}.")
+                        st.rerun()
+            with col2:
+                if st.button("Delete", key=f"group-delete-{group.name}"):
+                    try:
+                        delete_group(folder_id, group.name)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.success(
+                            f"Deleted {group.name}'s configuration. Any channel still assigned to it will "
+                            "fall back to the default group's video types until reassigned or reconfigured."
+                        )
+                        st.rerun()
 
 
 def main() -> None:

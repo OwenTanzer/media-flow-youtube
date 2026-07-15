@@ -81,6 +81,44 @@ def test_create_group_preserves_existing_groups(monkeypatch):
     assert written["groups"] == [existing_group, Group(name="Crypto", video_types=["Market Update"])]
 
 
+def test_update_group_video_types_replaces_the_list(monkeypatch):
+    other_group = Group(name="Finance", video_types=["Thesis Piece"])
+    written = _stub_groups(monkeypatch, existing=[Group(name="Google", video_types=["Tutorial"]), other_group])
+
+    updated = admin.update_group_video_types("folder-id", "Google", ["  Short Showcase  ", "", "Tutorial"])
+
+    assert updated == Group(name="Google", video_types=["Short Showcase", "Tutorial"])
+    # The other group is untouched, and its position/order is preserved.
+    assert written["groups"] == [Group(name="Google", video_types=["Short Showcase", "Tutorial"]), other_group]
+
+
+def test_update_group_video_types_rejects_no_non_blank_types(monkeypatch):
+    _stub_groups(monkeypatch, existing=[Group(name="Google", video_types=["Tutorial"])])
+    with pytest.raises(ValueError, match="At least one video type is required"):
+        admin.update_group_video_types("folder-id", "Google", ["  ", ""])
+
+
+def test_update_group_video_types_rejects_an_unregistered_group(monkeypatch):
+    _stub_groups(monkeypatch, existing=[])
+    with pytest.raises(ValueError, match="'Google' is not registered"):
+        admin.update_group_video_types("folder-id", "Google", ["Tutorial"])
+
+
+def test_delete_group_removes_only_the_named_group(monkeypatch):
+    kept_group = Group(name="Finance", video_types=["Thesis Piece"])
+    written = _stub_groups(monkeypatch, existing=[Group(name="Google", video_types=["Tutorial"]), kept_group])
+
+    admin.delete_group("folder-id", "Google")
+
+    assert written["groups"] == [kept_group]
+
+
+def test_delete_group_rejects_an_unregistered_group(monkeypatch):
+    _stub_groups(monkeypatch, existing=[])
+    with pytest.raises(ValueError, match="'Google' is not registered"):
+        admin.delete_group("folder-id", "Google")
+
+
 def _stub(monkeypatch, *, existing, lock_token="the-token", backfill_report=None, feed_ok=True):
     monkeypatch.setattr(admin.channel_store, "read_channels", lambda folder_id: existing)
     written = {}
