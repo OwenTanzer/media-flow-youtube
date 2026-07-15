@@ -31,6 +31,33 @@ def test_read_groups_parses_valid_registry(monkeypatch):
     ]
 
 
+def test_read_groups_parses_video_type_descriptions(monkeypatch):
+    _with_real_drive(
+        monkeypatch,
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "name": "Google",
+                        "video_types": ["Tutorial", "Short Showcase"],
+                        "video_type_descriptions": {"Tutorial": "a how-to walkthrough.", "Bogus": 5},
+                    }
+                ]
+            }
+        ),
+    )
+
+    groups = group_store.read_groups("folder-id")
+
+    assert groups == [
+        Group(
+            name="Google",
+            video_types=["Tutorial", "Short Showcase"],
+            video_type_descriptions={"Tutorial": "a how-to walkthrough."},
+        )
+    ]
+
+
 def test_read_groups_missing_file_returns_empty(monkeypatch):
     _with_real_drive(monkeypatch, None)
     assert group_store.read_groups("folder-id") == []
@@ -89,7 +116,14 @@ def _capture_upload(monkeypatch):
 
 def test_write_groups_round_trips_through_read_groups(monkeypatch):
     written = _capture_upload(monkeypatch)
-    groups = [Group(name="Finance", video_types=["Thesis Piece"]), Group(name="Google", video_types=["Tutorial"])]
+    groups = [
+        Group(name="Finance", video_types=["Thesis Piece"]),
+        Group(
+            name="Google",
+            video_types=["Tutorial"],
+            video_type_descriptions={"Tutorial": "a how-to walkthrough."},
+        ),
+    ]
 
     group_store.write_groups("folder-id", groups)
 
@@ -99,6 +133,12 @@ def test_write_groups_round_trips_through_read_groups(monkeypatch):
     monkeypatch.setattr(group_store.settings, "dry_run", False)
     monkeypatch.setattr(group_store.drive, "download_text", lambda folder_id, filename: json.dumps(written["content"]))
     assert group_store.read_groups("folder-id") == groups
+
+
+def test_write_groups_omits_absent_descriptions(monkeypatch):
+    written = _capture_upload(monkeypatch)
+    group_store.write_groups("folder-id", [Group(name="Google", video_types=["Tutorial"])])
+    assert "video_type_descriptions" not in written["content"]["groups"][0]
 
 
 def test_get_video_types_returns_the_matching_groups_list():
@@ -122,3 +162,34 @@ def test_get_video_types_falls_back_to_the_hardcoded_default_when_nothing_is_con
 def test_get_video_types_treats_an_empty_configured_list_as_unconfigured():
     groups = [Group(name="Google", video_types=[])]
     assert group_store.get_video_types(groups, "Google", "Finance") == group_store.FALLBACK_VIDEO_TYPES
+
+
+def test_get_video_type_descriptions_returns_the_matching_groups_descriptions():
+    groups = [
+        Group(name="Google", video_types=["Tutorial"], video_type_descriptions={"Tutorial": "a how-to walkthrough."})
+    ]
+    assert group_store.get_video_type_descriptions(groups, "Google", "Finance") == {"Tutorial": "a how-to walkthrough."}
+
+
+def test_get_video_type_descriptions_returns_empty_when_group_has_none_configured():
+    """A group that configures its own video_types without descriptions
+    gets no descriptions at all - not the Finance-flavored ones, which
+    would describe the wrong categories entirely."""
+    groups = [Group(name="Google", video_types=["Tutorial"])]
+    assert group_store.get_video_type_descriptions(groups, "Google", "Finance") == {}
+
+
+def test_get_video_type_descriptions_falls_back_to_hardcoded_defaults_when_nothing_is_configured():
+    assert (
+        group_store.get_video_type_descriptions([], "Finance", "Finance")
+        == group_store.FALLBACK_VIDEO_TYPE_DESCRIPTIONS
+    )
+
+
+def test_get_video_type_descriptions_falls_back_to_the_default_groups_descriptions():
+    groups = [
+        Group(name="Finance", video_types=["Thesis Piece"], video_type_descriptions={"Thesis Piece": "a deep dive."})
+    ]
+    assert group_store.get_video_type_descriptions(groups, "SomeUnconfiguredGroup", "Finance") == {
+        "Thesis Piece": "a deep dive."
+    }

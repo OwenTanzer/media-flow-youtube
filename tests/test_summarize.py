@@ -150,6 +150,35 @@ def test_count_prompt_tokens_uses_the_given_video_types(monkeypatch):
     }
 
 
+def test_build_system_prompt_includes_descriptions_when_given():
+    """Regression test for the review finding: bare category names alone
+    are a materially weaker classification signal than the original
+    per-category definitions - a description, when configured, must
+    actually reach the prompt."""
+    prompt = summarize._build_system_prompt(
+        5, ["Tutorial", "Short Showcase"], {"Tutorial": "a how-to walkthrough."}
+    )
+    assert '"Tutorial": a how-to walkthrough.' in prompt
+    # Short Showcase has no configured description - listed as a bare
+    # option, not given a fabricated one.
+    assert "Short Showcase" in prompt
+    assert '"Short Showcase":' not in prompt
+
+
+def test_build_system_prompt_omits_the_descriptions_block_when_none_given():
+    prompt_without = summarize._build_system_prompt(5, ["Tutorial"])
+    prompt_with_empty = summarize._build_system_prompt(5, ["Tutorial"], {})
+    assert prompt_without == prompt_with_empty
+    assert '"Tutorial":' not in prompt_without
+
+
+def test_fallback_video_type_descriptions_cover_every_fallback_video_type():
+    """Regression test: the whole point of restoring these is that
+    Finance's classification prompt doesn't regress to bare names - every
+    fallback category needs its original definition."""
+    assert set(summarize.FALLBACK_VIDEO_TYPE_DESCRIPTIONS) == set(summarize.FALLBACK_VIDEO_TYPES)
+
+
 @pytest.mark.parametrize(
     "exc_factory",
     [

@@ -8,13 +8,14 @@ stores each group's classification categories."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import drive
 from .config import settings
-from .summarize import FALLBACK_VIDEO_TYPES
+from .summarize import FALLBACK_VIDEO_TYPE_DESCRIPTIONS, FALLBACK_VIDEO_TYPES
 
 logger = logging.getLogger("media_flow.groups")
 
@@ -25,10 +26,23 @@ GROUPS_FILENAME = "groups.json"
 class Group:
     name: str
     video_types: list[str]
+    # Optional {video_type: description} guidance for the model - not
+    # editable from the admin panel's create/edit-group forms (those only
+    # take names), but can be hand-edited directly in groups.json, same as
+    # e.g. channels.json's "languages" field. A category's classification
+    # accuracy is meaningfully better with a real definition (see
+    # summarize.FALLBACK_VIDEO_TYPE_DESCRIPTIONS for the original, pre-
+    # per-group categories' own descriptions) than a bare name alone -
+    # this exists so that quality isn't a required regression for groups
+    # that want to invest in it.
+    video_type_descriptions: dict[str, str] = field(default_factory=dict)
 
 
 def _group_to_dict(group: Group) -> dict:
-    return {"name": group.name, "video_types": group.video_types}
+    entry: dict = {"name": group.name, "video_types": group.video_types}
+    if group.video_type_descriptions:
+        entry["video_type_descriptions"] = group.video_type_descriptions
+    return entry
 
 
 def write_groups(folder_id: str, groups: list[Group]) -> None:
@@ -69,7 +83,13 @@ def read_groups(folder_id: str) -> list[Group]:
         video_types = (
             [str(t) for t in raw_types if isinstance(t, str) and t.strip()] if isinstance(raw_types, list) else []
         )
-        groups.append(Group(name=entry["name"], video_types=video_types))
+        raw_descriptions = entry.get("video_type_descriptions")
+        video_type_descriptions = (
+            {str(k): str(v) for k, v in raw_descriptions.items() if isinstance(k, str) and isinstance(v, str)}
+            if isinstance(raw_descriptions, dict)
+            else {}
+        )
+        groups.append(Group(name=entry["name"], video_types=video_types, video_type_descriptions=video_type_descriptions))
     return groups
 
 
@@ -81,3 +101,42 @@ def get_video_types(groups: list[Group], group_name: str, default_group: str) ->
 
     by_name = {g.name: g.video_types for g in groups if g.video_types}
     return by_name.get(group_name) or by_name.get(default_group) or FALLBACK_VIDEO_TYPES
+
+
+def get_video_type_descriptions(groups: list[Group], group_name: str, default_group: str) -> dict[str, str]:
+    """Returns group_name's configured video_type_descriptions, with the
+    same fallback chain as get_video_types() - falls back to
+    FALLBACK_VIDEO_TYPE_DESCRIPTIONS (the original categories' own
+    definitions) only when neither group_name nor default_group has
+    *any* video_types configured at all (i.e. get_video_types() would
+    itself be falling back to FALLBACK_VIDEO_TYPES), so a group that
+    configures its own video_types without descriptions gets no
+    descriptions at all, rather than the Finance-flavored ones by
+    accident."""
+
+    types_by_name = {g.name: g.video_types for g in groups if g.video_types}
+    if group_name not in types_by_name and default_group not in types_by_name:
+        return FALLBACK_VIDEO_TYPE_DESCRIPTIONS
+
+    descriptions_by_name = {g.name: g.video_type_descriptions for g in groups if g.video_types}
+    return descriptions_by_name.get(group_name) or descriptions_by_name.get(default_group) or {}
+
+
+def video_types_fingerprint(video_types: list[str], video_type_descriptions: dict[str, str]) -> str:
+    """A short, stable hash of a group's resolved classification config -
+    persisted on the summary artifact and compared as part of
+    summary_store.needs_summarization()'s idempotency check, so that
+    editing a group's video_types/video_type_descriptions later (see
+    vidproc/admin.py's update_group_video_types()) makes every video
+    previously summarized under a *different* taxonomy eligible for
+    re-summarization again, not just a one-time PROMPT_VERSION bump.
+
+    This also closes the launch-sequencing gap where the scheduled job
+    runs before groups.json is seeded: videos summarized under the
+    fallback taxonomy in that window get a different fingerprint than
+    ones summarized after the real categories are configured, so seeding
+    afterward still corrects them on the next run instead of leaving them
+    permanently marked "current" under the wrong categories."""
+
+    payload = json.dumps({"video_types": video_types, "video_type_descriptions": video_type_descriptions}, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

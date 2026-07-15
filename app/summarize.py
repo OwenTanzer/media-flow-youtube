@@ -29,6 +29,21 @@ PROMPT_VERSION = "v7"
 # behaves exactly as it did before groups could configure this themselves.
 FALLBACK_VIDEO_TYPES = ["Post-Market Update", "Pre-Market Brief", "Thesis Piece", "Analytic Overview"]
 
+# The original per-category definitions these 4 categories shipped with,
+# before classification became per-group/data-driven - a bare category
+# name alone is a materially weaker signal for the model than an actual
+# definition of what it means. Only used alongside FALLBACK_VIDEO_TYPES
+# (see group_store.get_video_type_descriptions()); a group that
+# configures its own video_types without descriptions gets none, rather
+# than these by accident.
+FALLBACK_VIDEO_TYPE_DESCRIPTIONS = {
+    "Post-Market Update": "a recap/review of a trading session or period that has already happened.",
+    "Pre-Market Brief": "forward-looking commentary or a plan for a session/period that hasn't happened yet.",
+    "Thesis Piece": "an in-depth case for or against a single specific idea, asset, or claim.",
+    "Analytic Overview": "a broader technical/analytical walkthrough across multiple assets or topics, not tied "
+    "to a single specific thesis or session (e.g. a live multi-asset chart-reading session).",
+}
+
 # Upper bound on how many points the model may return, scaling with video
 # length but never exceeding _MAX_POINTS_CEILING - without this, a very
 # long video (a multi-hour livestream, say) has no natural ceiling on how
@@ -43,8 +58,15 @@ def _max_points_for_duration(duration_seconds: int) -> int:
     return max(1, min(_MAX_POINTS_CEILING, duration_seconds // _POINT_INTERVAL_SECONDS))
 
 
-def _build_system_prompt(max_points: int, video_types: list[str]) -> str:
+def _build_system_prompt(
+    max_points: int, video_types: list[str], video_type_descriptions: dict[str, str] | None = None
+) -> str:
+    video_type_descriptions = video_type_descriptions or {}
     types_list = ", ".join(f'"{t}"' for t in video_types)
+    description_lines = "\n".join(
+        f'  - "{t}": {video_type_descriptions[t]}' for t in video_types if t in video_type_descriptions
+    )
+    descriptions_block = f"\n{description_lines}" if description_lines else ""
     return f"""You are extracting structured, timestamped insights from a YouTube video transcript.
 
 Identify the transcript-supported major and minor points made in the video. Include at most {max_points} points - however many major/minor points are actually present in the video's substantive content, up to that limit. A short, thin video may have only one or two points; a long, information-dense video may have many, up to {max_points}. Do not pad the list to hit a target count. If the video's substantive content exceeds {max_points} distinguishable points, select only the {max_points} most significant ones (favoring "major" points over "minor" ones) rather than trying to cram in everything - do not omit real content to keep the list short otherwise.
@@ -63,7 +85,8 @@ Many videos (livestreams especially) revisit the same topic more than once - e.g
 Be concise and factual. State uncertainty explicitly (e.g. "the speaker suggests..." vs "the speaker states...") rather than presenting an inference as a stated fact. Do not include information not supported by the transcript text.
 
 Also provide:
-- "video_type": classify the video as exactly one of {types_list}. If more than one could apply, pick whichever describes the video's primary purpose.
+- "video_type": classify the video as exactly one of {types_list}.{descriptions_block}
+  If more than one could apply, pick whichever describes the video's primary purpose.
 - "summary": one to three sentences summarizing the video as a whole.
 """
 
@@ -324,7 +347,13 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
     return (input_tokens / 1_000_000) * input_price + (output_tokens / 1_000_000) * output_price
 
 
-def count_prompt_tokens(transcript_body: str, *, model: str, video_types: list[str] | None = None) -> int:
+def count_prompt_tokens(
+    transcript_body: str,
+    *,
+    model: str,
+    video_types: list[str] | None = None,
+    video_type_descriptions: dict[str, str] | None = None,
+) -> int:
     """Real input token count for this exact prompt (system prompt + output
     schema overhead + the transcript itself) via the Anthropic token-
     counting endpoint - used to reserve accurate per-run budget before a
@@ -359,7 +388,7 @@ def count_prompt_tokens(transcript_body: str, *, model: str, video_types: list[s
         client = anthropic.Anthropic(max_retries=_CLIENT_MAX_RETRIES)
         result = client.messages.count_tokens(
             model=model,
-            system=_build_system_prompt(max_points, video_types),
+            system=_build_system_prompt(max_points, video_types, video_type_descriptions),
             messages=[{"role": "user", "content": transcript_body}],
             output_format=_build_model_output_schema(video_types),
         )
@@ -520,7 +549,12 @@ def _select_significant_points(points: list[ResolvedPoint], max_points: int) -> 
 
 
 def summarize_transcript(
-    transcript_body: str, *, model: str, max_output_tokens: int, video_types: list[str] | None = None
+    transcript_body: str,
+    *,
+    model: str,
+    max_output_tokens: int,
+    video_types: list[str] | None = None,
+    video_type_descriptions: dict[str, str] | None = None,
 ) -> tuple[ResolvedSummary, Usage, bool]:
     """Calls Claude to produce a ResolvedSummary for one transcript (the
     model itself produces a ModelSummaryOutput; _resolve_points() verifies
@@ -546,7 +580,7 @@ def summarize_transcript(
         response = client.messages.parse(
             model=model,
             max_tokens=max_output_tokens,
-            system=_build_system_prompt(max_points, video_types),
+            system=_build_system_prompt(max_points, video_types, video_type_descriptions),
             messages=[{"role": "user", "content": transcript_body}],
             output_format=output_schema,
         )
