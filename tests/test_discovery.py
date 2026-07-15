@@ -356,7 +356,7 @@ def test_discover_and_enqueue_resolves_and_caches_uploads_playlist_id(monkeypatc
     cache is persisted - but only once (subsequent runs shouldn't need
     another channels.list call)."""
     channel = Channel("UC_a", "Channel A", enabled=True)
-    written = _stub_stores(monkeypatch, channels=[channel])
+    _stub_stores(monkeypatch, channels=[channel])
     monkeypatch.setattr(discovery.settings, "youtube_data_api_key", "the-key")
     monkeypatch.setattr(discovery.uploads_playlist_store, "read_cache", lambda folder_id: {})
     cache_written = {}
